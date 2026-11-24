@@ -209,7 +209,10 @@ sealed class BrowserWindow : Form
         </style><div class="box">Enter a web address</div>
         """;
 
+    readonly ChromePanel railSpacer = new() { Dock = DockStyle.Left, BackColor = Theme.Frame, Visible = false };
     readonly ChromePanel sidebar = new() { Dock = DockStyle.Left, BackColor = Theme.Frame };
+    readonly ChromePanel sideContent = new() { BackColor = Theme.Frame };
+    readonly Panel peekBorder = new() { BackColor = Theme.Hairline, Visible = false };
     readonly ChromePanel sideTopBand = new() { Dock = DockStyle.Top, BackColor = Theme.Frame };
     readonly Panel sideAddressWrap = new() { Dock = DockStyle.Top, BackColor = Theme.Frame };
     readonly PinGridPanel sidePins = new() { Dock = DockStyle.Top, Visible = false };
@@ -219,6 +222,7 @@ sealed class BrowserWindow : Form
 
     readonly ChromePanel topStrip = new() { Dock = DockStyle.Top, BackColor = Theme.Ground, Visible = false };
     readonly ChromePanel stripTabs = new() { BackColor = Theme.Ground };
+    readonly ActiveTabTitle stripActiveTitle = new();
 
     readonly ChromePanel cardFrame = new() { Dock = DockStyle.Fill, BackColor = Theme.Frame };
     readonly Panel cardBorder = new() { Dock = DockStyle.Fill, BackColor = Theme.Hairline };
@@ -240,6 +244,7 @@ sealed class BrowserWindow : Form
     };
 
     readonly AddressLine address = new();
+    readonly IconButton collapseBtn;
     readonly IconButton backBtn;
     readonly IconButton forwardBtn;
     readonly IconButton reloadBtn;
@@ -260,8 +265,13 @@ sealed class BrowserWindow : Form
     readonly System.Windows.Forms.Timer dragScrollTimer = new() { Interval = 30 };
     readonly System.Windows.Forms.Timer loadingTimer = new() { Interval = 60 };
     readonly System.Windows.Forms.Timer responsiveTimer = new() { Interval = 1500 };
+    readonly System.Windows.Forms.Timer peekDelayTimer = new() { Interval = 300 };
+    readonly System.Windows.Forms.Timer peekWatchTimer = new() { Interval = 80 };
     readonly MotionClock motion = new();
     readonly TabLayoutMotion layoutMotion;
+    readonly PeekMotionTarget peekMotion;
+    readonly SidebarPeekFilter peekFilter;
+    AnimScalar peekAnim;
     int loadingPhase;
 
     readonly List<BrowserTab> opened = [];
@@ -307,6 +317,13 @@ sealed class BrowserWindow : Form
     UpdateRelease? availableUpdate;
     bool updating;
     bool vertical = true;
+    bool tabBarCollapsed;
+    bool peekOpen;
+    bool peekTrackCursor;
+    bool suppressPeekOnCollapseBtn;
+    bool sidebarInRailLayout;
+    bool collapsedAtStartup;
+    int activeTabMenuCount;
     bool chromeHidden;
     int hoveredCaptionHit;
     int pressedCaptionHit;
@@ -334,6 +351,12 @@ sealed class BrowserWindow : Form
     bool CanSaveSession => sessionLock is not null;
     public int ExitCode { get; private set; } = 1;
     public bool ChromeHidden => chromeHidden;
+    public bool TabBarCollapsed => tabBarCollapsed;
+    internal bool PeekOpen => peekOpen;
+    internal float PeekProgress => peekAnim.Value;
+    int ExpandedSidebarWidth => S(232);
+    int RailWidth => S(48);
+    bool IsVerticalRailOnly => vertical && tabBarCollapsed && !peekOpen && peekAnim.Value <= 0.001f;
     public bool IsFullscreen => fullscreen.IsFullscreen;
     internal bool BrowserFullscreen => fullscreen.BrowserFullscreen;
     internal bool ElementFullscreen => fullscreen.ElementFullscreen;
@@ -415,6 +438,9 @@ sealed class BrowserWindow : Form
     [DllImport("user32.dll")]
     static extern bool SetForegroundWindow(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    static extern IntPtr WindowFromPoint(Point point);
+
     static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
 
     [DllImport("user32.dll")]
@@ -424,6 +450,21 @@ sealed class BrowserWindow : Form
     static extern bool AreDpiAwarenessContextsEqual(IntPtr a, IntPtr b);
 
     readonly record struct TabDropTarget(bool Pinned, int Slot);
+
+    sealed class PeekMotionTarget(BrowserWindow owner) : IMotionTarget
+    {
+        public bool StepMotion(double nowMs) => owner.StepPeekMotion(nowMs);
+        public void SnapMotion() => owner.SnapPeekMotion();
+    }
+
+    sealed class SidebarPeekFilter(BrowserWindow owner) : IMessageFilter
+    {
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg == WM_MOUSEMOVE) owner.HandleAppMouseMove(m.HWnd);
+            return false;
+        }
+    }
 
     sealed class BrowserTab(SessionTab? saved = null)
     {
@@ -514,6 +555,9 @@ sealed class BrowserWindow : Form
         this.smokeReport = smokeReport;
         if (smokeReport is not null) motion.ForceEnabled = false;
         layoutMotion = new TabLayoutMotion(motion, ApplyAnimatedListLayout);
+        peekMotion = new PeekMotionTarget(this);
+        peekFilter = new SidebarPeekFilter(this);
+        tabBarCollapsed = initialSettings.TabBarCollapsed;
         this.fixture = fixture;
         this.smokePhase = smokePhase;
         this.noUpdateCheck = noUpdateCheck;
@@ -539,6 +583,11 @@ sealed class BrowserWindow : Form
         else StartPosition = FormStartPosition.CenterScreen;
         KeyPreview = true;
 
+        collapseBtn = MakeIcon(
+            tabBarCollapsed ? Theme.Glyphs.OpenPane : Theme.Glyphs.ClosePane,
+            tabBarCollapsed ? "Expand tab bar (Ctrl+Shift+B)" : "Collapse tab bar (Ctrl+Shift+B)",
+            ToggleTabBarCollapsed);
+        collapseBtn.MouseLeave += (_, _) => suppressPeekOnCollapseBtn = false;
         backBtn = MakeIcon(Theme.Glyphs.Back, "Back", GoBack);
         forwardBtn = MakeIcon(Theme.Glyphs.Forward, "Forward", GoForward);
         reloadBtn = MakeIcon(Theme.Glyphs.Reload, "Reload", ReloadOrStopCurrent);
@@ -553,25 +602,32 @@ sealed class BrowserWindow : Form
         stripNewTabBtn = MakeIcon(Theme.Glyphs.NewTab, "New tab", NewTab);
         stripNewTabBtn.SetSurface(Theme.Ground, Theme.StripHover, Theme.StripActive);
         sideNewTab = new QuietRow("New tab", NewTab);
+        tips.SetToolTip(sideNewTab, "New tab");
         findBar = new FindBar(tips, ReturnFocusFromFind);
         address.ZoomResetRequested += ResetZoom;
+        address.Input.LostFocus += (_, _) => HandleAddressLostFocus();
 
         minBtn = MakeCaption(Theme.Glyphs.Minimize, "Minimize", isClose: false, () => WindowState = FormWindowState.Minimized);
         maxBtn = MakeCaption(Theme.Glyphs.Maximize, "Maximize", isClose: false, ToggleMaximize);
         closeBtn = MakeCaption(Theme.Glyphs.ChromeClose, "Close", isClose: true, Close);
 
         ApplyChromeMetrics();
+        sidebar.Resize += (_, _) => LayoutSideContent();
         sideTopBand.Resize += (_, _) => LayoutSideTopBand();
-        sideAddressWrap.Resize += (_, _) => { if (vertical) address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28)); };
+        sideAddressWrap.Resize += (_, _) => { if (vertical && !IsVerticalRailOnly) address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28)); };
 
         // WinForms docks in reverse order: Fill first, then Top stack bottom-to-top.
-        sidebar.Controls.Add(sideTabs);
-        sidebar.Controls.Add(sidePins);
-        sidebar.Controls.Add(sideAddressWrap);
-        sidebar.Controls.Add(sideTopBand);
+        sideContent.Controls.Add(sideTabs);
+        sideContent.Controls.Add(sidePins);
+        sideContent.Controls.Add(sideAddressWrap);
+        sideContent.Controls.Add(sideTopBand);
+        sidebar.Controls.Add(sideContent);
+        sidebar.Controls.Add(peekBorder);
+        peekBorder.BringToFront();
 
         topStrip.Controls.Add(stripTabs);
         topStrip.Controls.Add(stripNewTabBtn);
+        topStrip.Controls.Add(stripActiveTitle);
         stripTabs.MouseWheel += HandleStripWheel;
         topStrip.Resize += (_, _) => { if (!vertical) LayoutTopStrip(); };
 
@@ -589,6 +645,7 @@ sealed class BrowserWindow : Form
         cardFrame.Controls.Add(sessionNotice);
 
         Controls.Add(cardFrame);
+        Controls.Add(railSpacer);
         Controls.Add(sidebar);
         Controls.Add(topStrip);
         Controls.Add(minBtn);
@@ -604,6 +661,7 @@ sealed class BrowserWindow : Form
         UpdateNavButtons();
         UpdateWindowTitle();
         sidebar.Enabled = topStrip.Enabled = false;
+        Application.AddMessageFilter(peekFilter);
 
         address.Input.KeyDown += (_, e) => {
             if (e.KeyCode != Keys.Enter) return;
@@ -616,13 +674,15 @@ sealed class BrowserWindow : Form
         dragScrollTimer.Tick += (_, _) => HandleDragAutoScroll();
         loadingTimer.Tick += (_, _) => TickLoadingSpinner();
         responsiveTimer.Tick += (_, _) => ProbeUnresponsiveTabs();
+        peekDelayTimer.Tick += (_, _) => HandlePeekDelayTick();
+        peekWatchTimer.Tick += (_, _) => HandlePeekWatchTick();
         Activated += (_, _) => SetCaptionWindowActive(true);
-        Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); };
+        Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); if (downloadsFlyout is null && activeTabMenuCount == 0) CancelPeek(animate: false); };
         LocationChanged += (_, _) => CloseDownloadsFlyout();
         SizeChanged += (_, _) => CloseDownloadsFlyout();
         Load += async (_, _) => await Start();
         FormClosing += HandleFormClosing;
-        FormClosed += (_, _) => { closed = true; StopLaunchPipe(); CancelTabDrag(animate: false); CloseDownloadsFlyout(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); layoutMotion.Dispose(); motion.Dispose(); };
+        FormClosed += (_, _) => { closed = true; Application.RemoveMessageFilter(peekFilter); StopLaunchPipe(); CancelTabDrag(animate: false); CancelPeek(animate: false); CloseDownloadsFlyout(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); peekDelayTimer.Stop(); peekDelayTimer.Dispose(); peekWatchTimer.Stop(); peekWatchTimer.Dispose(); layoutMotion.Dispose(); motion.Dispose(); };
     }
 
     int S(int px) => dpiOverride is { } dpi
@@ -644,8 +704,10 @@ sealed class BrowserWindow : Form
         {
             if (!closed) FlushSession();
             closed = true;
+            Application.RemoveMessageFilter(peekFilter);
             StopLaunchPipe();
             CancelTabDrag(animate: false);
+            CancelPeek(animate: false);
             CloseDownloadsFlyout();
             downloads.Dispose();
             pending?.Cancel();
@@ -657,6 +719,8 @@ sealed class BrowserWindow : Form
             dragScrollTimer.Dispose();
             loadingTimer.Dispose();
             responsiveTimer.Dispose();
+            peekDelayTimer.Dispose();
+            peekWatchTimer.Dispose();
             layoutMotion.Dispose();
             motion.Dispose();
             if (!dropLine.IsDisposed) dropLine.Dispose();
@@ -666,19 +730,318 @@ sealed class BrowserWindow : Form
         if (disposing) { tips.Dispose(); favicons.Dispose(); }
     }
 
+    int CurrentCollapsedSidebarWidth() =>
+        Math.Clamp((int)MathF.Round(Motion.Lerp(RailWidth, ExpandedSidebarWidth, peekAnim.Value)), RailWidth, ExpandedSidebarWidth);
+
     void ApplyChromeMetrics()
     {
         metricsDpi = dpiOverride ?? DeviceDpi;
         MinimumSize = new(S(640), S(420));
-        sidebar.Width = S(232);
-        sidebar.Padding = new(S(10), 0, S(10), S(10));
+        railSpacer.Width = RailWidth;
+        sidebar.Padding = Padding.Empty;
+        sidebar.Width = vertical && tabBarCollapsed ? CurrentCollapsedSidebarWidth() : ExpandedSidebarWidth;
+        sideContent.Padding = IsVerticalRailOnly ? new(S(6), 0, S(6), S(10)) : new(S(10), 0, S(10), S(10));
         sideTopBand.Height = S(36);
         sideAddressWrap.Height = S(28) + S(8);
         sideAddressWrap.Padding = new(0, 0, 0, S(8));
         sideNewTab.Height = S(28);
         topStrip.Height = S(52);
+        stripActiveTitle.Height = S(28);
         sessionNotice.Height = S(22);
         sessionNotice.Padding = new(S(8), 0, S(8), 0);
+        LayoutSideContent();
+    }
+
+    void LayoutSideContent()
+    {
+        var contentW = IsVerticalRailOnly ? RailWidth : ExpandedSidebarWidth;
+        var h = sidebar.ClientSize.Height;
+        sideContent.SetBounds(0, 0, contentW, h);
+        var showBorder = vertical && tabBarCollapsed && sidebar.Width > RailWidth;
+        if (peekBorder.Visible != showBorder) peekBorder.Visible = showBorder;
+        if (showBorder)
+        {
+            peekBorder.SetBounds(sidebar.Width - 1, 0, 1, h);
+            peekBorder.BringToFront();
+        }
+    }
+
+    void SyncSidebarLayoutMode(bool syncTabs = true)
+    {
+        var railOnly = IsVerticalRailOnly;
+        sidebarInRailLayout = railOnly;
+        sideContent.SuspendLayout();
+        sideContent.Padding = railOnly ? new(S(6), 0, S(6), S(10)) : new(S(10), 0, S(10), S(10));
+        sideAddressWrap.Visible = !railOnly;
+        LayoutSideContent();
+        sideContent.ResumeLayout(true);
+        if (vertical)
+        {
+            LayoutSideTopBand();
+            if (!railOnly) address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28));
+            if (syncTabs) SyncTabs();
+        }
+    }
+
+    void UpdateCollapseButton()
+    {
+        var tip = tabBarCollapsed ? "Expand tab bar (Ctrl+Shift+B)" : "Collapse tab bar (Ctrl+Shift+B)";
+        collapseBtn.SetGlyph(tabBarCollapsed ? Theme.Glyphs.OpenPane : Theme.Glyphs.ClosePane, tip);
+        if (tips.GetToolTip(collapseBtn) != tip) tips.SetToolTip(collapseBtn, tip);
+    }
+
+    void SyncActiveTabTitle()
+    {
+        var tab = selected;
+        var title = tab is null ? "New tab" : ClipTitle(tab.Title);
+        stripActiveTitle.UpdateTab(title, tab?.Url, favicons.Get(tab?.Url), tab?.Navigating ?? false, tab is not null ? AudioStateOf(tab) : TabAudioState.None, loadingPhase);
+        if (tips.GetToolTip(stripActiveTitle) != title) tips.SetToolTip(stripActiveTitle, title);
+        if (!vertical && tabBarCollapsed && topStrip.Visible) LayoutTopStrip();
+    }
+
+    internal void SetTabBarCollapsed(bool collapsed, bool persistSettings = true)
+    {
+        if (closed || IsDisposed) return;
+        if (tabBarCollapsed == collapsed)
+        {
+            UpdateCollapseButton();
+            if (persistSettings && (settings.TabBarCollapsed != collapsed || !settingsExisted))
+            {
+                settings = settings with { TabBarCollapsed = collapsed };
+                settingsExisted = true;
+                SaveSettings();
+                settingsDialog?.SyncFrom(settings);
+            }
+            return;
+        }
+        CancelTabDrag(animate: false);
+        CloseDownloadsFlyout();
+        CancelPeek(animate: false);
+        tabBarCollapsed = collapsed;
+        suppressPeekOnCollapseBtn = collapsed && vertical && collapseBtn.Visible && collapseBtn.IsHandleCreated
+            && collapseBtn.RectangleToScreen(collapseBtn.ClientRectangle).Contains(Cursor.Position);
+        UpdateCollapseButton();
+
+        SuspendLayout();
+        ApplyChromeMetrics();
+        ApplyChromeVisibility();
+        ResumeLayout(true);
+
+        if (vertical)
+        {
+            SyncSidebarLayoutMode(syncTabs: true);
+        }
+        else
+        {
+            SyncActiveTabTitle();
+            LayoutTopStrip();
+        }
+        if (findBar.Visible) findBar.PositionIn(pages);
+
+        if (persistSettings && (settings.TabBarCollapsed != collapsed || !settingsExisted))
+        {
+            settings = settings with { TabBarCollapsed = collapsed };
+            settingsExisted = true;
+            SaveSettings();
+            settingsDialog?.SyncFrom(settings);
+        }
+    }
+
+    void ToggleTabBarCollapsed() => SetTabBarCollapsed(!tabBarCollapsed);
+
+    void ApplyPeekWidth()
+    {
+        if (!vertical || !tabBarCollapsed || !sidebar.Visible) return;
+        var w = CurrentCollapsedSidebarWidth();
+        var h = ClientSize.Height;
+        if (sidebar.Left != 0 || sidebar.Top != 0 || sidebar.Width != w || sidebar.Height != h)
+            sidebar.SetBounds(0, 0, w, h);
+        var showBorder = w > RailWidth;
+        if (peekBorder.Visible != showBorder) peekBorder.Visible = showBorder;
+        if (showBorder)
+        {
+            peekBorder.SetBounds(w - 1, 0, 1, h);
+            peekBorder.BringToFront();
+        }
+    }
+
+    internal void SetPeekOpen(bool open, bool trackCursor = false)
+    {
+        if (closed || IsDisposed) return;
+        peekDelayTimer.Stop();
+        if (!vertical || !tabBarCollapsed || chromeHidden || IsFullscreen)
+        {
+            CancelPeek(animate: false);
+            return;
+        }
+        if (open)
+        {
+            peekTrackCursor = peekTrackCursor || trackCursor;
+            if (peekTrackCursor && !peekWatchTimer.Enabled) peekWatchTimer.Start();
+        }
+        else
+        {
+            peekTrackCursor = false;
+        }
+        if (peekOpen == open && !peekAnim.Active) return;
+        peekOpen = open;
+        if (open && sidebarInRailLayout)
+            SyncSidebarLayoutMode(syncTabs: true);
+        var changed = peekAnim.SetTarget(open ? 1f : 0f, motion, Motion.PeekSlideDurationMs);
+        if (peekAnim.Active)
+        {
+            motion.Track(peekMotion);
+        }
+        else if (changed || sidebar.Width != CurrentCollapsedSidebarWidth())
+        {
+            ApplyPeekWidth();
+            if (!open && peekAnim.Value <= 0.001f && !sidebarInRailLayout)
+                SyncSidebarLayoutMode(syncTabs: true);
+            if (!open && !peekDelayTimer.Enabled) peekWatchTimer.Stop();
+        }
+    }
+
+    void CancelPeek(bool animate = false)
+    {
+        peekDelayTimer.Stop();
+        peekWatchTimer.Stop();
+        peekTrackCursor = false;
+        if (animate && vertical && tabBarCollapsed && !chromeHidden && !IsFullscreen)
+        {
+            SetPeekOpen(false);
+            return;
+        }
+        peekOpen = false;
+        peekAnim.Snap(0f);
+        motion.Untrack(peekMotion);
+        if (vertical && tabBarCollapsed)
+        {
+            ApplyPeekWidth();
+            if (!sidebarInRailLayout) SyncSidebarLayoutMode(syncTabs: true);
+        }
+    }
+
+    bool StepPeekMotion(double nowMs)
+    {
+        if (closed || IsDisposed || !vertical || !tabBarCollapsed)
+        {
+            peekAnim.Snap(0f);
+            return false;
+        }
+        var still = peekAnim.Step(nowMs);
+        ApplyPeekWidth();
+        if (!still && !peekOpen && peekAnim.Value <= 0.001f)
+        {
+            if (!sidebarInRailLayout) SyncSidebarLayoutMode(syncTabs: true);
+            if (!peekDelayTimer.Enabled) peekWatchTimer.Stop();
+        }
+        return still;
+    }
+
+    void SnapPeekMotion()
+    {
+        peekAnim.Snap(peekAnim.Target);
+        if (closed || IsDisposed || !vertical || !tabBarCollapsed) return;
+        ApplyPeekWidth();
+        if (!peekOpen && peekAnim.Value <= 0.001f)
+        {
+            if (!sidebarInRailLayout) SyncSidebarLayoutMode(syncTabs: true);
+            if (!peekDelayTimer.Enabled) peekWatchTimer.Stop();
+        }
+    }
+
+    bool IsInSidebar(Control c)
+    {
+        for (Control? cur = c; cur is not null; cur = cur.Parent)
+            if (ReferenceEquals(cur, sidebar)) return true;
+        return false;
+    }
+
+    bool IsCursorOverSidebar() =>
+        !closed && !IsDisposed && sidebar.Visible && sidebar.IsHandleCreated
+        && sidebar.RectangleToScreen(sidebar.ClientRectangle).Contains(Cursor.Position);
+
+    void HandleAppMouseMove(IntPtr hwnd)
+    {
+        if (closed || IsDisposed || !vertical || !tabBarCollapsed || chromeHidden || IsFullscreen || restoring || !sidebar.Visible)
+            return;
+        var ctrl = Control.FromHandle(hwnd);
+        if (ctrl is null) return;
+        var overSidebar = IsInSidebar(ctrl) || ((ReferenceEquals(ctrl, this) || ReferenceEquals(ctrl, railSpacer)) && IsCursorOverSidebar());
+        if (!overSidebar) return;
+        if (suppressPeekOnCollapseBtn && ReferenceEquals(ctrl, collapseBtn)) return;
+        suppressPeekOnCollapseBtn = false;
+        if (!peekOpen)
+        {
+            if (!peekDelayTimer.Enabled) peekDelayTimer.Start();
+            if (!peekWatchTimer.Enabled) peekWatchTimer.Start();
+        }
+        else if (!peekTrackCursor)
+        {
+            peekTrackCursor = true;
+            if (!peekWatchTimer.Enabled) peekWatchTimer.Start();
+        }
+    }
+
+    bool IsSidebarExposedAtCursor()
+    {
+        if (!IsCursorOverSidebar()) return false;
+        var hit = WindowFromPoint(Cursor.Position);
+        if (hit == IntPtr.Zero) return false;
+        var ctrl = Control.FromHandle(hit);
+        return ctrl is not null && (IsInSidebar(ctrl) || ReferenceEquals(ctrl, this) || ReferenceEquals(ctrl, railSpacer));
+    }
+
+    void HandlePeekDelayTick()
+    {
+        peekDelayTimer.Stop();
+        if (closed || IsDisposed || !vertical || !tabBarCollapsed || chromeHidden || IsFullscreen || restoring)
+            return;
+        if (IsSidebarExposedAtCursor())
+            SetPeekOpen(true, trackCursor: true);
+        else if (!peekOpen)
+            peekWatchTimer.Stop();
+    }
+
+    void HandlePeekWatchTick()
+    {
+        if (closed || IsDisposed || !vertical || !tabBarCollapsed || chromeHidden || IsFullscreen)
+        {
+            CancelPeek(animate: false);
+            return;
+        }
+        var keepOpen = IsCursorOverSidebar()
+            || address.InputFocused
+            || dragTab is not null
+            || activeTabMenuCount > 0
+            || downloadsFlyout is { IsDisposed: false, Visible: true };
+        if (keepOpen) return;
+        if (peekDelayTimer.Enabled) peekDelayTimer.Stop();
+        if (peekOpen && peekTrackCursor)
+            SetPeekOpen(false);
+        else if (!peekOpen && !peekAnim.Active)
+            peekWatchTimer.Stop();
+    }
+
+    void HandleAddressLostFocus()
+    {
+        if (closed || IsDisposed || !vertical || !tabBarCollapsed || !peekOpen) return;
+        if (IsCursorOverSidebar())
+        {
+            peekTrackCursor = true;
+            if (!peekWatchTimer.Enabled) peekWatchTimer.Start();
+        }
+        else if (dragTab is null && activeTabMenuCount == 0 && downloadsFlyout is not { IsDisposed: false, Visible: true })
+        {
+            SetPeekOpen(false);
+        }
+    }
+
+    void FocusAddressBar()
+    {
+        if (vertical && tabBarCollapsed && !chromeHidden && !IsFullscreen)
+            SetPeekOpen(true, trackCursor: false);
+        address.FocusInput();
     }
 
     void ToggleMaximize() => WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
@@ -732,6 +1095,7 @@ sealed class BrowserWindow : Form
         var next = string.IsNullOrWhiteSpace(title) ? brand : $"{title} — {brand}";
         if (Text != next) Text = next;
         sessionNotice.Visible = !chromeHidden && !CanSaveSession;
+        SyncActiveTabTitle();
     }
 
     public void SetChromeHidden(bool hidden)
@@ -739,6 +1103,7 @@ sealed class BrowserWindow : Form
         if (IsFullscreen) { fullscreen.UpdateSavedChromeHidden(hidden); return; }
         if (chromeHidden == hidden) return;
         CancelTabDrag();
+        if (hidden) CancelPeek(animate: false);
         chromeHidden = hidden;
         SuspendLayout();
         ApplyChromeVisibility();
@@ -757,6 +1122,7 @@ sealed class BrowserWindow : Form
     {
         if (transition == FullscreenTransition.None || closed || IsDisposed) return;
         CancelTabDrag();
+        CancelPeek(animate: false);
         ClearCaptionInteraction();
         if (transition == FullscreenTransition.Enter)
         {
@@ -828,10 +1194,35 @@ sealed class BrowserWindow : Form
     void ApplyChromeVisibility()
     {
         var hideChrome = chromeHidden || IsFullscreen;
+        var floatingRail = vertical && tabBarCollapsed;
         BackColor = hideChrome ? Theme.Ground : (vertical ? Theme.Frame : Theme.Ground);
-        sidebar.Visible = !hideChrome && vertical;
+        railSpacer.Width = RailWidth;
+        railSpacer.Visible = !hideChrome && floatingRail;
+        if (Controls.GetChildIndex(railSpacer) < Controls.GetChildIndex(cardFrame))
+            railSpacer.SendToBack();
+        if (floatingRail)
+        {
+            if (sidebar.Dock != DockStyle.None) sidebar.Dock = DockStyle.None;
+            sidebar.Visible = !hideChrome;
+            if (!hideChrome)
+            {
+                sidebar.SetBounds(0, 0, CurrentCollapsedSidebarWidth(), ClientSize.Height);
+                sidebar.BringToFront();
+            }
+        }
+        else
+        {
+            if (sidebar.Dock != DockStyle.Left) sidebar.Dock = DockStyle.Left;
+            sidebar.Width = ExpandedSidebarWidth;
+            sidebar.Visible = !hideChrome && vertical;
+            if (Controls.GetChildIndex(sidebar) < Controls.GetChildIndex(cardFrame))
+                sidebar.SendToBack();
+        }
         topStrip.Visible = !hideChrome && !vertical;
         minBtn.Visible = maxBtn.Visible = closeBtn.Visible = !hideChrome;
+        minBtn.BringToFront();
+        maxBtn.BringToFront();
+        closeBtn.BringToFront();
         sessionNotice.Visible = !hideChrome && !CanSaveSession;
         sessionNotice.BackColor = vertical ? Theme.Frame : Theme.Ground;
 
@@ -952,9 +1343,19 @@ sealed class BrowserWindow : Form
         UpdateMaximizeButton();
     }
 
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        collapsedAtStartup = tabBarCollapsed && (vertical
+            ? sidebar.Visible && sidebar.Width == RailWidth && !sideAddressWrap.Visible && railSpacer.Visible && railSpacer.Width == RailWidth
+            : topStrip.Visible && !stripTabs.Visible && stripActiveTitle.Visible);
+    }
+
     protected override void OnSizeChanged(EventArgs e)
     {
         base.OnSizeChanged(e);
+        if (vertical && tabBarCollapsed && sidebar.Visible && sidebar.Dock == DockStyle.None)
+            sidebar.SetBounds(0, 0, CurrentCollapsedSidebarWidth(), ClientSize.Height);
         LayoutCaptionButtons();
         UpdateMaximizeButton();
     }
@@ -983,15 +1384,19 @@ sealed class BrowserWindow : Form
     {
         Font = Theme.FontForDpi(Theme.UiFont, DeviceDpi);
         CancelTabDrag(animate: false);
+        CancelPeek(animate: false);
         SuspendLayout();
         ApplyChromeMetrics();
         ApplyChromeVisibility();
         ResumeLayout(true);
         if (vertical)
         {
-            LayoutSideTopBand();
-            address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28));
-            address.PerformLayout();
+            SyncSidebarLayoutMode(syncTabs: false);
+            if (!IsVerticalRailOnly) address.PerformLayout();
+        }
+        else
+        {
+            SyncActiveTabTitle();
         }
         RebuildTabs();
         if (findBar.Visible) findBar.PositionIn(pages);
@@ -1090,9 +1495,30 @@ sealed class BrowserWindow : Form
         var btn = S(26);
         var gap = S(2);
         var y = (h - btn) / 2;
-        backBtn.SetBounds(0, y, btn, btn);
-        forwardBtn.SetBounds(btn + gap, y, btn, btn);
-        reloadBtn.SetBounds((btn + gap) * 2, y, btn, btn);
+        if (IsVerticalRailOnly)
+        {
+            collapseBtn.SetBounds((w - btn) / 2, y, btn, btn);
+            var offX = w + S(16);
+            backBtn.SetBounds(offX, y, btn, btn);
+            forwardBtn.SetBounds(offX, y, btn, btn);
+            reloadBtn.SetBounds(offX, y, btn, btn);
+            updateBtn.SetBounds(offX, y, btn, btn);
+            downloadsBtn.SetBounds(offX, y, btn, btn);
+            shareBtn.SetBounds(offX, y, btn, btn);
+            settingsBtn.SetBounds(offX, y, btn, btn);
+            return;
+        }
+        var rightCount = 1 + (shareBtn.Visible ? 1 : 0) + (downloadsBtn.Visible ? 1 : 0) + (updateBtn.Visible ? 1 : 0);
+        if (rightCount >= 4 && w < btn * 8 + gap * 7)
+        {
+            btn = S(24);
+            gap = S(1);
+            y = (h - btn) / 2;
+        }
+        collapseBtn.SetBounds(0, y, btn, btn);
+        backBtn.SetBounds(btn + gap, y, btn, btn);
+        forwardBtn.SetBounds((btn + gap) * 2, y, btn, btn);
+        reloadBtn.SetBounds((btn + gap) * 3, y, btn, btn);
         var rx = w - btn;
         settingsBtn.SetBounds(rx, y, btn, btn);
         if (shareBtn.Visible) { rx -= btn + gap; shareBtn.SetBounds(rx, y, btn, btn); }
@@ -1112,6 +1538,7 @@ sealed class BrowserWindow : Form
         var yRow = (h - rowH) / 2;
 
         var x = pad;
+        collapseBtn.SetBounds(x, yBtn, btn, btn); x += btn + gap;
         backBtn.SetBounds(x, yBtn, btn, btn); x += btn + gap;
         forwardBtn.SetBounds(x, yBtn, btn, btn); x += btn + gap;
         reloadBtn.SetBounds(x, yBtn, btn, btn); x += btn + S(8);
@@ -1132,6 +1559,22 @@ sealed class BrowserWindow : Form
         address.SetBounds(x, yRow, addrW, rowH);
         x += addrW + S(8);
 
+        if (tabBarCollapsed)
+        {
+            stripTabs.Visible = false;
+            stripNewTabBtn.Visible = false;
+            var maxTitle = Math.Max(0, rightStart - S(24) - x);
+            var titleW = stripActiveTitle.MeasureWidth(maxTitle);
+            stripActiveTitle.Visible = titleW > 0;
+            stripActiveTitle.SetBounds(x, yRow, titleW, rowH);
+            lastStripX = x;
+            lastStripMaxRun = 0;
+            return;
+        }
+
+        stripActiveTitle.Visible = false;
+        stripTabs.Visible = true;
+        stripNewTabBtn.Visible = true;
         var maxRun = Math.Max(0, rightStart - S(24) - x - gap - btn);
         lastStripX = x;
         lastStripMaxRun = maxRun;
@@ -1316,6 +1759,8 @@ sealed class BrowserWindow : Form
             any = true;
             if (tabControls.TryGetValue(tab, out var ctrl) && !ctrl.IsDisposed && ctrl is ITabItem item)
                 item.SetLoadingPhase(loadingPhase);
+            if (tab == selected && stripActiveTitle.Visible)
+                stripActiveTitle.SetLoadingPhase(loadingPhase);
         }
         if (!any) loadingTimer.Stop();
     }
@@ -1355,7 +1800,7 @@ sealed class BrowserWindow : Form
                 if (closed) return;
                 await DrainPendingExternalUrlsAsync();
                 if (closed) return;
-                if (selected?.Url is null) address.FocusInput();
+                if (selected?.Url is null) FocusAddressBar();
                 else if (selected.View is { IsDisposed: false } view) FocusView(view); // a focused address bar ignores redirects
                 ExitCode = 0;
                 if (!noUpdateCheck && settings.AutoUpdateCheck) _ = CheckForUpdateAsync();
@@ -1965,6 +2410,14 @@ sealed class BrowserWindow : Form
         settingsDialog?.SyncFrom(settings);
     }
 
+    Control DownloadsAnchor()
+    {
+        if (IsVerticalRailOnly) return collapseBtn.Visible ? collapseBtn : this;
+        if (downloadsBtn.Visible) return downloadsBtn;
+        if (settingsBtn.Visible) return settingsBtn;
+        return collapseBtn.Visible ? collapseBtn : this;
+    }
+
     void OpenDownloads() => ToggleDownloads(fromButtonClick: false);
 
     void ToggleDownloads(bool fromButtonClick)
@@ -1978,7 +2431,7 @@ sealed class BrowserWindow : Form
         // Clicking the button while the flyout was open triggers Deactivate->Close first; don't immediately reopen.
         if (fromButtonClick && Environment.TickCount64 - downloadsFlyoutClosedAt < 250)
             return;
-        var anchor = downloadsBtn.Visible ? (Control)downloadsBtn : settingsBtn;
+        var anchor = DownloadsAnchor();
         var flyout = new DownloadsFlyout(
             downloads,
             RetryDownload,
@@ -2501,7 +2954,7 @@ sealed class BrowserWindow : Form
     {
         if (environment is null || closed || restoring) return; // Ctrl+T skips the disabled UI during restore
         if (url is not null && address.InputFocused) ActiveControl = null;
-        try { await Open(url); if (url is null) address.FocusInput(); }
+        try { await Open(url); if (url is null) FocusAddressBar(); }
         catch (Exception ex) { if (!closed) MessageBox.Show(this, ex.Message, "Could not open tab"); }
     }
 
@@ -2738,7 +3191,7 @@ sealed class BrowserWindow : Form
                 var tabIdx = loose.IndexOf(tab);
                 if (tabIdx >= 0) MoveTab(dup, false, tabIdx + 1);
             }
-            if (url is null) address.FocusInput();
+            if (url is null) FocusAddressBar();
         }
         catch (Exception ex)
         {
@@ -2912,9 +3365,14 @@ sealed class BrowserWindow : Form
 
     (int cols, int tileW, int tileH, int gap) PinGridMetrics(int count)
     {
-        var room = Math.Max(S(100), sidebar.ClientSize.Width - sidebar.Padding.Horizontal);
         var gap = S(4);
         var tileH = S(34);
+        if (IsVerticalRailOnly)
+        {
+            var railRoom = Math.Max(S(24), sideContent.ClientSize.Width - sideContent.Padding.Horizontal);
+            return (1, railRoom, tileH, gap);
+        }
+        var room = Math.Max(S(100), sideContent.ClientSize.Width - sideContent.Padding.Horizontal);
         var cols = count <= 3 ? 3 : 4;
         var tileW = Math.Max(S(24), (room - (cols - 1) * gap) / cols);
         return (cols, tileW, tileH, gap);
@@ -2922,7 +3380,7 @@ sealed class BrowserWindow : Form
 
     bool StartTabDrag(BrowserTab tab, Point screenPt)
     {
-        if (closed || restoring || chromeHidden || !opened.Contains(tab)) return false;
+        if (closed || restoring || chromeHidden || IsVerticalRailOnly || (!vertical && tabBarCollapsed) || !opened.Contains(tab)) return false;
         if (dragTab is not null) CancelTabDrag(animate: false);
         layoutMotion.FinishClosing();
         layoutMotion.SnapOffsetsToZero();
@@ -3196,7 +3654,7 @@ sealed class BrowserWindow : Form
         {
             var sideRect = BoundsInForm(sidebar);
             if (formPt.X < sideRect.Left || formPt.X > sideRect.Right + S(32)) return null;
-            var sidePt = sidebar.PointToClient(screenPt);
+            var sidePt = sideContent.PointToClient(screenPt);
             if (sidePt.Y < sideAddressWrap.Top) return null;
 
             var hasPins = opened.Any(t => t.Pinned);
@@ -3205,7 +3663,7 @@ sealed class BrowserWindow : Form
                 pinDropPlaceholder = true;
                 sidePins.Height = S(34) + S(10);
                 sidePins.Visible = true;
-                sidebar.PerformLayout();
+                sideContent.PerformLayout();
             }
 
             if (sidePt.Y < sideTabs.Top && (hasPins || pinDropPlaceholder))
@@ -3401,6 +3859,7 @@ sealed class BrowserWindow : Form
     void SetOrientation(bool sidebarMode, bool persistSettings = true)
     {
         CancelTabDrag(animate: false);
+        CancelPeek(animate: false);
         CloseDownloadsFlyout();
         vertical = sidebarMode;
         SuspendLayout();
@@ -3408,25 +3867,25 @@ sealed class BrowserWindow : Form
         var hover = sidebarMode ? Theme.SideHover : Theme.StripHover;
         var activeFill = sidebarMode ? Theme.SideActive : Theme.StripActive;
 
-        foreach (var b in new[] { backBtn, forwardBtn, reloadBtn, shareBtn, updateBtn, settingsBtn })
+        foreach (var b in new[] { collapseBtn, backBtn, forwardBtn, reloadBtn, shareBtn, updateBtn, settingsBtn })
             b.SetSurface(surface, hover, activeFill);
         downloadsBtn.SetSurface(surface, hover, activeFill);
         address.SetSurface(surface, hover);
 
         if (sidebarMode)
         {
-            sideTopBand.Controls.AddRange([backBtn, forwardBtn, reloadBtn, updateBtn, downloadsBtn, shareBtn, settingsBtn]);
+            sideTopBand.Controls.AddRange([collapseBtn, backBtn, forwardBtn, reloadBtn, updateBtn, downloadsBtn, shareBtn, settingsBtn]);
             sideAddressWrap.Controls.Add(address);
             ApplyChromeVisibility();
-            LayoutSideTopBand();
-            address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28));
+            SyncSidebarLayoutMode(syncTabs: false);
         }
         else
         {
             stripScroll = 0;
-            topStrip.Controls.AddRange([backBtn, forwardBtn, reloadBtn, address, updateBtn, downloadsBtn, shareBtn, settingsBtn]);
+            topStrip.Controls.AddRange([collapseBtn, backBtn, forwardBtn, reloadBtn, address, updateBtn, downloadsBtn, shareBtn, settingsBtn]);
             stripTabs.SendToBack();
             ApplyChromeVisibility();
+            SyncActiveTabTitle();
         }
         ResumeLayout(true);
         RebuildTabs();
@@ -3476,6 +3935,8 @@ sealed class BrowserWindow : Form
         }
         SyncMenu();
         menu.Opening += (_, _) => SyncMenu();
+        menu.Opened += (_, _) => activeTabMenuCount++;
+        menu.Closed += (_, _) => activeTabMenuCount = Math.Max(0, activeTabMenuCount - 1);
         c.ContextMenuStrip = menu;
         c.Disposed += (_, _) => {
             if (!closed && !IsDisposed) tips.SetToolTip(c, null);
@@ -3530,6 +3991,7 @@ sealed class BrowserWindow : Form
             var title = ClipTitle(tab.Title);
             ((ITabItem)c).UpdateTab(title, tab.Url, tab == selected, favicons.Get(tab.Url), tab.Navigating, AudioStateOf(tab), loadingPhase);
             if (tips.GetToolTip(c) != title) tips.SetToolTip(c, title);
+            if (tab == selected) SyncActiveTabTitle();
         }
         finally { drawTabsTicks += Stopwatch.GetTimestamp() - t0; }
     }
@@ -3626,6 +4088,7 @@ sealed class BrowserWindow : Form
         }
         else
         {
+            if (tabBarCollapsed) return;
             var gap = S(2);
             var rowH = S(28);
             stripTabs.SuspendLayout();
@@ -3864,6 +4327,7 @@ sealed class BrowserWindow : Form
             case Keys.Control | Keys.W:
             case Keys.Control | Keys.Shift | Keys.T:
             case Keys.Control | Keys.Shift | Keys.S:
+            case Keys.Control | Keys.Shift | Keys.B:
             case Keys.Control | Keys.Oemcomma:
             case Keys.Control | Keys.Tab:
             case Keys.Control | Keys.Shift | Keys.Tab:
@@ -3953,12 +4417,13 @@ sealed class BrowserWindow : Form
             case Keys.Control | Keys.S:
                 if (selected is { } st) _ = SaveTabAsync(st);
                 return true;
-            case Keys.Control | Keys.L: address.FocusInput(); return true;
+            case Keys.Control | Keys.L: FocusAddressBar(); return true;
             case Keys.Control | Keys.N: if (!restoring) OpenNewWindow(); return true;
             case Keys.Control | Keys.T: if (!restoring) NewTab(); return true;
             case Keys.Control | Keys.W: if (!restoring) CloseCurrent(); return true;
             case Keys.Control | Keys.Shift | Keys.T: if (!restoring) ReopenClosedTab(); return true;
             case Keys.Control | Keys.Shift | Keys.S: if (!restoring) SetOrientation(!vertical); return true;
+            case Keys.Control | Keys.Shift | Keys.B: if (!restoring) ToggleTabBarCollapsed(); return true;
             case Keys.Control | Keys.Oemcomma: OpenSettings(); return true;
             case Keys.Control | Keys.Tab:
             case Keys.Control | Keys.PageDown: if (!restoring) CycleTab(1); return true;
@@ -4050,6 +4515,9 @@ sealed class BrowserWindow : Form
 
         if (next.VerticalTabs != vertical)
             SetOrientation(next.VerticalTabs, persistSettings: false);
+
+        if (next.TabBarCollapsed != tabBarCollapsed)
+            SetTabBarCollapsed(next.TabBarCollapsed, persistSettings: false);
 
         if (next.ShareEnabled != prev.ShareEnabled)
         {
@@ -4491,6 +4959,12 @@ sealed class BrowserWindow : Form
                 }),
                 selectedIndex = selected is null ? -1 : opened.IndexOf(selected),
                 vertical,
+                tabBarCollapsed,
+                collapsedAtStartup,
+                sidebarWidth = sidebar.Width,
+                railWidth = RailWidth,
+                stripTabsVisible = stripTabs.Visible,
+                stripActiveTitleVisible = stripActiveTitle.Visible,
                 horizontalLayout = CheckHorizontalLayout(),
                 pinnedSurvivesClose = firstPinned is null || opened.Contains(firstPinned),
                 pinnedFirst = CheckPinnedFirst(),
@@ -5628,6 +6102,7 @@ sealed class BrowserWindow : Form
         var guardSelectedBefore = selected;
         var guardCountBefore = opened.Count;
         var guardVerticalBefore = vertical;
+        var guardCollapsedBefore = tabBarCollapsed;
         closedUrls.Push(fixture + "/closed-during-restore");
         var closedCountBefore = closedUrls.Count;
         var restoreLaunchCalled = false;
@@ -5640,6 +6115,7 @@ sealed class BrowserWindow : Form
             PressKey(Keys.Control | Keys.W);
             PressKey(Keys.Control | Keys.Shift | Keys.T);
             PressKey(Keys.Control | Keys.Shift | Keys.S);
+            PressKey(Keys.Control | Keys.Shift | Keys.B);
             PressKey(Keys.Control | Keys.Tab);
             PressKey(Keys.Control | Keys.Shift | Keys.Tab);
             PressKey(Keys.Control | Keys.PageUp);
@@ -5655,6 +6131,7 @@ sealed class BrowserWindow : Form
             && opened.Count == guardCountBefore
             && selected == guardSelectedBefore
             && vertical == guardVerticalBefore
+            && tabBarCollapsed == guardCollapsedBefore
             && closedUrls.Count == closedCountBefore;
         if (closedUrls.Count > 0 && closedUrls.Peek() == fixture + "/closed-during-restore") closedUrls.Pop();
         CloseTab(restoreGuardTab, recordClosed: false);
@@ -5835,7 +6312,7 @@ sealed class BrowserWindow : Form
         PerformLayout();
         var liveStripRects = new[]
         {
-            BoundsInForm(backBtn), BoundsInForm(forwardBtn), BoundsInForm(reloadBtn),
+            BoundsInForm(collapseBtn), BoundsInForm(backBtn), BoundsInForm(forwardBtn), BoundsInForm(reloadBtn),
             BoundsInForm(address), BoundsInForm(stripTabs), BoundsInForm(stripNewTabBtn),
             BoundsInForm(updateBtn), BoundsInForm(shareBtn), BoundsInForm(settingsBtn),
             minBtn.Bounds, maxBtn.Bounds, closeBtn.Bounds,
@@ -5849,7 +6326,7 @@ sealed class BrowserWindow : Form
         var liveSideBand = BoundsInForm(sideTopBand);
         var liveSideRects = new[]
         {
-            BoundsInForm(backBtn), BoundsInForm(forwardBtn), BoundsInForm(reloadBtn),
+            BoundsInForm(collapseBtn), BoundsInForm(backBtn), BoundsInForm(forwardBtn), BoundsInForm(reloadBtn),
             BoundsInForm(updateBtn), BoundsInForm(shareBtn), BoundsInForm(settingsBtn),
         };
         var liveVertOk = address.Width >= S(160) && address.Height == S(28)
@@ -5874,7 +6351,7 @@ sealed class BrowserWindow : Form
                 var simArea = new Rectangle(0, 0, simW, simH);
                 var simRects = new[]
                 {
-                    backBtn.Bounds, forwardBtn.Bounds, reloadBtn.Bounds,
+                    collapseBtn.Bounds, backBtn.Bounds, forwardBtn.Bounds, reloadBtn.Bounds,
                     address.Bounds, stripTabs.Bounds, stripNewTabBtn.Bounds,
                     updateBtn.Bounds, shareBtn.Bounds, settingsBtn.Bounds,
                     minBtn.Bounds, maxBtn.Bounds, closeBtn.Bounds,
@@ -5897,7 +6374,7 @@ sealed class BrowserWindow : Form
                 var bandArea = new Rectangle(0, 0, sideInnerW, bandH);
                 var bandRects = new[]
                 {
-                    backBtn.Bounds, forwardBtn.Bounds, reloadBtn.Bounds,
+                    collapseBtn.Bounds, backBtn.Bounds, forwardBtn.Bounds, reloadBtn.Bounds,
                     updateBtn.Bounds, shareBtn.Bounds, settingsBtn.Bounds,
                 };
                 var (pinCols, pinW, pinH, pinGap) = PinGridMetrics(4);
@@ -6911,6 +7388,160 @@ sealed class BrowserWindow : Form
             f11FinalRestores,
         };
 
+        // #55: Collapsible tab bar — vertical icon rail, hover peek overlay, horizontal compact title, Ctrl+Shift+B, orientation switch, F11, DPI.
+        SetOrientation(true, persistSettings: false);
+        SetTabBarCollapsed(false, persistSettings: false);
+        PerformLayout();
+        var colTab2 = new BrowserTab { SavedUrl = fixture + "/second", SavedTitle = "Rail Tab 2" };
+        var colTab3 = new BrowserTab { SavedUrl = fixture + "/third", SavedTitle = "Rail Tab 3" };
+        opened.AddRange([colTab2, colTab3]);
+        SelectTab(first);
+        SyncTabs();
+        PerformLayout();
+
+        var expandedSideW = sidebar.Width;
+        var expandedPagesW = pages.Width;
+        PressKey(Keys.Control | Keys.Shift | Keys.B);
+        PerformLayout();
+        var railWidthOk = TabBarCollapsed
+            && sidebar.Width == RailWidth
+            && railSpacer.Visible && railSpacer.Width == RailWidth
+            && !sideAddressWrap.Visible
+            && collapseBtn.Glyph == Theme.Glyphs.OpenPane
+            && Math.Abs(pages.Width - (expandedPagesW + (expandedSideW - RailWidth))) <= 1
+            && SettingsStore.Load(settingsFile).Settings.TabBarCollapsed;
+
+        var railItems = sidePins.Controls.OfType<Control>().Where(c => c is not TabChromeControl { Closing: true }).OfType<ITabItem>()
+            .Concat(sideTabs.Items.OfType<Control>().Where(c => c is not TabChromeControl { Closing: true }).OfType<ITabItem>()).ToArray();
+        var railItem2 = tabControls[colTab2];
+        var railItem3 = tabControls[colTab3];
+        var railClickPt = new Point(railItem2.Width / 2, railItem2.Height / 2);
+        SendMessage(railItem2.Handle, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, MakeLParam(railClickPt.X, railClickPt.Y));
+        SendMessage(railItem2.Handle, WM_LBUTTONUP, IntPtr.Zero, MakeLParam(railClickPt.X, railClickPt.Y));
+        var railClickSelected = selected == colTab2;
+        var railMidPt = new Point(railItem3.Width / 2, railItem3.Height / 2);
+        SendMessage(railItem3.Handle, WM_MBUTTONDOWN, (IntPtr)MK_MBUTTON, MakeLParam(railMidPt.X, railMidPt.Y));
+        SendMessage(railItem3.Handle, WM_MBUTTONUP, IntPtr.Zero, MakeLParam(railMidPt.X, railMidPt.Y));
+        var railDragDisabled = !StartTabDrag(colTab2, CenterOnScreen(railItem2));
+        var railItemsOk = railItems.Length == 3
+            && railItem2.Width <= RailWidth
+            && railClickSelected
+            && !opened.Contains(colTab3)
+            && railDragDisabled;
+        SelectTab(first);
+
+        // Hover peek overlay slides over pages without changing pages bounds, and sits above cardFrame in z-order.
+        var pagesBeforePeek = BoundsInForm(pages);
+        SetPeekOpen(true);
+        PerformLayout();
+        var peekOpenOk = PeekOpen
+            && sidebar.Width == ExpandedSidebarWidth
+            && sideAddressWrap.Visible
+            && peekBorder.Visible
+            && BoundsInForm(pages) == pagesBeforePeek
+            && Controls.GetChildIndex(sidebar) < Controls.GetChildIndex(cardFrame);
+        SetPeekOpen(false);
+        PerformLayout();
+        var peekCloseOk = !PeekOpen
+            && sidebar.Width == RailWidth
+            && !sideAddressWrap.Visible
+            && !peekBorder.Visible
+            && BoundsInForm(pages) == pagesBeforePeek;
+
+        // Animated peek slide via MotionClock with animations enabled.
+        var prevPeekMotion = motion.ForceEnabled;
+        bool peekAnimOk;
+        try
+        {
+            motion.ForceEnabled = true;
+            SetPeekOpen(true);
+            var peekMidStarted = motion.IsRunning && sidebar.Width < ExpandedSidebarWidth;
+            motion.Advance(Motion.PeekSlideDurationMs / 2);
+            var peekMidBounds = sidebar.Width > RailWidth && sidebar.Width < ExpandedSidebarWidth && BoundsInForm(pages) == pagesBeforePeek;
+            motion.Advance(Motion.PeekSlideDurationMs + 10);
+            var peekEndOpen = sidebar.Width == ExpandedSidebarWidth && !motion.IsRunning && BoundsInForm(pages) == pagesBeforePeek;
+            SetPeekOpen(false);
+            motion.Advance(Motion.PeekSlideDurationMs / 2);
+            var peekClosingMid = sidebar.Width > RailWidth && sidebar.Width < ExpandedSidebarWidth && BoundsInForm(pages) == pagesBeforePeek;
+            motion.Advance(Motion.PeekSlideDurationMs + 10);
+            var peekEndClosed = sidebar.Width == RailWidth && !motion.IsRunning && !sideAddressWrap.Visible && BoundsInForm(pages) == pagesBeforePeek;
+            peekAnimOk = peekMidStarted && peekMidBounds && peekEndOpen && peekClosingMid && peekEndClosed;
+        }
+        finally
+        {
+            motion.ForceEnabled = prevPeekMotion;
+            CancelPeek(animate: false);
+        }
+
+        // Ctrl+Shift+B toggles back to expanded and collapsed again.
+        PressKey(Keys.Control | Keys.Shift | Keys.B);
+        PerformLayout();
+        var ctrlShiftBExpandOk = !TabBarCollapsed
+            && sidebar.Width == ExpandedSidebarWidth
+            && !railSpacer.Visible
+            && collapseBtn.Glyph == Theme.Glyphs.ClosePane
+            && Math.Abs(pages.Width - expandedPagesW) <= 1
+            && !SettingsStore.Load(settingsFile).Settings.TabBarCollapsed;
+        PressKey(Keys.Control | Keys.Shift | Keys.B);
+        PerformLayout();
+        var ctrlShiftBTogglesOk = ctrlShiftBExpandOk && TabBarCollapsed && sidebar.Width == RailWidth;
+
+        // Orientation switch while collapsed lays out horizontal compact title and returns to vertical rail.
+        PressKey(Keys.Control | Keys.Shift | Keys.S);
+        PerformLayout();
+        var horizCollapsedOk = !vertical && TabBarCollapsed
+            && topStrip.Visible && !sidebar.Visible && !railSpacer.Visible
+            && !stripTabs.Visible && !stripNewTabBtn.Visible
+            && stripActiveTitle.Visible && stripActiveTitle.Title == first.Title
+            && CheckHorizontalLayout();
+        PressKey(Keys.Control | Keys.Shift | Keys.S);
+        PerformLayout();
+        var orientSwitchCollapsedOk = horizCollapsedOk
+            && vertical && TabBarCollapsed
+            && sidebar.Visible && railSpacer.Visible
+            && sidebar.Width == RailWidth && !topStrip.Visible && !sideAddressWrap.Visible;
+
+        // F11 in collapsed state hides chrome and restores collapsed rail afterwards.
+        PressKey(Keys.F11);
+        PerformLayout();
+        var f11CollapsedHidden = IsFullscreen && !sidebar.Visible && !railSpacer.Visible && !topStrip.Visible;
+        PressKey(Keys.F11);
+        PerformLayout();
+        var f11RestoresCollapsedOk = f11CollapsedHidden
+            && !IsFullscreen && TabBarCollapsed
+            && sidebar.Visible && railSpacer.Visible
+            && sidebar.Width == RailWidth && !sideAddressWrap.Visible;
+
+        // SetChromeHidden and DownloadsAnchor cooperate with collapsed rail.
+        SetChromeHidden(true);
+        PerformLayout();
+        var chromeHiddenRailOk = !sidebar.Visible && !railSpacer.Visible;
+        SetChromeHidden(false);
+        PerformLayout();
+        var chromeRestoredRailOk = chromeHiddenRailOk && sidebar.Visible && railSpacer.Visible && sidebar.Width == RailWidth;
+        var downloadsAnchorOk = ReferenceEquals(DownloadsAnchor(), collapseBtn) && collapseBtn.Visible;
+
+        // Clean up temporary tabs and return to expanded before writing main report.
+        if (opened.Contains(colTab2)) { colTab2.Closed = true; opened.Remove(colTab2); }
+        if (opened.Contains(colTab3)) { colTab3.Closed = true; opened.Remove(colTab3); }
+        SetTabBarCollapsed(false, persistSettings: true);
+        SelectTab(first);
+        SyncTabs();
+        PerformLayout();
+
+        var collapsibleTabBar = new
+        {
+            railWidthOk,
+            railItemsOk,
+            peekOpenOk,
+            peekCloseOk,
+            peekAnimOk,
+            ctrlShiftBTogglesOk,
+            orientSwitchCollapsedOk,
+            f11RestoresCollapsedOk,
+            chromeHiddenAndAnchorOk = chromeRestoredRailOk && downloadsAnchorOk,
+        };
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -6923,7 +7554,7 @@ sealed class BrowserWindow : Form
             faviconCached, addressDisplayOk, tabDrag, tabAnim, tabFixes, highDpi, shareTimeout,
             tabCycle, loadingStop, tabMenuAndNewWindow, findInPage, zoomAndPrint,
             postClean, blobUrl, permissions, downloads = downloadsReport, processCrash,
-            crashUi, fullscreen = fullscreenReport,
+            crashUi, fullscreen = fullscreenReport, collapsibleTabBar,
             sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
             rejectsLocalFiles = Resolve("file:///C:/Windows/win.ini") == null && !PageHandoff.Allowed("file:///C:/Windows/win.ini"),
@@ -6972,6 +7603,7 @@ sealed class BrowserWindow : Form
         thirdSaved.Pinned = true;
         SelectTab(secondSaved);
         SetOrientation(false);
+        SetTabBarCollapsed(true);
         ExitCode = 0;
         Close();
     }

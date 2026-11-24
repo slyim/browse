@@ -61,6 +61,10 @@ static class Theme
         public static readonly string ChevronUp = "\uE70E";  // caret-up
         public static readonly string ChevronDown = "\uE70D"; // caret-down
         public static readonly string Warning = "\uE7BA";    // warning
+        // https://learn.microsoft.com/en-us/windows/apps/design/style/segoe-fluent-icons-font
+        // ClosePaneMirrored (EA49) / OpenPaneMirrored (EA5B) show a left-hand pane with left/right arrows.
+        public static readonly string ClosePane = "\uEA49";  // ClosePaneMirrored
+        public static readonly string OpenPane = "\uEA5B";   // OpenPaneMirrored
 
         // Window caption buttons stay on Segoe Fluent Icons to match native Windows chrome.
         public const string Minimize = "\uE921";
@@ -902,6 +906,7 @@ sealed class TabRow : TabChromeControl
 {
     string title;
     string? badge;
+    string compactLetter;
     Image? favicon;
     bool active;
     bool loading;
@@ -914,6 +919,7 @@ sealed class TabRow : TabChromeControl
     {
         this.title = title;
         badge = url is null ? null : Theme.Monogram(url, title);
+        compactLetter = Theme.Monogram(url, title);
         this.favicon = favicon;
         this.active = active;
         this.loading = loading;
@@ -931,11 +937,13 @@ sealed class TabRow : TabChromeControl
     public override void UpdateTab(string title, string? url, bool active, Image? favicon, bool loading = false, TabAudioState audio = TabAudioState.None, int loadingPhase = 0)
     {
         var nextBadge = url is null ? null : Theme.Monogram(url, title);
-        if (this.title == title && badge == nextBadge && this.active == active && ReferenceEquals(this.favicon, favicon)
+        var nextCompact = Theme.Monogram(url, title);
+        if (this.title == title && badge == nextBadge && compactLetter == nextCompact && this.active == active && ReferenceEquals(this.favicon, favicon)
             && this.loading == loading && this.audio == audio && (!loading || this.loadingPhase == loadingPhase)) return;
         var activeChanged = this.active != active;
         this.title = title;
         badge = nextBadge;
+        compactLetter = nextCompact;
         this.favicon = favicon;
         this.active = active;
         this.loading = loading;
@@ -953,8 +961,9 @@ sealed class TabRow : TabChromeControl
         Invalidate();
     }
 
+    bool Compact => Width < S(78);
     Rectangle CloseDotRect => new(Width - S(7) - S(15), (Height - S(15)) / 2, S(15), S(15));
-    protected override bool IsClosePoint(Point p) => hovered && p.X >= Width - S(26);
+    protected override bool IsClosePoint(Point p) => hovered && !Compact && p.X >= Width - S(26);
     protected override void ClearCloseHover()
     {
         closeHovered = false;
@@ -987,10 +996,26 @@ sealed class TabRow : TabChromeControl
             Theme.FillRounded(g, surface, new RectangleF(lift * 0.5f, lift, Math.Max(0, Width - lift), Math.Max(0, Height - lift)), Sf(9f));
         }
 
+        var mark = S(16);
+        if (Compact)
+        {
+            var box = new Rectangle((Width - mark) / 2, (Height - mark) / 2, mark, mark);
+            if (loading) Theme.DrawSpinner(g, box, loadingPhase, active, DeviceDpi / 96f);
+            else if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
+            else Theme.DrawMonogram(g, box, compactLetter, active, DeviceDpi);
+            if (audio != TabAudioState.None)
+            {
+                var aSize = S(10);
+                Theme.DrawAudioGlyph(g, new Rectangle(Width - aSize - S(2), S(2), aSize, aSize), audio, active, DeviceDpi, tiny: true);
+            }
+            PaintAppearWash(g);
+            PaintDragGhost(g);
+            return;
+        }
+
         var x = S(10);
         if (loading || favicon is not null || badge is not null)
         {
-            var mark = S(16);
             var box = new Rectangle(x, (Height - mark) / 2, mark, mark);
             if (loading) Theme.DrawSpinner(g, box, loadingPhase, active, DeviceDpi / 96f);
             else if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
@@ -1289,6 +1314,13 @@ sealed class QuietRow : ChromeControl
         if (hovered) Theme.FillRounded(g, Theme.SideHover, new RectangleF(0, 0, Width, Height), Sf(9f));
         var color = hovered ? Theme.InkSoft : Theme.Faint;
         var mark = S(15);
+        if (Width < S(78))
+        {
+            var centerRect = new Rectangle((Width - mark) / 2, (Height - mark) / 2, mark, mark);
+            TextRenderer.DrawText(g, Theme.Glyphs.NewTab, Theme.FontForDpi(Theme.SmallIconFont, DeviceDpi), centerRect, color,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            return;
+        }
         var iconRect = new Rectangle(S(10), (Height - mark) / 2, mark, mark);
         TextRenderer.DrawText(g, Theme.Glyphs.NewTab, Theme.FontForDpi(Theme.SmallIconFont, DeviceDpi), iconRect, color,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
@@ -1296,6 +1328,90 @@ sealed class QuietRow : ChromeControl
         var textRect = new Rectangle(x, 0, Math.Max(0, Width - x - S(10)), Height);
         TextRenderer.DrawText(g, Text, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, color,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+    }
+}
+
+sealed class ActiveTabTitle : ChromeControl
+{
+    string title = "";
+    string? badge;
+    Image? favicon;
+    bool loading;
+    TabAudioState audio;
+    int loadingPhase;
+
+    internal ActiveTabTitle()
+    {
+        BackColor = Theme.Ground;
+        Height = S(28);
+        Visible = false;
+        AccessibleRole = AccessibleRole.StaticText;
+    }
+
+    internal string Title => title;
+
+    internal void UpdateTab(string title, string? url, Image? favicon, bool loading, TabAudioState audio, int loadingPhase)
+    {
+        var nextBadge = url is null ? null : Theme.Monogram(url, title);
+        if (this.title == title && badge == nextBadge && ReferenceEquals(this.favicon, favicon)
+            && this.loading == loading && this.audio == audio && (!loading || this.loadingPhase == loadingPhase))
+            return;
+        this.title = title;
+        badge = nextBadge;
+        this.favicon = favicon;
+        this.loading = loading;
+        this.audio = audio;
+        this.loadingPhase = loadingPhase;
+        AccessibleName = title;
+        Invalidate();
+    }
+
+    internal void SetLoadingPhase(int phase)
+    {
+        if (!loading || loadingPhase == phase) return;
+        loadingPhase = phase;
+        Invalidate();
+    }
+
+    internal int MeasureWidth(int maxWidth)
+    {
+        if (maxWidth <= 0) return 0;
+        var mark = (loading || favicon is not null || badge is not null) ? S(16) + S(6) : 0;
+        var audioW = audio != TabAudioState.None ? S(15) + S(6) : 0;
+        var textW = TextRenderer.MeasureText(title, Theme.FontForDpi(Theme.UiFont, DeviceDpi), Size.Empty,
+            TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine).Width;
+        var desired = S(10) + mark + textW + audioW + S(10);
+        return Math.Min(maxWidth, Math.Clamp(desired, S(64), S(240)));
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(BackColor);
+        if (Width <= 1 || Height <= 1) return;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        Theme.FillRounded(g, Theme.StripActive, new RectangleF(0, 0, Width, Height), Sf(9f));
+        var x = S(10);
+        var mark = S(16);
+        if (loading || favicon is not null || badge is not null)
+        {
+            var box = new Rectangle(x, (Height - mark) / 2, mark, mark);
+            if (loading) Theme.DrawSpinner(g, box, loadingPhase, active: true, DeviceDpi / 96f);
+            else if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
+            else Theme.DrawMonogram(g, box, badge!, active: true, DeviceDpi);
+            x += mark + S(6);
+        }
+        var showAudio = audio != TabAudioState.None && Width >= S(80);
+        var rightPad = showAudio ? S(26) : S(10);
+        var textRect = new Rectangle(x, 0, Math.Max(0, Width - x - rightPad), Height);
+        TextRenderer.DrawText(g, title, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, Theme.Ink,
+            TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        if (showAudio)
+        {
+            var audioSize = S(15);
+            Theme.DrawAudioGlyph(g, new Rectangle(Width - S(6) - audioSize, (Height - audioSize) / 2, audioSize, audioSize), audio, active: true, DeviceDpi);
+        }
     }
 }
 

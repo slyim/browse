@@ -15,6 +15,7 @@ static class Motion
     public const double DropGlideDurationMs = 150;
     public const double OpenCloseDurationMs = 150;
     public const double PinTransitionDurationMs = 140;
+    public const double PeekSlideDurationMs = 150;
 
     [DllImport("user32.dll", SetLastError = true)]
     static extern bool SystemParametersInfo(uint uiAction, uint uiParam, out int pvParam, uint fWinIni);
