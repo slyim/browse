@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 
 namespace SearchPort;
 
@@ -28,6 +29,8 @@ static class Theme
 
     public static readonly Color BadgeFill = Dark ? Color.FromArgb(0x14, 0xFF, 0xFF, 0xFF) : Color.FromArgb(0x10, 0x00, 0x00, 0x00);
     public static readonly Color CloseHoverFill = Dark ? Color.FromArgb(0x22, 0xFF, 0xFF, 0xFF) : Color.FromArgb(0x18, 0x00, 0x00, 0x00);
+    public static readonly Color DropLine = Dark ? Color.FromArgb(0x6B, 0xA4, 0xFF) : Color.FromArgb(0x25, 0x63, 0xEB);
+    public static readonly Color DropSlotFill = Dark ? Color.FromArgb(0x28, 0x6B, 0xA4, 0xFF) : Color.FromArgb(0x1C, 0x25, 0x63, 0xEB);
 
 
     public static class Glyphs
@@ -103,6 +106,23 @@ static class Theme
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
     }
 
+    public static void DrawFavicon(Graphics g, Rectangle box, Image icon)
+    {
+        if (box.Width <= 0 || box.Height <= 0 || icon.Width <= 0 || icon.Height <= 0) return;
+        var scale = Math.Min((float)box.Width / icon.Width, (float)box.Height / icon.Height);
+        var w = Math.Max(1, (int)Math.Round(icon.Width * scale));
+        var h = Math.Max(1, (int)Math.Round(icon.Height * scale));
+        var dest = new Rectangle(box.X + (box.Width - w) / 2, box.Y + (box.Height - h) / 2, w, h);
+        var prev = g.InterpolationMode;
+        g.InterpolationMode = w == icon.Width && h == icon.Height
+            ? InterpolationMode.NearestNeighbor
+            : InterpolationMode.HighQualityBicubic;
+        using var attrs = new ImageAttributes();
+        attrs.SetWrapMode(WrapMode.TileFlipXY);
+        g.DrawImage(icon, dest, 0, 0, icon.Width, icon.Height, GraphicsUnit.Pixel, attrs);
+        g.InterpolationMode = prev;
+    }
+
     public static void DrawCloseDot(Graphics g, Rectangle box, bool closeHovered)
     {
         using var brush = new SolidBrush(closeHovered ? CloseHoverFill : BadgeFill);
@@ -115,7 +135,7 @@ static class Theme
 interface ITabItem
 {
     bool Pinned { get; }
-    void UpdateTab(string title, string? url, bool active);
+    void UpdateTab(string title, string? url, bool active, Image? favicon);
 }
 
 abstract class ChromeControl : Control
@@ -316,22 +336,41 @@ sealed class AddressLine : ChromeControl
             BackColor = fillColor,
             ForeColor = Theme.InkSoft,
             PlaceholderText = "Search or enter address",
-            AccessibleName = "Address"
+            AccessibleName = "Address",
+            Visible = false
         };
         input.GotFocus += (_, _) => {
             focused = true;
+            input.Visible = true;
             input.ForeColor = Theme.Ink;
             Invalidate();
             if (!IsDisposed && IsHandleCreated)
-                BeginInvoke(() => { if (!IsDisposed && !input.IsDisposed) input.SelectAll(); });
+                BeginInvoke(() => { if (!IsDisposed && !input.IsDisposed && input.Focused) input.SelectAll(); });
         };
-        input.LostFocus += (_, _) => { focused = false; input.ForeColor = Theme.InkSoft; Invalidate(); };
+        input.LostFocus += (_, _) => {
+            focused = false;
+            input.Visible = false;
+            input.ForeColor = Theme.InkSoft;
+            Invalidate();
+        };
+        input.TextChanged += (_, _) => { if (!focused) Invalidate(); };
         Controls.Add(input);
         Height = S(28);
     }
 
     internal TextBox Input => input;
     internal bool InputFocused => input.Focused;
+    internal string DisplayText => string.IsNullOrEmpty(input.Text) ? input.PlaceholderText : FormatDisplayUrl(input.Text);
+
+    internal static string FormatDisplayUrl(string url)
+    {
+        if (url.Length > 8 && url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            var rest = url[8..];
+            return rest.IndexOf('/') == rest.Length - 1 ? rest[..^1] : rest;
+        }
+        return url;
+    }
 
     internal void SetSurface(Color surface, Color fill)
     {
@@ -343,7 +382,12 @@ sealed class AddressLine : ChromeControl
 
     internal void FocusInput()
     {
-        input.Focus();
+        input.Visible = true;
+        if (!input.Focus())
+        {
+            input.Visible = input.Focused;
+            return;
+        }
         input.SelectAll();
     }
 
@@ -358,7 +402,7 @@ sealed class AddressLine : ChromeControl
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
-        if (e.Button == MouseButtons.Left) input.Focus();
+        if (e.Button == MouseButtons.Left && !input.Focused) FocusInput();
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -370,67 +414,249 @@ sealed class AddressLine : ChromeControl
         Theme.FillRounded(g, fillColor, new RectangleF(0, 0, Width, Height), Sf(9f));
         if (focused)
             Theme.DrawRounded(g, Theme.Hairline, new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), Sf(8.5f));
+        else
+        {
+            var pad = S(10);
+            var textRect = new Rectangle(pad, 0, Math.Max(0, Width - pad * 2), Height);
+            var empty = string.IsNullOrEmpty(input.Text);
+            TextRenderer.DrawText(g, DisplayText, Theme.UiFont, textRect, empty ? Theme.Muted : Theme.InkSoft,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        }
     }
 }
 
-sealed class TabRow : ChromeControl, ITabItem
+sealed class TabDragCallbacks(Func<Point, bool> start, Action<Point> move, Action<Point> drop, Action cancel)
 {
-    string title;
-    string? badge;
-    bool active;
+    public Func<Point, bool> Start { get; } = start;
+    public Action<Point> Move { get; } = move;
+    public Action<Point> Drop { get; } = drop;
+    public Action Cancel { get; } = cancel;
+}
+
+abstract class TabChromeControl : ChromeControl, ITabItem
+{
+    const int WM_LBUTTONUP = 0x0202;
+
     readonly Action onSelect;
     readonly Action onClose;
-    bool hovered;
-    bool closeHovered;
+    readonly TabDragCallbacks? drag;
+    protected bool hovered;
+    protected bool dragSource;
+    Point? pressPoint;
+    bool pressedInClose;
+    bool dragging;
+    bool hadCapture;
+    bool suppressClick;
+    bool releasingLeft;
 
-    internal TabRow(string title, string? url, bool active, Action onSelect, Action onClose)
+    protected TabChromeControl(Action onSelect, Action onClose, TabDragCallbacks? drag)
     {
-        this.title = title;
-        badge = url is null ? null : Theme.Monogram(url, title);
-        this.active = active;
         this.onSelect = onSelect;
         this.onClose = onClose;
-        BackColor = Theme.Frame;
-        Height = S(28);
+        this.drag = drag;
         Cursor = Cursors.Hand;
-        AccessibleName = title;
         AccessibleRole = AccessibleRole.PageTab;
     }
 
-    public bool Pinned => false;
+    public abstract bool Pinned { get; }
+    public abstract void UpdateTab(string title, string? url, bool active, Image? favicon);
 
-    public void UpdateTab(string title, string? url, bool active)
+    protected virtual bool IsClosePoint(Point p) => false;
+    protected virtual void UpdateCloseHover(Point p) { }
+    protected virtual void ClearCloseHover() { }
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == WM_LBUTTONUP)
+        {
+            releasingLeft = true;
+            try { base.WndProc(ref m); }
+            finally { releasingLeft = false; }
+            return;
+        }
+        base.WndProc(ref m);
+    }
+
+    internal void CancelDrag()
+    {
+        var wasDragging = dragging || dragSource;
+        dragging = false;
+        dragSource = false;
+        hadCapture = false;
+        pressPoint = null;
+        pressedInClose = false;
+        if (wasDragging) suppressClick = true;
+        if (Capture) Capture = false;
+        if (wasDragging) Invalidate();
+    }
+
+    protected void PaintDragGhost(Graphics g)
+    {
+        if (!dragSource) return;
+        using var wash = new SolidBrush(Color.FromArgb(128, BackColor));
+        g.FillRectangle(wash, ClientRectangle);
+        Theme.DrawRounded(g, Theme.DropLine, new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), Sf(8.5f));
+    }
+
+    protected override void OnMouseEnter(EventArgs e)
+    {
+        base.OnMouseEnter(e);
+        if (!dragging) { hovered = true; Invalidate(); }
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        hovered = false;
+        ClearCloseHover();
+        Invalidate();
+    }
+
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        base.OnMouseDown(e);
+        if (dragging && e.Button == MouseButtons.Right)
+        {
+            CancelDrag();
+            drag?.Cancel();
+            return;
+        }
+        if (e.Button != MouseButtons.Left) return;
+        suppressClick = false;
+        dragging = false;
+        hadCapture = false;
+        if (IsClosePoint(e.Location))
+        {
+            pressedInClose = true;
+            pressPoint = null;
+        }
+        else
+        {
+            pressedInClose = false;
+            pressPoint = e.Location;
+        }
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        if (!dragging)
+        {
+            UpdateCloseHover(e.Location);
+            if (pressPoint is { } start && drag is not null)
+            {
+                var threshold = SystemInformation.DragSize;
+                if (Math.Abs(e.X - start.X) > threshold.Width / 2 || Math.Abs(e.Y - start.Y) > threshold.Height / 2)
+                {
+                    var screenPt = PointToScreen(e.Location);
+                    if (drag.Start(screenPt))
+                    {
+                        dragging = true;
+                        dragSource = true;
+                        hovered = false;
+                        ClearCloseHover();
+                        Capture = true;
+                        hadCapture = Capture;
+                        Invalidate();
+                    }
+                    else pressPoint = null;
+                }
+            }
+            return;
+        }
+        drag?.Move(PointToScreen(e.Location));
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (e.Button == MouseButtons.Middle)
+        {
+            if (!dragging) onClose();
+            return;
+        }
+        if (e.Button != MouseButtons.Left) return;
+        if (dragging)
+        {
+            dragging = false;
+            dragSource = false;
+            hadCapture = false;
+            pressPoint = null;
+            pressedInClose = false;
+            Invalidate();
+            if (Capture) Capture = false;
+            drag?.Drop(PointToScreen(e.Location));
+            return;
+        }
+        var wasClose = pressedInClose;
+        var suppressed = suppressClick;
+        pressPoint = null;
+        pressedInClose = false;
+        suppressClick = false;
+        if (suppressed || !ClientRectangle.Contains(e.Location)) return;
+        if (wasClose) { if (IsClosePoint(e.Location)) onClose(); }
+        else if (!IsClosePoint(e.Location)) onSelect();
+    }
+
+    protected override void OnMouseCaptureChanged(EventArgs e)
+    {
+        base.OnMouseCaptureChanged(e);
+        if (releasingLeft || Capture) return;
+        pressPoint = null;
+        pressedInClose = false;
+        if (dragging && hadCapture)
+        {
+            dragging = false;
+            dragSource = false;
+            hadCapture = false;
+            suppressClick = true;
+            Invalidate();
+            drag?.Cancel();
+        }
+    }
+}
+
+sealed class TabRow : TabChromeControl
+{
+    string title;
+    string? badge;
+    Image? favicon;
+    bool active;
+    bool closeHovered;
+
+    internal TabRow(string title, string? url, bool active, Image? favicon, Action onSelect, Action onClose, TabDragCallbacks? drag = null)
+        : base(onSelect, onClose, drag)
+    {
+        this.title = title;
+        badge = url is null ? null : Theme.Monogram(url, title);
+        this.favicon = favicon;
+        this.active = active;
+        BackColor = Theme.Frame;
+        Height = S(28);
+        AccessibleName = title;
+    }
+
+    public override bool Pinned => false;
+
+    public override void UpdateTab(string title, string? url, bool active, Image? favicon)
     {
         var nextBadge = url is null ? null : Theme.Monogram(url, title);
-        if (this.title == title && badge == nextBadge && this.active == active) return;
+        if (this.title == title && badge == nextBadge && this.active == active && ReferenceEquals(this.favicon, favicon)) return;
         this.title = title;
         badge = nextBadge;
+        this.favicon = favicon;
         this.active = active;
         AccessibleName = title;
         Invalidate();
     }
 
     Rectangle CloseDotRect => new(Width - S(7) - S(15), (Height - S(15)) / 2, S(15), S(15));
-    bool InCloseZone(int x) => hovered && x >= Width - S(26);
-
-    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hovered = true; Invalidate(); }
-    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hovered = false; closeHovered = false; Invalidate(); }
-    protected override void OnMouseMove(MouseEventArgs e)
+    protected override bool IsClosePoint(Point p) => hovered && p.X >= Width - S(26);
+    protected override void ClearCloseHover() => closeHovered = false;
+    protected override void UpdateCloseHover(Point p)
     {
-        base.OnMouseMove(e);
-        var over = InCloseZone(e.X);
+        var over = IsClosePoint(p);
         if (over != closeHovered) { closeHovered = over; Invalidate(); }
-    }
-
-    protected override void OnMouseUp(MouseEventArgs e)
-    {
-        base.OnMouseUp(e);
-        if (e.Button == MouseButtons.Middle) onClose();
-        else if (e.Button == MouseButtons.Left && ClientRectangle.Contains(e.Location))
-        {
-            if (InCloseZone(e.X)) onClose();
-            else onSelect();
-        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -443,10 +669,12 @@ sealed class TabRow : ChromeControl, ITabItem
             Theme.FillRounded(g, active ? Theme.SideActive : Theme.SideHover, new RectangleF(0, 0, Width, Height), Sf(9f));
 
         var x = S(10);
-        if (badge is not null)
+        if (favicon is not null || badge is not null)
         {
-            var mark = S(15);
-            Theme.DrawMonogram(g, new Rectangle(x, (Height - mark) / 2, mark, mark), badge, active);
+            var mark = S(16);
+            var box = new Rectangle(x, (Height - mark) / 2, mark, mark);
+            if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
+            else Theme.DrawMonogram(g, box, badge!, active);
             x += mark + S(8);
         }
 
@@ -457,51 +685,40 @@ sealed class TabRow : ChromeControl, ITabItem
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
         if (hovered) Theme.DrawCloseDot(g, CloseDotRect, closeHovered);
+        PaintDragGhost(g);
     }
 }
 
-sealed class PinSquare : ChromeControl, ITabItem
+sealed class PinSquare : TabChromeControl
 {
     string letter;
+    Image? favicon;
     bool active;
     readonly bool onFrame;
-    readonly Action onSelect;
-    readonly Action onClose;
-    bool hovered;
 
-    internal PinSquare(string title, string? url, bool active, bool onFrame, Action onSelect, Action onClose)
+    internal PinSquare(string title, string? url, bool active, Image? favicon, bool onFrame, Action onSelect, Action onClose, TabDragCallbacks? drag = null)
+        : base(onSelect, onClose, drag)
     {
         letter = Theme.Monogram(url, title);
+        this.favicon = favicon;
         this.active = active;
         this.onFrame = onFrame;
-        this.onSelect = onSelect;
-        this.onClose = onClose;
         BackColor = onFrame ? Theme.Frame : Theme.Ground;
-        Cursor = Cursors.Hand;
         AccessibleName = title;
-        AccessibleRole = AccessibleRole.PageTab;
     }
 
-    public bool Pinned => true;
+    public override bool Pinned => true;
     internal bool OnFrame => onFrame;
 
-    public void UpdateTab(string title, string? url, bool active)
+    public override void UpdateTab(string title, string? url, bool active, Image? favicon)
     {
         var nextLetter = Theme.Monogram(url, title);
-        if (AccessibleName == title && letter == nextLetter && this.active == active) return;
+        if (AccessibleName == title && letter == nextLetter && this.active == active && ReferenceEquals(this.favicon, favicon)) return;
         letter = nextLetter;
+        this.favicon = favicon;
         this.active = active;
         AccessibleName = title;
         Invalidate();
-    }
-
-    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hovered = true; Invalidate(); }
-    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hovered = false; Invalidate(); }
-    protected override void OnMouseUp(MouseEventArgs e)
-    {
-        base.OnMouseUp(e);
-        if (e.Button == MouseButtons.Middle) onClose();
-        else if (e.Button == MouseButtons.Left && ClientRectangle.Contains(e.Location)) onSelect();
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -514,48 +731,54 @@ sealed class PinSquare : ChromeControl, ITabItem
         var hoverTile = onFrame ? Theme.SideHover : Theme.StripHover;
         var fill = active ? Theme.PinActive : hovered ? hoverTile : restTile;
         Theme.FillRounded(g, fill, new RectangleF(0, 0, Width, Height), Sf(9f));
-        var color = active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
-        TextRenderer.DrawText(g, letter, onFrame ? Theme.PinFont : Theme.StripPinFont, ClientRectangle, color,
-            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        if (favicon is not null)
+        {
+            var mark = S(16);
+            Theme.DrawFavicon(g, new Rectangle((Width - mark) / 2, (Height - mark) / 2, mark, mark), favicon);
+        }
+        else
+        {
+            var color = active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
+            TextRenderer.DrawText(g, letter, onFrame ? Theme.PinFont : Theme.StripPinFont, ClientRectangle, color,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+        }
+        PaintDragGhost(g);
     }
 }
 
-sealed class TabPill : ChromeControl, ITabItem
+sealed class TabPill : TabChromeControl
 {
     string title;
     string? badge;
     string compactLetter;
+    Image? favicon;
     bool active;
-    readonly Action onSelect;
-    readonly Action onClose;
-    bool hovered;
     bool closeHovered;
 
-    internal TabPill(string title, string? url, bool active, Action onSelect, Action onClose)
+    internal TabPill(string title, string? url, bool active, Image? favicon, Action onSelect, Action onClose, TabDragCallbacks? drag = null)
+        : base(onSelect, onClose, drag)
     {
         this.title = title;
         badge = url is null ? null : Theme.Monogram(url, title);
         compactLetter = Theme.Monogram(url, title);
+        this.favicon = favicon;
         this.active = active;
-        this.onSelect = onSelect;
-        this.onClose = onClose;
         BackColor = Theme.Ground;
         Height = S(28);
-        Cursor = Cursors.Hand;
         AccessibleName = title;
-        AccessibleRole = AccessibleRole.PageTab;
     }
 
-    public bool Pinned => false;
+    public override bool Pinned => false;
 
-    public void UpdateTab(string title, string? url, bool active)
+    public override void UpdateTab(string title, string? url, bool active, Image? favicon)
     {
         var nextBadge = url is null ? null : Theme.Monogram(url, title);
         var nextCompact = Theme.Monogram(url, title);
-        if (this.title == title && badge == nextBadge && compactLetter == nextCompact && this.active == active) return;
+        if (this.title == title && badge == nextBadge && compactLetter == nextCompact && this.active == active && ReferenceEquals(this.favicon, favicon)) return;
         this.title = title;
         badge = nextBadge;
         compactLetter = nextCompact;
+        this.favicon = favicon;
         this.active = active;
         AccessibleName = title;
         Invalidate();
@@ -563,26 +786,12 @@ sealed class TabPill : ChromeControl, ITabItem
 
     bool Compact => Width < S(78);
     Rectangle CloseDotRect => new(Width - S(7) - S(15), (Height - S(15)) / 2, S(15), S(15));
-    bool InCloseZone(int x) => hovered && !Compact && x >= Width - S(26);
-
-    protected override void OnMouseEnter(EventArgs e) { base.OnMouseEnter(e); hovered = true; Invalidate(); }
-    protected override void OnMouseLeave(EventArgs e) { base.OnMouseLeave(e); hovered = false; closeHovered = false; Invalidate(); }
-    protected override void OnMouseMove(MouseEventArgs e)
+    protected override bool IsClosePoint(Point p) => hovered && !Compact && p.X >= Width - S(26);
+    protected override void ClearCloseHover() => closeHovered = false;
+    protected override void UpdateCloseHover(Point p)
     {
-        base.OnMouseMove(e);
-        var over = InCloseZone(e.X);
+        var over = IsClosePoint(p);
         if (over != closeHovered) { closeHovered = over; Invalidate(); }
-    }
-
-    protected override void OnMouseUp(MouseEventArgs e)
-    {
-        base.OnMouseUp(e);
-        if (e.Button == MouseButtons.Middle) onClose();
-        else if (e.Button == MouseButtons.Left && ClientRectangle.Contains(e.Location))
-        {
-            if (InCloseZone(e.X)) onClose();
-            else onSelect();
-        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -594,17 +803,22 @@ sealed class TabPill : ChromeControl, ITabItem
         if (active || hovered)
             Theme.FillRounded(g, active ? Theme.StripActive : Theme.StripHover, new RectangleF(0, 0, Width, Height), Sf(9f));
 
-        var mark = S(15);
+        var mark = S(16);
         if (Compact)
         {
-            Theme.DrawMonogram(g, new Rectangle((Width - mark) / 2, (Height - mark) / 2, mark, mark), compactLetter, active);
+            var box = new Rectangle((Width - mark) / 2, (Height - mark) / 2, mark, mark);
+            if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
+            else Theme.DrawMonogram(g, box, compactLetter, active);
+            PaintDragGhost(g);
             return;
         }
 
         var x = S(10);
-        if (badge is not null)
+        if (favicon is not null || badge is not null)
         {
-            Theme.DrawMonogram(g, new Rectangle(x, (Height - mark) / 2, mark, mark), badge, active);
+            var box = new Rectangle(x, (Height - mark) / 2, mark, mark);
+            if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
+            else Theme.DrawMonogram(g, box, badge!, active);
             x += mark + S(6);
         }
 
@@ -615,6 +829,7 @@ sealed class TabPill : ChromeControl, ITabItem
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
         if (hovered) Theme.DrawCloseDot(g, CloseDotRect, closeHovered);
+        PaintDragGhost(g);
     }
 }
 
@@ -675,6 +890,75 @@ sealed class Hairline : ChromeControl
     }
 }
 
+sealed class DropLineBar : ChromeControl
+{
+    internal DropLineBar() => Visible = false;
+
+    protected override void WndProc(ref Message m)
+    {
+        if (m.Msg == 0x0084) { m.Result = (IntPtr)(-1); return; } // HTTRANSPARENT
+        base.WndProc(ref m);
+    }
+
+    protected override void OnPaint(PaintEventArgs e) => e.Graphics.Clear(Theme.DropLine);
+}
+
+sealed class PinGridPanel : Panel
+{
+    bool dropHighlight;
+    bool emptyPlaceholder;
+    Rectangle? insertSlot;
+
+    internal PinGridPanel()
+    {
+        BackColor = Theme.Frame;
+        DoubleBuffered = true;
+    }
+
+    internal void SetDropPreview(bool highlight, bool placeholder, Rectangle? slot)
+    {
+        if (dropHighlight == highlight && emptyPlaceholder == placeholder && insertSlot == slot) return;
+        dropHighlight = highlight;
+        emptyPlaceholder = placeholder;
+        insertSlot = slot;
+        Invalidate();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        if (!dropHighlight && !emptyPlaceholder && insertSlot is null) return;
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        var radius = 9f * (DeviceDpi / 96f);
+        var padBottom = LogicalToDeviceUnits(10);
+        if (emptyPlaceholder)
+        {
+            var r = new RectangleF(0.5f, 0.5f, Math.Max(0, Width - 1f), Math.Max(0, Height - padBottom - 1f));
+            if (r.Width <= 1 || r.Height <= 1) return;
+            Theme.FillRounded(g, dropHighlight ? Theme.DropSlotFill : Theme.SideHover, r, radius);
+            Theme.DrawRounded(g, dropHighlight ? Theme.DropLine : Theme.Hairline, r, radius);
+            var textRect = new Rectangle(0, 0, Width, Math.Max(0, Height - padBottom));
+            TextRenderer.DrawText(g, "Drop to pin", Theme.UiFont, textRect, dropHighlight ? Theme.DropLine : Theme.Muted,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            return;
+        }
+        if (insertSlot is { } slot && slot.Width > 1 && slot.Height > 1)
+        {
+            var r = new RectangleF(slot.X + 0.5f, slot.Y + 0.5f, slot.Width - 1f, slot.Height - 1f);
+            Theme.FillRounded(g, Theme.DropSlotFill, r, radius);
+            Theme.DrawRounded(g, Theme.DropLine, r, radius, 1.5f);
+        }
+        else if (dropHighlight && Height > padBottom + 2)
+        {
+            var r = new RectangleF(0.5f, 0.5f, Math.Max(0, Width - 1f), Math.Max(0, Height - padBottom - 1f));
+            Theme.FillRounded(g, Theme.DropSlotFill, r, radius);
+            Theme.DrawRounded(g, Theme.DropLine, r, radius);
+        }
+    }
+}
+
 // Scrollable vertical list without a visible scrollbar; wheel scrolling clamps within content bounds.
 sealed class TabStack : Panel
 {
@@ -690,6 +974,28 @@ sealed class TabStack : Panel
     }
 
     internal ControlCollection Items => content.Controls;
+    internal int ScrollOffset => scrollOffset;
+
+    internal bool ScrollBy(int delta)
+    {
+        if (contentHeight <= ClientSize.Height || delta == 0) return false;
+        var prev = scrollOffset;
+        scrollOffset += delta;
+        ClampScroll();
+        if (scrollOffset == prev) return false;
+        content.Top = -scrollOffset;
+        return true;
+    }
+
+    internal void EnsureVisible(Control item)
+    {
+        if (item.Parent != content || contentHeight <= ClientSize.Height) return;
+        if (item.Top < scrollOffset) scrollOffset = item.Top;
+        else if (item.Bottom > scrollOffset + ClientSize.Height) scrollOffset = item.Bottom - ClientSize.Height;
+        else return;
+        ClampScroll();
+        content.Top = -scrollOffset;
+    }
 
     internal void SetItems(IReadOnlyList<Control> controls, Control footer)
     {
@@ -725,9 +1031,7 @@ sealed class TabStack : Panel
         base.OnMouseWheel(e);
         if (contentHeight <= ClientSize.Height) return;
         if (e is HandledMouseEventArgs h) h.Handled = true;
-        scrollOffset -= e.Delta / 3;
-        ClampScroll();
-        content.Top = -scrollOffset;
+        ScrollBy(-e.Delta / 3);
     }
 
     protected override void OnResize(EventArgs e)

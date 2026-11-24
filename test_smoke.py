@@ -7,11 +7,28 @@ import os
 from pathlib import Path
 import shutil
 from statistics import median
+import struct
 import subprocess
 from tempfile import mkdtemp
 from threading import Thread
 from time import sleep
 from urllib.parse import quote
+import zlib
+
+
+def make_png(size=16):
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xFFFFFFFF)
+    raw = b''.join(b'\x00' + b'\x2a\x7f\xd4\xff' * size for _ in range(size))
+    return (
+        b'\x89PNG\r\n\x1a\n'
+        + chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 6, 0, 0, 0))
+        + chunk(b'IDAT', zlib.compress(raw))
+        + chunk(b'IEND', b'')
+    )
+
+
+FAVICON_PNG = make_png()
 
 
 def search(text):
@@ -70,6 +87,16 @@ class Fixture(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).requested.append(self.path)
+        if self.path == '/favicon.ico':
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/png')
+            self.send_header('Content-Length', str(len(FAVICON_PNG)))
+            self.end_headers()
+            try:
+                self.wfile.write(FAVICON_PNG)
+            except (ConnectionAbortedError, BrokenPipeError):
+                pass
+            return
         if self.path == '/redirect-tracked':
             self.send_response(302)
             self.send_header('Location', '/second?fbclid=track123')
@@ -96,7 +123,26 @@ class Fixture(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        if self.path.startswith('/ads'):
+        if self.path.startswith('/popup-opener'):
+            body = (
+                '<!doctype html><title>Popup opener</title>'
+                '<button id="open-direct" style="position:fixed;left:0;top:0;width:120px;height:40px"'
+                ' onclick="window.__popup=window.open(\'/popup-child?utm_source=smoke&msg=ok\',\'oauth\')">Direct</button>'
+                '<button id="open-blank" style="position:fixed;left:140px;top:0;width:120px;height:40px"'
+                ' onclick="const w=window.open(\'about:blank\',\'oauth_blank\');'
+                'if(w)w.location.href=\'/popup-child?utm_source=smoke2&msg=blank-ok\';">Blank</button>'
+                '<button id="open-blank-stay" style="position:fixed;left:280px;top:0;width:120px;height:40px"'
+                ' onclick="window.__blankPopup=window.open(\'about:blank\',\'oauth_stay\')">Stay</button>'
+                '<script>window.__msgs=[];window.addEventListener(\'message\',e=>window.__msgs.push(e.data));'
+                'window.open(\'/popup-child?msg=untrusted\',\'untrusted\');</script>'
+            ).encode()
+        elif self.path.startswith('/popup-child'):
+            body = (
+                '<!doctype html><title>Popup child</title>'
+                '<script>const m=new URLSearchParams(location.search).get(\'msg\')||\'ok\';'
+                'if(window.opener)window.opener.postMessage(m,\'*\');window.close();</script>'
+            ).encode()
+        elif self.path.startswith('/ads'):
             body = (
                 '<!doctype html><title>Ads</title>'
                 '<div id="ad" class="adsbygoogle">ad</div><div id="ok">ok</div>'
@@ -193,6 +239,28 @@ def run():
                 assert report.get('menuDeferredDispose') is True, report.get('menuDeferredDispose')
                 assert report.get('ncTrackedOnDown') is True, report.get('ncTrackedOnDown')
                 assert report.get('captionNoTooltips') is True, report.get('captionNoTooltips')
+                assert report.get('faviconCached') is True, report.get('faviconCached')
+                assert report.get('addressDisplayOk') is True, report.get('addressDisplayOk')
+                assert report.get('tabDrag') == {
+                    'sidebarReorder': True,
+                    'plainClickSelects': True,
+                    'escapeCancels': True,
+                    'outsideCancels': True,
+                    'sidebarDragToPinEmpty': True,
+                    'sidebarDragToPinSlot': True,
+                    'sidebarPinGridReorder': True,
+                    'sidebarDragToUnpin': True,
+                    'stripPin': True,
+                    'stripUnpin': True,
+                    'stripReorder': True,
+                    'ctrlDigitFollowsOrder': True,
+                    'keyboardReorder': True,
+                    'sessionOrderMatches': True,
+                }, report.get('tabDrag')
+                favicon_files = list((path / 'Favicons').glob('*.png'))
+                assert len(favicon_files) == 1, favicon_files
+                assert favicon_files[0].read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+                assert not list((path / 'Favicons').glob('*.tmp'))
                 assert report['snapshot']['text'] == 'First page marker', report
                 assert report['snapshot']['url'] == base + '/first', report
                 assert report['pipeOneUse'] is True
@@ -225,6 +293,17 @@ def run():
                 assert report['loopGuard']['title'] == 'Loop settled', report['loopGuard']
                 loop_hits = [p for p in Fixture.requested if p.startswith('/loop')]
                 assert 2 <= len(loop_hits) < 10, loop_hits
+                assert report['popup'] == {
+                    'directOk': True,
+                    'blankNavOk': True,
+                    'untrustedBlocked': True,
+                    'blankSessionClean': True,
+                    'blankClosedBackToOpener': True,
+                    'allowlistOk': True,
+                }, report['popup']
+                assert '/popup-child?utm_source=smoke&msg=ok' in Fixture.requested, Fixture.requested
+                assert '/popup-child?utm_source=smoke2&msg=blank-ok' in Fixture.requested, Fixture.requested
+                assert not any('untrusted' in p for p in Fixture.requested), Fixture.requested
                 assert report['cleanLink'] == CLEAN_LINK, {k: v for k, v in report['cleanLink'].items() if CLEAN_LINK.get(k, ...) != v}
 
                 assert session_path.is_file(), f'Missing session.json at {session_path}'
@@ -251,6 +330,7 @@ def run():
                 assert restore['pinnedFirst'] is True, restore
                 assert [{k: t[k] for k in ('url', 'title', 'pinned')} for t in restore['tabs']] == expected_tabs, restore
                 assert [t['loaded'] for t in restore['tabs']] == [False, True, False], restore
+                assert [t['hasFavicon'] for t in restore['tabs']] == [True, True, True], restore
                 # Only the selected tab may load; the browser's own favicon fetch is not a page load.
                 assert [p for p in Fixture.requested if p != '/favicon.ico'] == ['/second?a'], Fixture.requested
                 assert json.loads(session_path.read_text(encoding='utf-8')) == expected_session

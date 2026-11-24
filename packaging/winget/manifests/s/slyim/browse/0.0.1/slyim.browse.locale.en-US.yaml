@@ -1,0 +1,33 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
+
+PackageIdentifier: slyim.browse
+PackageVersion: 0.0.1
+PackageLocale: en-US
+Publisher: slyim
+PublisherUrl: https://github.com/slyim
+PublisherSupportUrl: https://github.com/slyim/browse/issues
+PackageName: browse
+PackageUrl: https://github.com/slyim/browse
+License: MIT
+LicenseUrl: https://github.com/slyim/browse/blob/main/LICENSE
+Copyright: Copyright (c) 2026 Liliana
+ShortDescription: Small, fast Windows web browser built with WinForms and system WebView2.
+Description: >-
+  Windows port of Office Commun's Search, built with WinForms on .NET 10 and the
+  system Microsoft Edge WebView2 runtime. Features vertical or top tabs, built-in
+  ad/tracker blocking, link cleaning, sleeping tabs, session restore, and one-time
+  read-only page sharing without bundling Chromium, Electron, or .NET.
+Moniker: browse
+Tags:
+- browser
+- web-browser
+- webview2
+- winforms
+- adblock
+- privacy
+ReleaseNotes: >-
+  First release of browse, a WinForms + WebView2 browser for Windows 10/11 x64.
+  Requires the .NET 10 Desktop Runtime (x64) and the Microsoft Edge WebView2 Runtime.
+ReleaseNotesUrl: https://github.com/slyim/browse/releases/tag/v0.0.1
+ManifestType: defaultLocale
+ManifestVersion: 1.28.0
