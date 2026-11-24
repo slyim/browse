@@ -618,6 +618,8 @@ sealed class BrowserWindow : Form
             Location = new(wa.X + Math.Max(0, (wa.Width - Width) / 2), wa.Y + Math.Max(0, (wa.Height - Height) / 2));
         }
         else StartPosition = FormStartPosition.CenterScreen;
+        // Click checks only land when WindowFromPoint finds the smoke window, so keep it above the user's windows.
+        if (smokeReport is not null) TopMost = true;
         KeyPreview = true;
 
         collapseBtn = MakeIcon(
