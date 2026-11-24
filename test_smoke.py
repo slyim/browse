@@ -225,6 +225,11 @@ class Fixture(BaseHTTPRequestHandler):
                 '<!doctype html><title>Hung page</title><main>Hung page</main>'
                 '<script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>'
             ).encode()
+        elif self.path.startswith('/find-page'):
+            body = (
+                '<!doctype html><title>Find page</title>'
+                '<main>alpha Alpha alpha beta alphabet</main>'
+            ).encode()
         elif self.path.startswith('/slow'):
             type(self).stop_event.wait(3.0)
             body = b'<!doctype html><title>Slow page</title><main>Slow page done</main>'
@@ -536,6 +541,30 @@ def run_checks():
                     'ctrlNLaunched': True,
                     'newWindowArgsOk': True,
                 }, report.get('tabMenuAndNewWindow')
+                assert report.get('findInPage') == {
+                    'openedOk': True,
+                    'pageShortcutOk': True,
+                    'countOk': True,
+                    'nextWrapOk': True,
+                    'prevWrapOk': True,
+                    'caseOk': True,
+                    'wholeWordOk': True,
+                    'escOk': True,
+                    'tabSwitchStops': True,
+                    'navStops': True,
+                }, report.get('findInPage')
+                assert report.get('zoomAndPrint') == {
+                    'sitePrefsSelfCheck': True,
+                    'zoomStepsOk': True,
+                    'zoomSavedOnDisk': True,
+                    'otherOriginResetOk': True,
+                    'backOriginRestoredOk': True,
+                    'zoomSurvivesReload': True,
+                    'zoomResetKeyOk': True,
+                    'zoomPillResetOk': True,
+                    'wheelZoomCapturedOk': True,
+                    'printSaveWiredOk': True,
+                }, report.get('zoomAndPrint')
                 favicon_files = list((path / 'Favicons').glob('*.png'))
                 assert len(favicon_files) == 1, favicon_files
                 assert favicon_files[0].read_bytes().startswith(b'\x89PNG\r\n\x1a\n')

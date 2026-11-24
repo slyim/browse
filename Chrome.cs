@@ -110,6 +110,8 @@ static class Theme
         public static readonly string Share = PhosphorLoaded ? "\uE406" : "\uE72D";      // share
         public static readonly string Update = PhosphorLoaded ? "\uE20C" : "\uE896";     // download-simple
         public static readonly string Settings = PhosphorLoaded ? "\uE272" : "\uE713";   // gear-six
+        public static readonly string ChevronUp = PhosphorLoaded ? "\uE13C" : "\uE70E";  // caret-up
+        public static readonly string ChevronDown = PhosphorLoaded ? "\uE136" : "\uE70D"; // caret-down
 
         // Window caption buttons stay on Segoe Fluent Icons to match native Windows chrome.
         public const string Minimize = "\uE921";
@@ -442,6 +444,10 @@ sealed class AddressLine : ChromeControl
     readonly TextBox input;
     Color fillColor = Theme.SideHover;
     bool focused;
+    string? zoomLabel;
+    Rectangle zoomPillRect;
+    bool zoomHovered;
+    bool zoomPressed;
 
     internal AddressLine()
     {
@@ -480,6 +486,20 @@ sealed class AddressLine : ChromeControl
     internal TextBox Input => input;
     internal bool InputFocused => input.Focused;
     internal string DisplayText => string.IsNullOrEmpty(input.Text) ? input.PlaceholderText : FormatDisplayUrl(input.Text);
+    internal bool ZoomPillVisible => zoomLabel is not null;
+    internal string? ZoomPillText => zoomLabel;
+    internal Rectangle ZoomPillBounds => zoomPillRect;
+    internal event Action? ZoomResetRequested;
+
+    internal void SetZoom(double factor)
+    {
+        var next = ZoomLevels.IsDefault(factor) ? null : ZoomLevels.FormatPercent(factor);
+        if (zoomLabel == next) return;
+        zoomLabel = next;
+        if (next is null) { zoomHovered = false; zoomPressed = false; Cursor = Cursors.IBeam; }
+        PerformLayout();
+        Invalidate();
+    }
 
     internal static string FormatDisplayUrl(string url)
     {
@@ -529,14 +549,66 @@ sealed class AddressLine : ChromeControl
     {
         base.OnLayout(e);
         var pad = S(10);
+        if (zoomLabel is not null && Width >= S(90))
+        {
+            var textW = TextRenderer.MeasureText(zoomLabel, Theme.FontForDpi(Theme.HintFont, DeviceDpi), Size.Empty, TextFormatFlags.NoPadding).Width;
+            var pillW = textW + S(10);
+            var pillH = S(20);
+            var pillInset = S(4);
+            zoomPillRect = new Rectangle(Width - pillInset - pillW, (Height - pillH) / 2, pillW, pillH);
+        }
+        else
+        {
+            zoomPillRect = Rectangle.Empty;
+        }
+        var rightPad = zoomPillRect.IsEmpty ? pad : (Width - zoomPillRect.Left) + S(6);
         var h = input.PreferredHeight;
-        input.SetBounds(pad, Math.Max(0, (Height - h) / 2), Math.Max(0, Width - pad * 2), h);
+        input.SetBounds(pad, Math.Max(0, (Height - h) / 2), Math.Max(0, Width - pad - rightPad), h);
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        base.OnMouseMove(e);
+        var over = !zoomPillRect.IsEmpty && zoomPillRect.Contains(e.Location);
+        if (over != zoomHovered)
+        {
+            zoomHovered = over;
+            Cursor = over ? Cursors.Hand : Cursors.IBeam;
+            Invalidate();
+        }
+    }
+
+    protected override void OnMouseLeave(EventArgs e)
+    {
+        base.OnMouseLeave(e);
+        if (zoomHovered)
+        {
+            zoomHovered = false;
+            Cursor = Cursors.IBeam;
+            Invalidate();
+        }
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
-        if (e.Button == MouseButtons.Left && !input.Focused) FocusInput();
+        if (e.Button != MouseButtons.Left) return;
+        if (!zoomPillRect.IsEmpty && zoomPillRect.Contains(e.Location))
+        {
+            zoomPressed = true;
+            return;
+        }
+        zoomPressed = false;
+        if (!input.Focused) FocusInput();
+    }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        base.OnMouseUp(e);
+        if (e.Button != MouseButtons.Left || !zoomPressed) return;
+        zoomPressed = false;
+        if (!zoomPillRect.IsEmpty && zoomPillRect.Contains(e.Location))
+            ZoomResetRequested?.Invoke();
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -551,10 +623,17 @@ sealed class AddressLine : ChromeControl
         else
         {
             var pad = S(10);
-            var textRect = new Rectangle(pad, 0, Math.Max(0, Width - pad * 2), Height);
+            var rightPad = zoomPillRect.IsEmpty ? pad : (Width - zoomPillRect.Left) + S(6);
+            var textRect = new Rectangle(pad, 0, Math.Max(0, Width - pad - rightPad), Height);
             var empty = string.IsNullOrEmpty(input.Text);
             TextRenderer.DrawText(g, DisplayText, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, empty ? Theme.Muted : Theme.InkSoft,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        }
+        if (!zoomPillRect.IsEmpty && zoomLabel is not null)
+        {
+            Theme.FillRounded(g, zoomHovered ? Theme.CloseHoverFill : Theme.BadgeFill, zoomPillRect, Sf(6f));
+            TextRenderer.DrawText(g, zoomLabel, Theme.FontForDpi(Theme.HintFont, DeviceDpi), zoomPillRect, zoomHovered ? Theme.Ink : Theme.InkSoft,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
         }
     }
 }
