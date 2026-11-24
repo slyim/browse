@@ -401,8 +401,7 @@ def run_checks():
                 assert report.get('captionNoTooltips') is True, report.get('captionNoTooltips')
                 assert report.get('updaterSelfCheck') is True, report.get('updaterSelfCheck')
                 assert report.get('settingsRoundTrip') is True, report.get('settingsRoundTrip')
-                assert report.get('phosphorLoaded') is True, report.get('phosphorLoaded')
-                assert report.get('iconFontFamily') == 'Phosphor', report.get('iconFontFamily')
+                assert 'Segoe' in (report.get('iconFontFamily') or ''), report.get('iconFontFamily')
                 assert 'Segoe' in (report.get('captionFontFamily') or ''), report.get('captionFontFamily')
                 assert report.get('settingsDialogOk') is True, report.get('settingsDialogOk')
                 assert report.get('shareToggleWorks') is True, report.get('shareToggleWorks')
@@ -438,7 +437,7 @@ def run_checks():
                     'liveRememberedSkipsPrompt': True,
                     'liveClearRePrompts': True,
                 }, report.get('externalSchemes')
-                assert (exe.parent / 'Phosphor-LICENSE.txt').is_file(), f'Missing Phosphor-LICENSE.txt next to {exe}'
+                assert not (exe.parent / 'Phosphor-LICENSE.txt').exists(), 'Phosphor is no longer bundled'
                 assert not (path / 'update-check.txt').exists(), 'Smoke test must skip update checks'
                 assert report.get('faviconCached') is True, report.get('faviconCached')
                 assert report.get('addressDisplayOk') is True, report.get('addressDisplayOk')

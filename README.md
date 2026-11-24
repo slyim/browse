@@ -33,7 +33,7 @@ dotnet publish Search.Windows.csproj -c Release -warnaserror -o publish
 python test_smoke.py publish/browse.exe
 ```
 
-`test_smoke.py` launches the built executable against a local loopback fixture in a temporary profile and verifies navigation, URL resolution, CLI URL launching and instance forwarding, per-user browser registration, external app prompts and remembered permissions, tab layouts, custom title bar hit-testing, tracker/ad blocking (on and off), link cleaning (on and off), settings persistence, Phosphor icon font loading, session save/restore (including multi-instance lock behavior), sleeping tabs, and one-time Share delivery.
+`test_smoke.py` launches the built executable against a local loopback fixture in a temporary profile and verifies navigation, URL resolution, CLI URL launching and instance forwarding, per-user browser registration, external app prompts and remembered permissions, tab layouts, custom title bar hit-testing, tracker/ad blocking (on and off), link cleaning (on and off), settings persistence, icon font selection, session save/restore (including multi-instance lock behavior), sleeping tabs, and one-time Share delivery.
 
 ## Features
 
@@ -100,4 +100,4 @@ Run `browse.exe --profile <folder>` to keep a separate profile (WebView data, `s
 
 ## License
 
-This port includes code, block rules and design from Search, used under its MIT license; that notice is in `LICENSE-Search` and ships next to the exe. Toolbar icons use [Phosphor Icons](https://phosphoricons.com) under its MIT license (`Phosphor-LICENSE.txt`, shipped next to the exe).
+This port includes code, block rules and design from Search, used under its MIT license; that notice is in `LICENSE-Search` and ships next to the exe. Icons come from the Segoe Fluent Icons / Segoe MDL2 Assets fonts that ship with Windows.

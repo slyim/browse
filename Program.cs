@@ -322,6 +322,7 @@ sealed class BrowserWindow : Form
     bool suppressExternalLaunch;
     Action<string, string[]>? launchWindowOverride;
     int? dpiOverride;
+    int metricsDpi;
     long envMs;
     long drawTabsTicks;
     bool CanSaveSession => sessionLock is not null;
@@ -515,11 +516,18 @@ sealed class BrowserWindow : Form
         var minW = S(640);
         var minH = S(420);
         MinimumSize = new(minW, minH);
-        var wa = Screen.PrimaryScreen?.WorkingArea ?? Rectangle.Empty;
+        // Smoke runs open on a secondary monitor when there is one, so test windows don't cover the user's work.
+        var home = smokeReport is not null ? Screen.AllScreens.FirstOrDefault(s => !s.Primary) ?? Screen.PrimaryScreen : Screen.PrimaryScreen;
+        var wa = home?.WorkingArea ?? Rectangle.Empty;
         Size = wa.Width > 0 && wa.Height > 0
             ? new(Math.Max(minW, Math.Min(S(1160), wa.Width)), Math.Max(minH, Math.Min(S(780), wa.Height)))
             : new(S(1160), S(780));
-        StartPosition = FormStartPosition.CenterScreen;
+        if (home is { Primary: false })
+        {
+            StartPosition = FormStartPosition.Manual;
+            Location = new(wa.X + Math.Max(0, (wa.Width - Width) / 2), wa.Y + Math.Max(0, (wa.Height - Height) / 2));
+        }
+        else StartPosition = FormStartPosition.CenterScreen;
         KeyPreview = true;
 
         backBtn = MakeIcon(Theme.Glyphs.Back, "Back", GoBack);
@@ -649,6 +657,7 @@ sealed class BrowserWindow : Form
 
     void ApplyChromeMetrics()
     {
+        metricsDpi = DeviceDpi;
         MinimumSize = new(S(640), S(420));
         sidebar.Width = S(232);
         sidebar.Padding = new(S(10), 0, S(10), S(10));
@@ -925,6 +934,8 @@ sealed class BrowserWindow : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
+        // A window created on a monitor whose DPI differs from the one the constructor measured gets no WM_DPICHANGED (#52).
+        if (dpiOverride is null && metricsDpi != DeviceDpi) RescaleChrome();
         SetDwmFrame(!IsFullscreen);
         LayoutCaptionButtons();
         UpdateMaximizeButton();
@@ -954,6 +965,11 @@ sealed class BrowserWindow : Form
         // Clear old MinimumSize before base.OnDpiChanged applies SuggestedRectangle so shrinking to a lower-DPI monitor is not clamped.
         MinimumSize = Size.Empty;
         base.OnDpiChanged(e);
+        RescaleChrome();
+    }
+
+    void RescaleChrome()
+    {
         Font = Theme.FontForDpi(Theme.UiFont, DeviceDpi);
         CancelTabDrag();
         SuspendLayout();
@@ -4372,7 +4388,6 @@ sealed class BrowserWindow : Form
 
         var updaterSelfCheck = Updater.SelfCheck();
         var settingsRoundTrip = SettingsStore.SelfCheck(Path.GetDirectoryName(settingsFile)!);
-        var phosphorLoaded = Theme.PhosphorLoaded;
         var iconFontFamily = Theme.IconFont.FontFamily.Name;
         var captionFontFamily = Theme.CaptionIconFont.FontFamily.Name;
 
@@ -6322,7 +6337,7 @@ sealed class BrowserWindow : Form
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
             verticalAndHorizontal = orientations, orientationDetail, captionHidden, hitTests, maximizeToggles, chromeHiddenWorks,
             stripOverflowSafe, stripWheelScrolled, sideWheelStep, menuDeferredDispose, ncTrackedOnDown, captionNoTooltips,
-            updaterSelfCheck, settingsRoundTrip, phosphorLoaded, iconFontFamily, captionFontFamily,
+            updaterSelfCheck, settingsRoundTrip, iconFontFamily, captionFontFamily,
             settingsDialogOk, shareToggleWorks,
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
             urlWhenCleanOff, cliFlags, cliUrl, browserRegistration, externalSchemes,

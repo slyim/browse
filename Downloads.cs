@@ -604,10 +604,10 @@ sealed class DownloadManager : IDisposable
 static class DownloadGlyphs
 {
     public static readonly string Download = Theme.Glyphs.Update;                                      // download-simple
-    public static readonly string Pause = Theme.PhosphorLoaded ? "\uE39E" : "\uE769";                  // pause
-    public static readonly string Play = Theme.PhosphorLoaded ? "\uE3D0" : "\uE768";                   // play
-    public static readonly string Folder = Theme.PhosphorLoaded ? "\uE256" : "\uE838";                 // folder-open
-    public static readonly string OpenFile = Theme.PhosphorLoaded ? "\uE5DE" : "\uE8A7";               // arrow-square-out
+    public static readonly string Pause = "\uE769";                  // pause
+    public static readonly string Play = "\uE768";                   // play
+    public static readonly string Folder = "\uE838";                 // folder-open
+    public static readonly string OpenFile = "\uE8A7";               // arrow-square-out
     public static readonly string Retry = Theme.Glyphs.Reload;                                         // arrow-clockwise
     public static readonly string Close = Theme.Glyphs.Close;                                          // x
 }
