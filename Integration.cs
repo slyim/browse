@@ -37,7 +37,8 @@ static class LaunchPipe
 
         var pipeName = PipeName(profilePath);
         var deadline = Stopwatch.StartNew();
-        var budget = timeout ?? TimeSpan.FromSeconds(2);
+        // Longer than the server's 2 s per-connection limit, so one busy connection can't make us open a second window.
+        var budget = timeout ?? TimeSpan.FromSeconds(5);
         while (deadline.Elapsed < budget)
         {
             var remainingMs = (int)Math.Clamp((budget - deadline.Elapsed).TotalMilliseconds, 50, 300);
@@ -160,10 +161,9 @@ static class LaunchPipe
                 catch { }
                 finally
                 {
-                    if (server.IsConnected)
-                    {
-                        try { server.Disconnect(); } catch { }
-                    }
+                    // Always reset: a client that hung up mid-message leaves IsConnected false but the pipe broken,
+                    // and skipping Disconnect made the next WaitForConnectionAsync throw and end this loop for good.
+                    try { server.Disconnect(); } catch { }
                 }
             }
         }

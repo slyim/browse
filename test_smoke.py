@@ -212,7 +212,7 @@ class Fixture(BaseHTTPRequestHandler):
         elif self.path.startswith('/external-scheme'):
             body = (
                 '<!doctype html><title>External scheme</title>'
-                '<a id="open-ext" href="mailto:test@example.com"'
+                '<a id="open-ext" href="browse-smoke:test"'
                 ' style="position:fixed;left:0;top:0;width:120px;height:40px;display:block">Open app</a>'
             ).encode()
         elif self.path.startswith('/geo'):
@@ -282,7 +282,38 @@ def run_phase(exe, output, base, *extra):
     return report
 
 
+# WebView2 only raises LaunchingExternalUriScheme for schemes registered with Windows, and CI
+# runners have no mail app, so the live test uses its own per-user scheme (launch is suppressed).
+SMOKE_SCHEME_KEY = r'Software\Classes\browse-smoke'
+
+
+def register_smoke_scheme():
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, SMOKE_SCHEME_KEY) as key:
+        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, 'URL:browse smoke test')
+        winreg.SetValueEx(key, 'URL Protocol', 0, winreg.REG_SZ, '')
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, SMOKE_SCHEME_KEY + r'\shell\open\command') as key:
+        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, r'"%SystemRoot%\System32\cmd.exe" /c exit')
+
+
+def unregister_smoke_scheme():
+    import winreg
+    for sub in (r'\shell\open\command', r'\shell\open', r'\shell', ''):
+        try:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, SMOKE_SCHEME_KEY + sub)
+        except FileNotFoundError:
+            pass
+
+
 def run():
+    register_smoke_scheme()
+    try:
+        run_checks()
+    finally:
+        unregister_smoke_scheme()
+
+
+def run_checks():
     parser = argparse.ArgumentParser()
     parser.add_argument('exe', type=Path)
     args = parser.parse_args()
@@ -329,7 +360,7 @@ def run():
                 assert report['second'] == 'Second page marker'
                 assert report['restored'] == 'First page marker'
                 assert report['pinnedSurvivesClose'] is True
-                assert report['verticalAndHorizontal'] is True
+                assert report['verticalAndHorizontal'] is True, report.get('orientationDetail')
                 assert report.get('captionHidden') is True, report.get('captionHidden')
                 assert report.get('hitTests') == {
                     'sideEmpty': 2,

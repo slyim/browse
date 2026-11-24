@@ -3462,7 +3462,10 @@ sealed class BrowserWindow : Form
         var stripEmptyHit = HitTestAt(topStrip.PointToScreen(new Point((stripNewTabBtn.Right + shareBtn.Left) / 2, topStrip.Height / 2)));
         SetOrientation(true);
         PerformLayout();
-        var orientations = horizontal && CheckVerticalLayout();
+        var vertOk = CheckVerticalLayout();
+        var orientations = horizontal && vertOk;
+        // Intermittent locally (#52): record what was measured so a failure says why.
+        var orientationDetail = orientations ? null : $"h={horizontal} v={vertOk} vertical={vertical} dpi={DeviceDpi} client={ClientSize} strip={BoundsInForm(topStrip)} side={BoundsInForm(sidebar)} pages={BoundsInForm(pages)}";
         var captionHidden = Math.Abs(RectangleToScreen(ClientRectangle).Top - Bounds.Top) <= 1;
         var firstTabRow = sideTabs.Items.OfType<TabRow>().First();
         var hitTests = new
@@ -4722,7 +4725,7 @@ sealed class BrowserWindow : Form
         confirmExternalSchemeOverride = (_, _, _) => { promptCalls++; return (false, false); };
 
         // Background non-user-initiated launch must be denied without prompting.
-        await extBgCore.ExecuteScriptAsync("location.href='mailto:bg@example.com';");
+        await extBgCore.ExecuteScriptAsync("location.href='browse-smoke:bg';");
         var extWait = Stopwatch.StartNew();
         while (extWait.Elapsed < TimeSpan.FromSeconds(2) && extEvents.Count < 1)
             await Task.Delay(50);
@@ -4737,7 +4740,7 @@ sealed class BrowserWindow : Form
         while (extWait.Elapsed < TimeSpan.FromSeconds(5) && extEvents.Count < 1)
             await Task.Delay(50);
         var livePromptDenyOk = extEvents.Count == 1
-            && extEvents[0].Scheme == "mailto"
+            && extEvents[0].Scheme == "browse-smoke"
             && extEvents[0].Site == fixture
             && !extEvents[0].Allowed
             && extEvents[0].Prompted
@@ -4753,7 +4756,7 @@ sealed class BrowserWindow : Form
         while (extWait.Elapsed < TimeSpan.FromSeconds(5) && extEvents.Count < 1)
             await Task.Delay(50);
         var persistedAfterRemember = SettingsStore.Load(settingsFile).Settings.AllowedExternalApps
-            .SequenceEqual([new ExternalAppPermission(fixture!, "mailto")]);
+            .SequenceEqual([new ExternalAppPermission(fixture!, "browse-smoke")]);
         var liveRememberOk = extEvents.Count == 1
             && extEvents[0].Allowed
             && extEvents[0].Prompted
@@ -5045,7 +5048,7 @@ sealed class BrowserWindow : Form
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
-            verticalAndHorizontal = orientations, captionHidden, hitTests, maximizeToggles, chromeHiddenWorks,
+            verticalAndHorizontal = orientations, orientationDetail, captionHidden, hitTests, maximizeToggles, chromeHiddenWorks,
             stripOverflowSafe, stripWheelScrolled, sideWheelStep, menuDeferredDispose, ncTrackedOnDown, captionNoTooltips,
             updaterSelfCheck, settingsRoundTrip, phosphorLoaded, iconFontFamily, captionFontFamily,
             settingsDialogOk, shareToggleWorks,
