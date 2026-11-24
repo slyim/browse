@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
@@ -12,6 +13,12 @@ static class Theme
 
     [DllImport("gdi32.dll")]
     static extern bool RemoveFontMemResourceEx(IntPtr fh);
+
+    [DllImport("user32.dll")]
+    static extern uint GetDpiForSystem();
+
+    static readonly int SystemDpi = GetDpiForSystem() is > 0 and var d ? (int)d : 96;
+    static readonly ConcurrentDictionary<(Font, int), Font> ScaledFonts = new();
 
     // shortcut: the theme is read once at startup; changing Theme in Settings or Windows applies on the next launch.
 #pragma warning disable WFO5001
@@ -125,6 +132,13 @@ static class Theme
     public static readonly Font PinFont = new("Segoe UI Semibold", 9.5f, FontStyle.Regular);
     public static readonly Font StripPinFont = new("Segoe UI Semibold", 9f, FontStyle.Regular);
 
+    public static Font FontForDpi(Font baseFont, int dpi)
+    {
+        if (dpi <= 0 || dpi == SystemDpi) return baseFont;
+        return ScaledFonts.GetOrAdd((baseFont, dpi), static key =>
+            new Font(key.Item1.FontFamily, key.Item1.SizeInPoints * key.Item2 / 72f, key.Item1.Style, GraphicsUnit.Pixel));
+    }
+
     public static GraphicsPath RoundedRect(RectangleF r, float radius)
     {
         var path = new GraphicsPath();
@@ -164,10 +178,10 @@ static class Theme
         return trimmed.Length > 0 ? char.ToUpperInvariant(trimmed[0]).ToString() : "•";
     }
 
-    public static void DrawMonogram(Graphics g, Rectangle box, string letter, bool active)
+    public static void DrawMonogram(Graphics g, Rectangle box, string letter, bool active, int dpi = 96)
     {
         FillRounded(g, BadgeFill, box, box.Width * 0.24f);
-        TextRenderer.DrawText(g, letter, BadgeFont, box, active ? Ink : Muted,
+        TextRenderer.DrawText(g, letter, FontForDpi(BadgeFont, dpi), box, active ? Ink : Muted,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
     }
 
@@ -188,11 +202,11 @@ static class Theme
         g.InterpolationMode = prev;
     }
 
-    public static void DrawCloseDot(Graphics g, Rectangle box, bool closeHovered)
+    public static void DrawCloseDot(Graphics g, Rectangle box, bool closeHovered, int dpi = 96)
     {
         using var brush = new SolidBrush(closeHovered ? CloseHoverFill : BadgeFill);
         g.FillEllipse(brush, box);
-        TextRenderer.DrawText(g, Glyphs.Close, CloseIconFont, box, closeHovered ? Ink : Muted,
+        TextRenderer.DrawText(g, Glyphs.Close, FontForDpi(CloseIconFont, dpi), box, closeHovered ? Ink : Muted,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
     }
 }
@@ -213,6 +227,7 @@ abstract class ChromeControl : Control
     }
 
     protected override void OnPaintBackground(PaintEventArgs e) { }
+    protected override void OnDpiChangedAfterParent(EventArgs e) { base.OnDpiChangedAfterParent(e); Invalidate(); }
     protected int S(int px) => LogicalToDeviceUnits(px);
     protected float Sf(float px) => px * (DeviceDpi / 96f);
 }
@@ -283,7 +298,7 @@ sealed class IconButton : ChromeControl
         if (active || (hovered && Enabled))
             Theme.FillRounded(g, active ? activeColor : hoverColor, new RectangleF(0, 0, Width, Height), Sf(8f));
         var color = !Enabled ? Theme.Faint : active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
-        TextRenderer.DrawText(g, glyph, Theme.IconFont, ClientRectangle, color,
+        TextRenderer.DrawText(g, glyph, Theme.FontForDpi(Theme.IconFont, DeviceDpi), ClientRectangle, color,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
     }
 }
@@ -378,7 +393,7 @@ sealed class CaptionButton : ChromeControl
         var fg = isClose && (hovered || pressed)
             ? Color.White
             : windowActive ? Theme.Ink : Theme.Muted;
-        TextRenderer.DrawText(g, glyph, Theme.CaptionIconFont, ClientRectangle, fg,
+        TextRenderer.DrawText(g, glyph, Theme.FontForDpi(Theme.CaptionIconFont, DeviceDpi), ClientRectangle, fg,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
     }
 }
@@ -456,6 +471,21 @@ sealed class AddressLine : ChromeControl
         input.SelectAll();
     }
 
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        input.Font = Theme.FontForDpi(Theme.UiFont, DeviceDpi);
+        PerformLayout();
+    }
+
+    protected override void OnDpiChangedAfterParent(EventArgs e)
+    {
+        base.OnDpiChangedAfterParent(e);
+        input.Font = Theme.FontForDpi(Theme.UiFont, DeviceDpi);
+        Height = S(28);
+        PerformLayout();
+    }
+
     protected override void OnLayout(LayoutEventArgs e)
     {
         base.OnLayout(e);
@@ -484,7 +514,7 @@ sealed class AddressLine : ChromeControl
             var pad = S(10);
             var textRect = new Rectangle(pad, 0, Math.Max(0, Width - pad * 2), Height);
             var empty = string.IsNullOrEmpty(input.Text);
-            TextRenderer.DrawText(g, DisplayText, Theme.UiFont, textRect, empty ? Theme.Muted : Theme.InkSoft,
+            TextRenderer.DrawText(g, DisplayText, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, empty ? Theme.Muted : Theme.InkSoft,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
         }
     }
@@ -750,17 +780,17 @@ sealed class TabRow : TabChromeControl
             var mark = S(16);
             var box = new Rectangle(x, (Height - mark) / 2, mark, mark);
             if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
-            else Theme.DrawMonogram(g, box, badge!, active);
+            else Theme.DrawMonogram(g, box, badge!, active, DeviceDpi);
             x += mark + S(8);
         }
 
         var rightPad = hovered ? S(28) : S(10);
         var textRect = new Rectangle(x, 0, Math.Max(0, Width - x - rightPad), Height);
         var textColor = active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
-        TextRenderer.DrawText(g, title, Theme.UiFont, textRect, textColor,
+        TextRenderer.DrawText(g, title, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, textColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
-        if (hovered) Theme.DrawCloseDot(g, CloseDotRect, closeHovered);
+        if (hovered) Theme.DrawCloseDot(g, CloseDotRect, closeHovered, DeviceDpi);
         PaintDragGhost(g);
     }
 }
@@ -815,7 +845,7 @@ sealed class PinSquare : TabChromeControl
         else
         {
             var color = active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
-            TextRenderer.DrawText(g, letter, onFrame ? Theme.PinFont : Theme.StripPinFont, ClientRectangle, color,
+            TextRenderer.DrawText(g, letter, Theme.FontForDpi(onFrame ? Theme.PinFont : Theme.StripPinFont, DeviceDpi), ClientRectangle, color,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
         }
         PaintDragGhost(g);
@@ -884,7 +914,7 @@ sealed class TabPill : TabChromeControl
         {
             var box = new Rectangle((Width - mark) / 2, (Height - mark) / 2, mark, mark);
             if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
-            else Theme.DrawMonogram(g, box, compactLetter, active);
+            else Theme.DrawMonogram(g, box, compactLetter, active, DeviceDpi);
             PaintDragGhost(g);
             return;
         }
@@ -894,17 +924,17 @@ sealed class TabPill : TabChromeControl
         {
             var box = new Rectangle(x, (Height - mark) / 2, mark, mark);
             if (favicon is not null) Theme.DrawFavicon(g, box, favicon);
-            else Theme.DrawMonogram(g, box, badge!, active);
+            else Theme.DrawMonogram(g, box, badge!, active, DeviceDpi);
             x += mark + S(6);
         }
 
         var rightPad = hovered ? S(26) : S(8);
         var textRect = new Rectangle(x, 0, Math.Max(0, Width - x - rightPad), Height);
         var textColor = active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
-        TextRenderer.DrawText(g, title, Theme.UiFont, textRect, textColor,
+        TextRenderer.DrawText(g, title, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, textColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
-        if (hovered) Theme.DrawCloseDot(g, CloseDotRect, closeHovered);
+        if (hovered) Theme.DrawCloseDot(g, CloseDotRect, closeHovered, DeviceDpi);
         PaintDragGhost(g);
     }
 }
@@ -943,11 +973,11 @@ sealed class QuietRow : ChromeControl
         var color = hovered ? Theme.InkSoft : Theme.Faint;
         var mark = S(15);
         var iconRect = new Rectangle(S(10), (Height - mark) / 2, mark, mark);
-        TextRenderer.DrawText(g, Theme.Glyphs.NewTab, Theme.SmallIconFont, iconRect, color,
+        TextRenderer.DrawText(g, Theme.Glyphs.NewTab, Theme.FontForDpi(Theme.SmallIconFont, DeviceDpi), iconRect, color,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
         var x = iconRect.Right + S(8);
         var textRect = new Rectangle(x, 0, Math.Max(0, Width - x - S(10)), Height);
-        TextRenderer.DrawText(g, Text, Theme.UiFont, textRect, color,
+        TextRenderer.DrawText(g, Text, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, color,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
     }
 }
@@ -1016,7 +1046,7 @@ sealed class PinGridPanel : Panel
             Theme.FillRounded(g, dropHighlight ? Theme.DropSlotFill : Theme.SideHover, r, radius);
             Theme.DrawRounded(g, dropHighlight ? Theme.DropLine : Theme.Hairline, r, radius);
             var textRect = new Rectangle(0, 0, Width, Math.Max(0, Height - padBottom));
-            TextRenderer.DrawText(g, "Drop to pin", Theme.UiFont, textRect, dropHighlight ? Theme.DropLine : Theme.Muted,
+            TextRenderer.DrawText(g, "Drop to pin", Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, dropHighlight ? Theme.DropLine : Theme.Muted,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
             return;
         }
@@ -1073,7 +1103,7 @@ sealed class TabStack : Panel
         content.Top = -scrollOffset;
     }
 
-    internal void SetItems(IReadOnlyList<Control> controls, Control footer)
+    internal void SetItems(IReadOnlyList<Control> controls, Control footer, int? rowHeight = null, int? itemGap = null)
     {
         content.SuspendLayout();
         var keep = new HashSet<Control>(controls) { footer };
@@ -1082,7 +1112,8 @@ sealed class TabStack : Panel
             if (keep.Contains(content.Controls[i])) continue;
             content.Controls.RemoveAt(i);
         }
-        var gap = LogicalToDeviceUnits(2);
+        var rowH = rowHeight ?? LogicalToDeviceUnits(28);
+        var gap = itemGap ?? LogicalToDeviceUnits(2);
         var y = 0;
         var w = Math.Max(0, ClientSize.Width);
         for (var i = 0; i < controls.Count; i++)
@@ -1090,13 +1121,13 @@ sealed class TabStack : Panel
             var c = controls[i];
             if (c.Parent != content) content.Controls.Add(c);
             if (content.Controls.GetChildIndex(c) != i) content.Controls.SetChildIndex(c, i);
-            c.SetBounds(0, y, w, c.Height);
-            y += c.Height + gap;
+            c.SetBounds(0, y, w, rowH);
+            y += rowH + gap;
         }
         if (footer.Parent != content) content.Controls.Add(footer);
         if (content.Controls.GetChildIndex(footer) != controls.Count) content.Controls.SetChildIndex(footer, controls.Count);
-        footer.SetBounds(0, y, w, footer.Height);
-        contentHeight = y + footer.Height;
+        footer.SetBounds(0, y, w, rowH);
+        contentHeight = y + rowH;
         ClampScroll();
         content.SetBounds(0, -scrollOffset, w, Math.Max(contentHeight, ClientSize.Height));
         content.ResumeLayout();

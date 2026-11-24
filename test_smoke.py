@@ -209,6 +209,11 @@ class Fixture(BaseHTTPRequestHandler):
                 '<!doctype html><title>Geo</title>'
                 '<script>navigator.geolocation.getCurrentPosition(()=>{},()=>{});</script>'
             ).encode()
+        elif self.path.startswith('/hang'):
+            body = (
+                '<!doctype html><title>Hung page</title><main>Hung page</main>'
+                '<script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>'
+            ).encode()
         elif self.path.startswith('/ads'):
             body = (
                 '<!doctype html><title>Ads</title>'
@@ -412,6 +417,21 @@ def run():
                     'leftTitleToCloseDotKeepsTab': True,
                     'middleClickInsideClosesTab': True,
                 }, report.get('tabFixes')
+                assert report.get('highDpi') == {
+                    'perMonitorV2': True,
+                    'minSizeScaled': True,
+                    'liveMinLayoutOk': True,
+                    'simulatedDpiOk': True,
+                    'shareDialogOk': True,
+                    'settingsDialogDpiOk': True,
+                }, report.get('highDpi')
+                assert report.get('shareTimeout') == {
+                    'disabledDuringCapture': True,
+                    'timedOut': True,
+                    'elapsedOk': True,
+                    'reEnabledAfter': True,
+                    'shareWorksAfterTimeout': True,
+                }, report.get('shareTimeout')
                 favicon_files = list((path / 'Favicons').glob('*.png'))
                 assert len(favicon_files) == 1, favicon_files
                 assert favicon_files[0].read_bytes().startswith(b'\x89PNG\r\n\x1a\n')

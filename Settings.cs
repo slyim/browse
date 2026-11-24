@@ -119,6 +119,9 @@ static class SettingsStore
 
 sealed class SettingsDialog : Form
 {
+    readonly TableLayoutPanel table;
+    readonly List<Label> sectionLabels = [];
+    readonly List<Label> hintLabels = [];
     readonly ComboBox themeBox;
     readonly ComboBox layoutBox;
     readonly CheckBox blockingCheck;
@@ -127,10 +130,13 @@ sealed class SettingsDialog : Form
     readonly CheckBox autoUpdateCheck;
     readonly CheckBox shareCheck;
     readonly Button clearBtn;
+    readonly Button closeBtn;
     readonly Label clearHint;
     readonly Action<AppSettings> onChanged;
     readonly Func<Task> onClearBrowsingData;
     readonly bool noUpdateCheckFlag;
+    readonly int? dpiOverride;
+    int currentDpi;
     AppSettings current;
     bool syncing;
 
@@ -138,16 +144,20 @@ sealed class SettingsDialog : Form
         AppSettings initial,
         bool noUpdateCheckFlag,
         Action<AppSettings> onChanged,
-        Func<Task> onClearBrowsingData)
+        Func<Task> onClearBrowsingData,
+        int? dpiOverride = null)
     {
         current = initial;
         this.noUpdateCheckFlag = noUpdateCheckFlag;
         this.onChanged = onChanged;
         this.onClearBrowsingData = onClearBrowsingData;
+        this.dpiOverride = dpiOverride;
+        currentDpi = dpiOverride ?? DeviceDpi;
 
         Text = "Settings";
         AccessibleName = "Settings";
-        Font = Theme.UiFont;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        Font = Theme.FontForDpi(Theme.UiFont, currentDpi);
         ForeColor = Theme.Ink;
         BackColor = Theme.Ground;
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -158,7 +168,7 @@ sealed class SettingsDialog : Form
         KeyPreview = true;
         Padding = new(S(20), S(16), S(20), S(16));
 
-        var table = new TableLayoutPanel
+        table = new TableLayoutPanel
         {
             Dock = DockStyle.Top,
             AutoSize = true,
@@ -177,12 +187,13 @@ sealed class SettingsDialog : Form
             var lbl = new Label
             {
                 Text = text,
-                Font = Theme.SectionFont,
+                Font = Theme.FontForDpi(Theme.SectionFont, currentDpi),
                 ForeColor = Theme.Muted,
                 AutoSize = true,
                 Margin = new(0, first ? 0 : S(4), 0, S(6)),
                 AccessibleName = text,
             };
+            sectionLabels.Add(lbl);
             table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             table.Controls.Add(lbl, 0, row);
             table.SetColumnSpan(lbl, 2);
@@ -233,11 +244,12 @@ sealed class SettingsDialog : Form
                 var hintLbl = new Label
                 {
                     Text = hint,
-                    Font = Theme.HintFont,
+                    Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
                     ForeColor = Theme.Muted,
                     AutoSize = true,
                     Margin = new(0, 0, 0, S(6)),
                 };
+                hintLabels.Add(hintLbl);
                 table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 table.Controls.Add(hintLbl, 0, row);
                 table.SetColumnSpan(hintLbl, 2);
@@ -268,11 +280,12 @@ sealed class SettingsDialog : Form
                 var hintLbl = new Label
                 {
                     Text = hint,
-                    Font = Theme.HintFont,
+                    Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
                     ForeColor = Theme.Muted,
                     AutoSize = true,
                     Margin = new(S(20), 0, 0, S(4)),
                 };
+                hintLabels.Add(hintLbl);
                 table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 table.Controls.Add(hintLbl, 0, row);
                 table.SetColumnSpan(hintLbl, 2);
@@ -302,12 +315,13 @@ sealed class SettingsDialog : Form
         clearHint = new Label
         {
             Text = "Cookies, cache, history, and site data",
-            Font = Theme.HintFont,
+            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
             ForeColor = Theme.Muted,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new(0, S(4), S(12), S(4)),
         };
+        hintLabels.Add(clearHint);
         clearBtn = new Button
         {
             Text = "Clear browsing data...",
@@ -329,14 +343,15 @@ sealed class SettingsDialog : Form
         var aboutLbl = new Label
         {
             Text = aboutText,
-            Font = Theme.HintFont,
+            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
             ForeColor = Theme.Muted,
             AutoSize = true,
             Anchor = AnchorStyles.Left,
             Margin = new(0, S(6), S(12), S(2)),
             AccessibleName = $"About {aboutText}",
         };
-        var closeBtn = new Button
+        hintLabels.Add(aboutLbl);
+        closeBtn = new Button
         {
             Text = "Close",
             DialogResult = DialogResult.Cancel,
@@ -367,13 +382,74 @@ sealed class SettingsDialog : Form
         shareCheck.CheckedChanged += (_, _) => Emit();
         clearBtn.Click += async (_, _) => await ClearDataClickedAsync();
 
-        var width = S(420);
+        FitClientSize();
+    }
+
+    int S(int px) => dpiOverride is { } dpi
+        ? (int)Math.Round(px * (dpi / 96.0), MidpointRounding.AwayFromZero)
+        : LogicalToDeviceUnits(px);
+
+    void ApplyFonts(int dpi)
+    {
+        Font = Theme.FontForDpi(Theme.UiFont, dpi);
+        var sectionFont = Theme.FontForDpi(Theme.SectionFont, dpi);
+        foreach (var lbl in sectionLabels) lbl.Font = sectionFont;
+        var hintFont = Theme.FontForDpi(Theme.HintFont, dpi);
+        foreach (var lbl in hintLabels) lbl.Font = hintFont;
+    }
+
+    void FitClientSize()
+    {
+        var minWidth = S(420);
+        var pref = table.GetPreferredSize(new Size(minWidth - Padding.Horizontal, 0));
+        var width = Math.Max(minWidth, pref.Width + Padding.Horizontal);
         table.Width = width - Padding.Horizontal;
-        var pref = table.GetPreferredSize(new Size(width - Padding.Horizontal, 0));
+        pref = table.GetPreferredSize(new Size(table.Width, 0));
         ClientSize = new(width, pref.Height + Padding.Vertical);
     }
 
-    int S(int px) => LogicalToDeviceUnits(px);
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        if (dpiOverride is null && DeviceDpi != currentDpi)
+        {
+            var factor = (float)DeviceDpi / currentDpi;
+            currentDpi = DeviceDpi;
+            Scale(new SizeF(factor, factor));
+            ApplyFonts(currentDpi);
+            FitClientSize();
+        }
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        if (dpiOverride is not null) return;
+        currentDpi = e.DeviceDpiNew;
+        Padding = new(S(20), S(16), S(20), S(16));
+        themeBox.Width = S(132);
+        layoutBox.Width = S(132);
+        clearBtn.Padding = new(S(8), S(2), S(8), S(2));
+        closeBtn.MinimumSize = new(S(78), 0);
+        closeBtn.Padding = new(S(8), S(2), S(8), S(2));
+        ApplyFonts(currentDpi);
+        FitClientSize();
+    }
+
+    internal bool VerifyLayoutInsideClient()
+    {
+        CreateControl();
+        PerformLayout();
+        var client = ClientRectangle;
+        if (client.Width <= 0 || client.Height <= 0 || !client.Contains(table.Bounds)) return false;
+        foreach (Control c in table.Controls)
+        {
+            if (!c.Visible) continue;
+            var r = new Rectangle(table.Left + c.Left, table.Top + c.Top, c.Width, c.Height);
+            if (r.Width <= 0 || r.Height <= 0 || !client.Contains(r)) return false;
+        }
+        return true;
+    }
 
     internal void SyncFrom(AppSettings next)
     {

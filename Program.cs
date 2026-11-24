@@ -241,6 +241,9 @@ sealed class BrowserWindow : Form
     bool recoveringBrowser;
     int sessionSaveCount;
     Func<string, string, bool>? confirmDownloadOverride;
+    Func<string, bool>? confirmShareOverride;
+    Action<string>? shareErrorOverride;
+    int? dpiOverride;
     long envMs;
     long drawTabsTicks;
     bool CanSaveSession => sessionLock is not null;
@@ -320,6 +323,14 @@ sealed class BrowserWindow : Form
     [DllImport("user32.dll")]
     static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+    static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetThreadDpiAwarenessContext();
+
+    [DllImport("user32.dll")]
+    static extern bool AreDpiAwarenessContextsEqual(IntPtr a, IntPtr b);
+
     readonly record struct TabDropTarget(bool Pinned, int Slot);
 
     sealed class BrowserTab(SessionTab? saved = null)
@@ -388,11 +399,16 @@ sealed class BrowserWindow : Form
         this.smokePhase = smokePhase;
         this.noUpdateCheck = noUpdateCheck;
         this.launchArgs = launchArgs ?? [];
-        Font = Theme.UiFont;
+        Font = Theme.FontForDpi(Theme.UiFont, DeviceDpi);
         ForeColor = Theme.Ink;
         BackColor = Theme.Frame;
-        MinimumSize = new(640, 420);
-        Size = new(1160, 780);
+        var minW = S(640);
+        var minH = S(420);
+        MinimumSize = new(minW, minH);
+        var wa = Screen.PrimaryScreen?.WorkingArea ?? Rectangle.Empty;
+        Size = wa.Width > 0 && wa.Height > 0
+            ? new(Math.Max(minW, Math.Min(S(1160), wa.Width)), Math.Max(minH, Math.Min(S(780), wa.Height)))
+            : new(S(1160), S(780));
         StartPosition = FormStartPosition.CenterScreen;
         KeyPreview = true;
 
@@ -463,7 +479,9 @@ sealed class BrowserWindow : Form
         FormClosed += (_, _) => { closed = true; CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); };
     }
 
-    int S(int px) => LogicalToDeviceUnits(px);
+    int S(int px) => dpiOverride is { } dpi
+        ? (int)Math.Round(px * (dpi / 96.0), MidpointRounding.AwayFromZero)
+        : LogicalToDeviceUnits(px);
 
     IconButton MakeIcon(string glyph, string tip, Action action)
     {
@@ -497,6 +515,7 @@ sealed class BrowserWindow : Form
 
     void ApplyChromeMetrics()
     {
+        MinimumSize = new(S(640), S(420));
         sidebar.Width = S(232);
         sidebar.Padding = new(S(10), 0, S(10), S(10));
         sideTopBand.Height = S(36);
@@ -510,12 +529,13 @@ sealed class BrowserWindow : Form
 
     void ToggleMaximize() => WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
 
-    void LayoutCaptionButtons()
+    void LayoutCaptionButtons() => LayoutCaptionButtons(ClientSize.Width);
+
+    void LayoutCaptionButtons(int w)
     {
         if (closeBtn is null) return;
         var bw = S(46);
         var bh = vertical ? S(32) : topStrip.Height;
-        var w = ClientSize.Width;
         closeBtn.SetBounds(w - bw, 0, bw, bh);
         maxBtn.SetBounds(w - bw * 2, 0, bw, bh);
         minBtn.SetBounds(w - bw * 3, 0, bw, bh);
@@ -709,7 +729,10 @@ sealed class BrowserWindow : Form
 
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
+        // Clear old MinimumSize before base.OnDpiChanged applies SuggestedRectangle so shrinking to a lower-DPI monitor is not clamped.
+        MinimumSize = Size.Empty;
         base.OnDpiChanged(e);
+        Font = Theme.FontForDpi(Theme.UiFont, DeviceDpi);
         CancelTabDrag();
         SuspendLayout();
         ApplyChromeMetrics();
@@ -722,6 +745,7 @@ sealed class BrowserWindow : Form
             address.PerformLayout();
         }
         RebuildTabs();
+        Invalidate(true);
     }
 
     protected override void WndProc(ref Message m)
@@ -800,13 +824,14 @@ sealed class BrowserWindow : Form
         base.WndProc(ref m);
     }
 
-    void LayoutSideTopBand()
+    void LayoutSideTopBand() => LayoutSideTopBand(sideTopBand.ClientSize.Width, sideTopBand.ClientSize.Height);
+
+    void LayoutSideTopBand(int w, int h)
     {
         if (!vertical) return;
         var btn = S(26);
         var gap = S(2);
-        var y = (sideTopBand.ClientSize.Height - btn) / 2;
-        var w = sideTopBand.ClientSize.Width;
+        var y = (h - btn) / 2;
         backBtn.SetBounds(0, y, btn, btn);
         forwardBtn.SetBounds(btn + gap, y, btn, btn);
         reloadBtn.SetBounds((btn + gap) * 2, y, btn, btn);
@@ -816,10 +841,10 @@ sealed class BrowserWindow : Form
         if (updateBtn.Visible) { rx -= btn + gap; updateBtn.SetBounds(rx, y, btn, btn); }
     }
 
-    void LayoutTopStrip()
+    void LayoutTopStrip() => LayoutTopStrip(topStrip.ClientSize.Width, topStrip.ClientSize.Height);
+
+    void LayoutTopStrip(int w, int h)
     {
-        var w = topStrip.ClientSize.Width;
-        var h = topStrip.ClientSize.Height;
         var pad = S(10);
         var btn = S(26);
         var gap = S(2);
@@ -2281,7 +2306,7 @@ sealed class BrowserWindow : Form
 
                 var list = new List<Control>(loose.Length);
                 foreach (var tab in loose) list.Add(GetOrCreateTabControl(tab));
-                sideTabs.SetItems(list, sideNewTab);
+                sideTabs.SetItems(list, sideNewTab, S(28), S(2));
             }
             else
             {
@@ -2447,8 +2472,12 @@ sealed class BrowserWindow : Form
             return;
         }
         var source = core.Source;
-        if (MessageBox.Show(this, $"Offer a one-time text snapshot from {new Uri(source).IdnHost}?\n\nAny program running as you can read the snapshot while the offer is open (up to 60 seconds, once). Share only when you trust what's running. This is read-only and does not allow tab control.",
-            "Share page with a local agent", MessageBoxButtons.OKCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.OK) return;
+        var host = new Uri(source).IdnHost;
+        var confirmed = confirmShareOverride is not null
+            ? confirmShareOverride(host)
+            : MessageBox.Show(this, $"Offer a one-time text snapshot from {host}?\n\nAny program running as you can read the snapshot while the offer is open (up to 60 seconds, once). Share only when you trust what's running. This is read-only and does not allow tab control.",
+                "Share page with a local agent", MessageBoxButtons.OKCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.OK;
+        if (!confirmed) return;
         busy = true;
         shareBtn.Enabled = false;
         try
@@ -2464,30 +2493,27 @@ sealed class BrowserWindow : Form
             try
             {
                 var offer = PageHandoff.Offer(snapshot, token.Token);
-                using var dialog = new Form { Text = "One-time Share code", ClientSize = new(425, 116),
-                    StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog,
-                    MaximizeBox = false, MinimizeBox = false, ShowInTaskbar = false };
-                var hint = new Label { Text = "Open up to 60s (once) to any program running as you.", AutoSize = true, Left = 14, Top = 11 };
-                var code = new TextBox { Text = offer.Name, ReadOnly = true, Left = 14, Top = 35, Width = 395 };
-                var cancel = new Button { Text = "Cancel share", Left = 309, Top = 69, Width = 100 };
-                cancel.Click += (_, _) => dialog.Close();
-                dialog.CancelButton = cancel;
-                dialog.FormClosed += (_, _) => token.Cancel();
-                dialog.Controls.AddRange([hint, code, cancel]);
+                using var dialog = new ShareDialog(offer.Name, () => token.Cancel());
                 dialog.Show(this);
-                code.Focus();
-                code.SelectAll();
+                dialog.FocusCode();
                 shareBtn.SetActive(true);
                 tips.SetToolTip(shareBtn, "Share code ready");
                 await offer.Completion;
             }
             finally { token.Cancel(); if (ReferenceEquals(pending, token)) pending = null; }
         }
-        catch (Exception ex) { if (!closed) MessageBox.Show(this, ex.Message, "Could not share text"); }
+        catch (Exception ex)
+        {
+            if (!closed)
+            {
+                if (shareErrorOverride is not null) shareErrorOverride(ex.Message);
+                else MessageBox.Show(this, ex.Message, "Could not share text");
+            }
+        }
         finally
         {
             busy = false;
-            if (!closed)
+            if (!closed && !IsDisposed && !shareBtn.IsDisposed)
             {
                 shareBtn.Enabled = true;
                 shareBtn.SetActive(false);
@@ -3835,6 +3861,173 @@ sealed class BrowserWindow : Form
             middleClickInsideClosesTab,
         };
 
+        // #38: PerMonitorV2 awareness, scaled MinimumSize, minimum-width layout invariants at 100/150/200%, Share and Settings dialogs.
+        static bool NoOverlap(Rectangle[] rects)
+        {
+            for (var i = 0; i < rects.Length; i++)
+                for (var j = i + 1; j < rects.Length; j++)
+                    if (rects[i].IntersectsWith(rects[j])) return false;
+            return true;
+        }
+
+        var perMonitorV2 = AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        var minSizeScaled = MinimumSize == new Size(S(640), S(420));
+
+        var prevDpiSize = Size;
+        var prevDpiUpdateVisible = updateBtn.Visible;
+        var prevDpiVertical = vertical;
+        var dpiTempTabs = Enumerable.Range(1, 20).Select(i => new BrowserTab { SavedTitle = $"DPI {i}" }).ToList();
+        opened.AddRange(dpiTempTabs);
+        updateBtn.Visible = true;
+        shareBtn.Visible = true;
+
+        Size = MinimumSize;
+        SetOrientation(false, persistSettings: false);
+        PerformLayout();
+        var liveStripRects = new[]
+        {
+            BoundsInForm(backBtn), BoundsInForm(forwardBtn), BoundsInForm(reloadBtn),
+            BoundsInForm(address), BoundsInForm(stripTabs), BoundsInForm(stripNewTabBtn),
+            BoundsInForm(updateBtn), BoundsInForm(shareBtn), BoundsInForm(settingsBtn),
+            minBtn.Bounds, maxBtn.Bounds, closeBtn.Bounds,
+        };
+        var liveHorizOk = address.Width >= S(160) && address.Height == S(28)
+            && liveStripRects.All(r => r.Width > 0 && r.Height > 0 && ClientRectangle.Contains(r))
+            && NoOverlap(liveStripRects);
+
+        SetOrientation(true, persistSettings: false);
+        PerformLayout();
+        var liveSideBand = BoundsInForm(sideTopBand);
+        var liveSideRects = new[]
+        {
+            BoundsInForm(backBtn), BoundsInForm(forwardBtn), BoundsInForm(reloadBtn),
+            BoundsInForm(updateBtn), BoundsInForm(shareBtn), BoundsInForm(settingsBtn),
+        };
+        var liveVertOk = address.Width >= S(160) && address.Height == S(28)
+            && liveSideRects.All(r => r.Width > 0 && r.Height > 0 && liveSideBand.Contains(r))
+            && NoOverlap(liveSideRects);
+        var liveMinLayoutOk = liveHorizOk && liveVertOk;
+
+        var otherDpi = DeviceDpi == 192 ? 96 : 192;
+        var simulatedDpiOk = Theme.FontForDpi(Theme.IconFont, otherDpi).FontFamily.Name == Theme.IconFont.FontFamily.Name
+            && Theme.FontForDpi(Theme.UiFont, otherDpi).Height != Theme.FontForDpi(Theme.UiFont, DeviceDpi).Height;
+        try
+        {
+            SetOrientation(false, persistSettings: false);
+            foreach (var dpi in new[] { 96, 144, 192 })
+            {
+                dpiOverride = dpi;
+                ApplyChromeMetrics();
+                var simW = S(624);
+                var simH = S(52);
+                LayoutCaptionButtons(simW);
+                LayoutTopStrip(simW, simH);
+                var simArea = new Rectangle(0, 0, simW, simH);
+                var simRects = new[]
+                {
+                    backBtn.Bounds, forwardBtn.Bounds, reloadBtn.Bounds,
+                    address.Bounds, stripTabs.Bounds, stripNewTabBtn.Bounds,
+                    updateBtn.Bounds, shareBtn.Bounds, settingsBtn.Bounds,
+                    minBtn.Bounds, maxBtn.Bounds, closeBtn.Bounds,
+                };
+                simulatedDpiOk &= MinimumSize == new Size(S(640), S(420))
+                    && address.Width >= S(160) && address.Height == S(28)
+                    && simRects.All(r => r.Width > 0 && r.Height > 0 && simArea.Contains(r))
+                    && NoOverlap(simRects);
+            }
+            dpiOverride = null;
+            ApplyChromeMetrics();
+            SetOrientation(true, persistSettings: false);
+            foreach (var dpi in new[] { 96, 144, 192 })
+            {
+                dpiOverride = dpi;
+                ApplyChromeMetrics();
+                var sideInnerW = S(212);
+                var bandH = S(36);
+                LayoutSideTopBand(sideInnerW, bandH);
+                var bandArea = new Rectangle(0, 0, sideInnerW, bandH);
+                var bandRects = new[]
+                {
+                    backBtn.Bounds, forwardBtn.Bounds, reloadBtn.Bounds,
+                    updateBtn.Bounds, shareBtn.Bounds, settingsBtn.Bounds,
+                };
+                var (pinCols, pinW, pinH, pinGap) = PinGridMetrics(4);
+                simulatedDpiOk &= bandRects.All(r => r.Width > 0 && r.Height > 0 && bandArea.Contains(r))
+                    && NoOverlap(bandRects)
+                    && pinCols == 4 && pinH == S(34) && pinW >= S(24)
+                    && pinCols * pinW + (pinCols - 1) * pinGap <= sideInnerW;
+            }
+        }
+        finally
+        {
+            dpiOverride = null;
+            updateBtn.Visible = prevDpiUpdateVisible;
+            foreach (var t in dpiTempTabs) { t.Closed = true; opened.Remove(t); }
+            ApplyChromeMetrics();
+            Size = prevDpiSize;
+            SetOrientation(prevDpiVertical, persistSettings: false);
+            PerformLayout();
+        }
+
+        bool shareDialogOk;
+        using (var liveShare = new ShareDialog("SearchWindows-0123456789abcdef0123456789abcdef", () => { }))
+        {
+            liveShare.Show(this);
+            shareDialogOk = liveShare.VerifyLayoutInsideClient();
+            liveShare.Close();
+        }
+        foreach (var dpi in new[] { 96, 144, 192 })
+        {
+            using var simShare = new ShareDialog("SearchWindows-0123456789abcdef0123456789abcdef", () => { }, dpi);
+            shareDialogOk &= simShare.VerifyLayoutInsideClient();
+        }
+
+        var settingsDialogDpiOk = true;
+        foreach (var dpi in new[] { 96, 144, 192 })
+        {
+            using var simSettings = new SettingsDialog(settings, noUpdateCheck, _ => { }, () => Task.CompletedTask, dpi);
+            settingsDialogDpiOk &= simSettings.VerifyLayoutInsideClient();
+        }
+
+        var highDpi = new
+        {
+            perMonitorV2,
+            minSizeScaled,
+            liveMinLayoutOk,
+            simulatedDpiOk,
+            shareDialogOk,
+            settingsDialogDpiOk,
+        };
+
+        // #41: Share capture times out on a page with a blocked script thread and re-enables Share afterwards.
+        var hangTab = await Open(fixture + "/hang");
+        await WaitForLoad(hangTab);
+        await Task.Delay(250);
+        string? hangError = null;
+        confirmShareOverride = _ => true;
+        shareErrorOverride = msg => hangError = msg;
+        var hangWatch = Stopwatch.StartNew();
+        var hangShareTask = SharePage();
+        var disabledDuringCapture = !shareBtn.Enabled && busy;
+        await hangShareTask;
+        hangWatch.Stop();
+        confirmShareOverride = null;
+        shareErrorOverride = null;
+        var timedOut = !string.IsNullOrEmpty(hangError) && hangError.Contains("Timed out", StringComparison.OrdinalIgnoreCase);
+        var elapsedOk = hangWatch.Elapsed >= TimeSpan.FromSeconds(4.5) && hangWatch.Elapsed < TimeSpan.FromSeconds(12);
+        var reEnabledAfter = shareBtn.Enabled && !busy;
+        CloseTab(hangTab, recordClosed: false);
+        SelectTab(first);
+        var recoveredShare = await PageHandoff.Capture(first.View?.CoreWebView2 ?? throw new InvalidOperationException("First tab view is not ready."));
+        var shareTimeout = new
+        {
+            disabledDuringCapture,
+            timedOut,
+            elapsedOk,
+            reEnabledAfter,
+            shareWorksAfterTimeout = recoveredShare.Text == "First page marker",
+        };
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -3844,7 +4037,7 @@ sealed class BrowserWindow : Form
             settingsDialogOk, shareToggleWorks,
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
             urlWhenCleanOff, cliFlags,
-            faviconCached, addressDisplayOk, tabDrag, tabFixes,
+            faviconCached, addressDisplayOk, tabDrag, tabFixes, highDpi, shareTimeout,
             postClean, blobUrl, permissions, downloads, processCrash,
             sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
@@ -3896,5 +4089,98 @@ sealed class BrowserWindow : Form
         SetOrientation(false);
         ExitCode = 0;
         Close();
+    }
+}
+
+sealed class ShareDialog : Form
+{
+    readonly Label hint;
+    readonly TextBox code;
+    readonly Button cancel;
+    readonly int? dpiOverride;
+    int currentDpi;
+
+    internal ShareDialog(string offerName, Action onClosed, int? dpiOverride = null)
+    {
+        this.dpiOverride = dpiOverride;
+        currentDpi = dpiOverride ?? DeviceDpi;
+
+        Text = "One-time Share code";
+        AccessibleName = "One-time Share code";
+        AutoScaleMode = AutoScaleMode.Dpi;
+        ForeColor = Theme.Ink;
+        BackColor = Theme.Ground;
+        StartPosition = FormStartPosition.CenterParent;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        ShowInTaskbar = false;
+
+        hint = new Label { Text = "Open up to 60s (once) to any program running as you.", AutoSize = true };
+        code = new TextBox { Text = offerName, ReadOnly = true };
+        cancel = new Button { Text = "Cancel share", AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+        cancel.Click += (_, _) => Close();
+        CancelButton = cancel;
+        FormClosed += (_, _) => onClosed();
+        Controls.AddRange([hint, code, cancel]);
+
+        LayoutForDpi(currentDpi);
+    }
+
+    internal void FocusCode()
+    {
+        code.Focus();
+        code.SelectAll();
+    }
+
+    static int ScalePx(int px, int dpi) => (int)Math.Round(px * (dpi / 96.0), MidpointRounding.AwayFromZero);
+
+    void LayoutForDpi(int dpi)
+    {
+        currentDpi = dpi;
+        Font = Theme.FontForDpi(Theme.UiFont, dpi);
+        var padX = ScalePx(14, dpi);
+        var padY = ScalePx(12, dpi);
+        var gapY = ScalePx(10, dpi);
+        cancel.Padding = new(ScalePx(8, dpi), ScalePx(2, dpi), ScalePx(8, dpi), ScalePx(2, dpi));
+        cancel.MinimumSize = new(ScalePx(100, dpi), 0);
+
+        var hintSize = hint.GetPreferredSize(Size.Empty);
+        var cancelSize = cancel.GetPreferredSize(Size.Empty);
+        var contentW = Math.Max(Math.Max(ScalePx(396, dpi), hintSize.Width), cancelSize.Width);
+        var codeH = code.PreferredHeight;
+
+        hint.SetBounds(padX, padY, hintSize.Width, hintSize.Height);
+        code.SetBounds(padX, hint.Bottom + gapY, contentW, codeH);
+        cancel.SetBounds(padX + contentW - cancelSize.Width, code.Bottom + gapY, cancelSize.Width, cancelSize.Height);
+        ClientSize = new(padX * 2 + contentW, cancel.Bottom + padY);
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        if (dpiOverride is null && DeviceDpi != currentDpi)
+            LayoutForDpi(DeviceDpi);
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        if (dpiOverride is null)
+            LayoutForDpi(e.DeviceDpiNew);
+    }
+
+    internal bool VerifyLayoutInsideClient()
+    {
+        CreateControl();
+        PerformLayout();
+        var client = ClientRectangle;
+        return client.Width > 0 && client.Height > 0
+            && hint.Width > 0 && hint.Height > 0 && client.Contains(hint.Bounds)
+            && code.Width >= ScalePx(396, currentDpi) && code.Height > 0 && client.Contains(code.Bounds)
+            && cancel.Width >= cancel.GetPreferredSize(Size.Empty).Width && cancel.Height > 0 && client.Contains(cancel.Bounds)
+            && !hint.Bounds.IntersectsWith(code.Bounds)
+            && !code.Bounds.IntersectsWith(cancel.Bounds)
+            && !hint.Bounds.IntersectsWith(cancel.Bounds);
     }
 }
