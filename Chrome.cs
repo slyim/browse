@@ -208,10 +208,16 @@ static class Theme
     }
 
     public static void DrawCloseDot(Graphics g, Rectangle box, bool closeHovered, int dpi = 96)
+        => DrawCloseDot(g, box, closeHovered ? 1f : 0f, 1f, Frame, dpi);
+
+    public static void DrawCloseDot(Graphics g, Rectangle box, float closeHoverAmount, float opacity, Color surface, int dpi = 96)
     {
-        using var brush = new SolidBrush(closeHovered ? CloseHoverFill : BadgeFill);
+        if (opacity <= 0.01f) return;
+        var fill = Motion.WithAlpha(Motion.Blend(BadgeFill, CloseHoverFill, closeHoverAmount), opacity);
+        using var brush = new SolidBrush(fill);
         g.FillEllipse(brush, box);
-        TextRenderer.DrawText(g, Glyphs.Close, FontForDpi(CloseIconFont, dpi), box, closeHovered ? Ink : Muted,
+        var fg = Motion.Blend(surface, Motion.Blend(Muted, Ink, closeHoverAmount), opacity);
+        TextRenderer.DrawText(g, Glyphs.Close, FontForDpi(CloseIconFont, dpi), box, fg,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
     }
 
@@ -646,7 +652,7 @@ sealed class TabDragCallbacks(Func<Point, bool> start, Action<Point> move, Actio
     public Action Cancel { get; } = cancel;
 }
 
-abstract class TabChromeControl : ChromeControl, ITabItem
+abstract class TabChromeControl : ChromeControl, ITabItem, IMotionTarget
 {
     const int WM_LBUTTONUP = 0x0202;
     const int WM_MBUTTONUP = 0x0208;
@@ -654,6 +660,11 @@ abstract class TabChromeControl : ChromeControl, ITabItem
     readonly Action onSelect;
     readonly Action onClose;
     readonly TabDragCallbacks? drag;
+    protected readonly MotionClock? motion;
+    protected AnimScalar hoverAnim;
+    protected AnimScalar activeAnim;
+    protected AnimScalar closeHoverAnim;
+    protected AnimScalar appearAnim;
     protected bool hovered;
     protected bool dragSource;
     Point? pressPoint;
@@ -664,11 +675,14 @@ abstract class TabChromeControl : ChromeControl, ITabItem
     bool suppressClick;
     bool releasingButton;
 
-    protected TabChromeControl(Action onSelect, Action onClose, TabDragCallbacks? drag)
+    protected TabChromeControl(Action onSelect, Action onClose, TabDragCallbacks? drag, MotionClock? motion, bool initialActive)
     {
         this.onSelect = onSelect;
         this.onClose = onClose;
         this.drag = drag;
+        this.motion = motion;
+        activeAnim.Snap(initialActive ? 1f : 0f);
+        appearAnim.Snap(1f);
         Cursor = Cursors.Hand;
         AccessibleRole = AccessibleRole.PageTab;
     }
@@ -678,6 +692,97 @@ abstract class TabChromeControl : ChromeControl, ITabItem
     public abstract TabAudioState Audio { get; }
     public abstract void UpdateTab(string title, string? url, bool active, Image? favicon, bool loading = false, TabAudioState audio = TabAudioState.None, int loadingPhase = 0);
     public abstract void SetLoadingPhase(int phase);
+
+    Rectangle baseBounds;
+    bool closing;
+
+    internal Rectangle BaseBounds => baseBounds;
+    internal bool Closing => closing;
+    internal void MarkClosing() => closing = true;
+    internal float HoverProgress => hoverAnim.Value;
+    internal float ActiveProgress => activeAnim.Value;
+    internal float CloseHoverProgress => closeHoverAnim.Value;
+    internal float AppearProgress => appearAnim.Value;
+
+    internal void SetBaseBounds(int x, int y, int w, int h, Point offset = default)
+    {
+        baseBounds = new Rectangle(x, y, w, h);
+        SetBounds(x + offset.X, y + offset.Y, w, h);
+    }
+
+    internal void ShiftBaseX(int delta)
+    {
+        baseBounds = new Rectangle(baseBounds.X + delta, baseBounds.Y, baseBounds.Width, baseBounds.Height);
+        Left += delta;
+    }
+
+    internal void SetHoverState(bool value)
+    {
+        if (hovered == value && !hoverAnim.Active) return;
+        hovered = value;
+        if (!value) ClearCloseHover();
+        if (hoverAnim.SetTarget(value ? 1f : 0f, motion, Motion.HoverDurationMs))
+        {
+            if (hoverAnim.Active) motion?.Track(this);
+            Invalidate();
+        }
+    }
+
+    protected void AnimateActiveState(bool value)
+    {
+        if (activeAnim.SetTarget(value ? 1f : 0f, motion, Motion.HoverDurationMs) && activeAnim.Active)
+            motion?.Track(this);
+    }
+
+    protected void SetCloseHoverState(bool value)
+    {
+        if (closeHoverAnim.SetTarget(value ? 1f : 0f, motion, Motion.HoverDurationMs))
+        {
+            if (closeHoverAnim.Active) motion?.Track(this);
+            Invalidate();
+        }
+    }
+
+    internal void TriggerAppear(float startOpacity = 0f, double durationMs = Motion.PinTransitionDurationMs)
+    {
+        if (appearAnim.Start(startOpacity, 1f, motion, durationMs) && appearAnim.Active)
+            motion?.Track(this);
+        Invalidate();
+    }
+
+    internal void SetAppearOpacity(float opacity)
+    {
+        var clamped = Math.Clamp(opacity, 0f, 1f);
+        if (MathF.Abs(appearAnim.Value - clamped) <= 0.001f && !appearAnim.Active) return;
+        appearAnim.Snap(clamped);
+        if (!IsDisposed) Invalidate();
+    }
+
+    bool IMotionTarget.StepMotion(double nowMs)
+    {
+        if (IsDisposed) return false;
+        var a1 = hoverAnim.Step(nowMs);
+        var a2 = activeAnim.Step(nowMs);
+        var a3 = closeHoverAnim.Step(nowMs);
+        var a4 = appearAnim.Step(nowMs);
+        Invalidate();
+        return a1 || a2 || a3 || a4;
+    }
+
+    void IMotionTarget.SnapMotion()
+    {
+        hoverAnim.Snap(hoverAnim.Target);
+        activeAnim.Snap(activeAnim.Target);
+        closeHoverAnim.Snap(closeHoverAnim.Target);
+        appearAnim.Snap(appearAnim.Target);
+        if (!IsDisposed) Invalidate();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) motion?.Untrack(this);
+        base.Dispose(disposing);
+    }
 
     protected virtual bool IsClosePoint(Point p) => false;
     protected virtual void UpdateCloseHover(Point p) { }
@@ -709,10 +814,17 @@ abstract class TabChromeControl : ChromeControl, ITabItem
         if (wasDragging) Invalidate();
     }
 
+    protected void PaintAppearWash(Graphics g)
+    {
+        if (appearAnim.Value >= 0.999f) return;
+        using var wash = new SolidBrush(Motion.WithAlpha(BackColor, 1f - appearAnim.Value));
+        g.FillRectangle(wash, ClientRectangle);
+    }
+
     protected void PaintDragGhost(Graphics g)
     {
         if (!dragSource) return;
-        using var wash = new SolidBrush(Color.FromArgb(128, BackColor));
+        using var wash = new SolidBrush(Color.FromArgb(40, BackColor));
         g.FillRectangle(wash, ClientRectangle);
         Theme.DrawRounded(g, Theme.DropLine, new RectangleF(0.5f, 0.5f, Width - 1f, Height - 1f), Sf(8.5f));
     }
@@ -720,20 +832,19 @@ abstract class TabChromeControl : ChromeControl, ITabItem
     protected override void OnMouseEnter(EventArgs e)
     {
         base.OnMouseEnter(e);
-        if (!dragging) { hovered = true; Invalidate(); }
+        if (!Closing && !dragging) SetHoverState(true);
     }
 
     protected override void OnMouseLeave(EventArgs e)
     {
         base.OnMouseLeave(e);
-        hovered = false;
-        ClearCloseHover();
-        Invalidate();
+        if (!Closing) SetHoverState(false);
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
         base.OnMouseDown(e);
+        if (Closing) return;
         if (dragging && e.Button == MouseButtons.Right)
         {
             CancelDrag();
@@ -764,6 +875,7 @@ abstract class TabChromeControl : ChromeControl, ITabItem
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
+        if (Closing) return;
         if (!dragging)
         {
             UpdateCloseHover(e.Location);
@@ -777,8 +889,7 @@ abstract class TabChromeControl : ChromeControl, ITabItem
                     {
                         dragging = true;
                         dragSource = true;
-                        hovered = false;
-                        ClearCloseHover();
+                        SetHoverState(false);
                         Capture = true;
                         hadCapture = Capture;
                         Invalidate();
@@ -794,6 +905,7 @@ abstract class TabChromeControl : ChromeControl, ITabItem
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
+        if (Closing) return;
         if (e.Button == MouseButtons.Middle)
         {
             var wasMiddle = middlePressed;
@@ -854,8 +966,8 @@ sealed class TabRow : TabChromeControl
     int loadingPhase;
     bool closeHovered;
 
-    internal TabRow(string title, string? url, bool active, Image? favicon, Action onSelect, Action onClose, TabDragCallbacks? drag = null, bool loading = false, TabAudioState audio = TabAudioState.None, int loadingPhase = 0)
-        : base(onSelect, onClose, drag)
+    internal TabRow(string title, string? url, bool active, Image? favicon, Action onSelect, Action onClose, TabDragCallbacks? drag = null, bool loading = false, TabAudioState audio = TabAudioState.None, int loadingPhase = 0, MotionClock? motion = null)
+        : base(onSelect, onClose, drag, motion, active)
     {
         this.title = title;
         badge = url is null ? null : Theme.Monogram(url, title);
@@ -878,6 +990,7 @@ sealed class TabRow : TabChromeControl
         var nextBadge = url is null ? null : Theme.Monogram(url, title);
         if (this.title == title && badge == nextBadge && this.active == active && ReferenceEquals(this.favicon, favicon)
             && this.loading == loading && this.audio == audio && (!loading || this.loadingPhase == loadingPhase)) return;
+        var activeChanged = this.active != active;
         this.title = title;
         badge = nextBadge;
         this.favicon = favicon;
@@ -886,6 +999,7 @@ sealed class TabRow : TabChromeControl
         this.audio = audio;
         this.loadingPhase = loadingPhase;
         AccessibleName = title;
+        if (activeChanged) AnimateActiveState(active);
         Invalidate();
     }
 
@@ -898,21 +1012,37 @@ sealed class TabRow : TabChromeControl
 
     Rectangle CloseDotRect => new(Width - S(7) - S(15), (Height - S(15)) / 2, S(15), S(15));
     protected override bool IsClosePoint(Point p) => hovered && p.X >= Width - S(26);
-    protected override void ClearCloseHover() => closeHovered = false;
+    protected override void ClearCloseHover()
+    {
+        closeHovered = false;
+        SetCloseHoverState(false);
+    }
     protected override void UpdateCloseHover(Point p)
     {
         var over = IsClosePoint(p);
-        if (over != closeHovered) { closeHovered = over; Invalidate(); }
+        if (over != closeHovered)
+        {
+            closeHovered = over;
+            SetCloseHoverState(over);
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
         g.Clear(BackColor);
+        if (Width <= 1 || Height <= 1) return;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        if (active || hovered)
-            Theme.FillRounded(g, active ? Theme.SideActive : Theme.SideHover, new RectangleF(0, 0, Width, Height), Sf(9f));
+        var ht = hoverAnim.Value;
+        var at = activeAnim.Value;
+        var cht = closeHoverAnim.Value;
+        var surface = Motion.Blend(Motion.Blend(BackColor, Theme.SideHover, ht), Theme.SideActive, at);
+        if (ht > 0.001f || at > 0.001f)
+        {
+            var lift = (1f - MathF.Max(ht, at)) * Sf(0.6f);
+            Theme.FillRounded(g, surface, new RectangleF(lift * 0.5f, lift, Math.Max(0, Width - lift), Math.Max(0, Height - lift)), Sf(9f));
+        }
 
         var x = S(10);
         if (loading || favicon is not null || badge is not null)
@@ -925,20 +1055,24 @@ sealed class TabRow : TabChromeControl
             x += mark + S(8);
         }
 
+        var showClose = ht > 0.01f;
         var showAudio = audio != TabAudioState.None;
-        var rightPad = hovered ? (showAudio ? S(46) : S(28)) : (showAudio ? S(28) : S(10));
+        var rightPad = showClose ? (showAudio ? S(46) : S(28)) : (showAudio ? S(28) : S(10));
         var textRect = new Rectangle(x, 0, Math.Max(0, Width - x - rightPad), Height);
-        var textColor = active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
+        var textColor = Motion.Blend(Motion.Blend(Theme.Muted, Theme.InkSoft, ht), Theme.Ink, at);
         TextRenderer.DrawText(g, title, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, textColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
         if (showAudio)
         {
             var audioSize = S(15);
-            var audioX = hovered ? CloseDotRect.Left - S(4) - audioSize : Width - S(7) - audioSize;
+            var restAudioX = Width - S(7) - audioSize;
+            var hoverAudioX = CloseDotRect.Left - S(4) - audioSize;
+            var audioX = (int)MathF.Round(Motion.Lerp(restAudioX, hoverAudioX, ht));
             Theme.DrawAudioGlyph(g, new Rectangle(audioX, (Height - audioSize) / 2, audioSize, audioSize), audio, active, DeviceDpi);
         }
-        if (hovered) Theme.DrawCloseDot(g, CloseDotRect, closeHovered, DeviceDpi);
+        if (showClose) Theme.DrawCloseDot(g, CloseDotRect, cht, ht, surface, DeviceDpi);
+        PaintAppearWash(g);
         PaintDragGhost(g);
     }
 }
@@ -953,8 +1087,8 @@ sealed class PinSquare : TabChromeControl
     int loadingPhase;
     readonly bool onFrame;
 
-    internal PinSquare(string title, string? url, bool active, Image? favicon, bool onFrame, Action onSelect, Action onClose, TabDragCallbacks? drag = null, bool loading = false, TabAudioState audio = TabAudioState.None, int loadingPhase = 0)
-        : base(onSelect, onClose, drag)
+    internal PinSquare(string title, string? url, bool active, Image? favicon, bool onFrame, Action onSelect, Action onClose, TabDragCallbacks? drag = null, bool loading = false, TabAudioState audio = TabAudioState.None, int loadingPhase = 0, MotionClock? motion = null)
+        : base(onSelect, onClose, drag, motion, active)
     {
         letter = Theme.Monogram(url, title);
         this.favicon = favicon;
@@ -977,6 +1111,7 @@ sealed class PinSquare : TabChromeControl
         var nextLetter = Theme.Monogram(url, title);
         if (AccessibleName == title && letter == nextLetter && this.active == active && ReferenceEquals(this.favicon, favicon)
             && this.loading == loading && this.audio == audio && (!loading || this.loadingPhase == loadingPhase)) return;
+        var activeChanged = this.active != active;
         letter = nextLetter;
         this.favicon = favicon;
         this.active = active;
@@ -984,6 +1119,7 @@ sealed class PinSquare : TabChromeControl
         this.audio = audio;
         this.loadingPhase = loadingPhase;
         AccessibleName = title;
+        if (activeChanged) AnimateActiveState(active);
         Invalidate();
     }
 
@@ -998,12 +1134,16 @@ sealed class PinSquare : TabChromeControl
     {
         var g = e.Graphics;
         g.Clear(BackColor);
+        if (Width <= 1 || Height <= 1) return;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+        var ht = hoverAnim.Value;
+        var at = activeAnim.Value;
         var restTile = !onFrame && Theme.Dark ? Color.FromArgb(0x24, 0x24, 0x24) : Theme.PinTile;
         var hoverTile = onFrame ? Theme.SideHover : Theme.StripHover;
-        var fill = active ? Theme.PinActive : hovered ? hoverTile : restTile;
-        Theme.FillRounded(g, fill, new RectangleF(0, 0, Width, Height), Sf(9f));
+        var fill = Motion.Blend(Motion.Blend(restTile, hoverTile, ht), Theme.PinActive, at);
+        var inset = (1f - MathF.Max(ht, at)) * Sf(0.5f);
+        Theme.FillRounded(g, fill, new RectangleF(inset, inset, Math.Max(0, Width - inset * 2f), Math.Max(0, Height - inset * 2f)), Sf(9f));
         if (loading)
         {
             var mark = S(16);
@@ -1016,7 +1156,7 @@ sealed class PinSquare : TabChromeControl
         }
         else
         {
-            var color = active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
+            var color = Motion.Blend(Motion.Blend(Theme.Muted, Theme.InkSoft, ht), Theme.Ink, at);
             TextRenderer.DrawText(g, letter, Theme.FontForDpi(onFrame ? Theme.PinFont : Theme.StripPinFont, DeviceDpi), ClientRectangle, color,
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
         }
@@ -1025,6 +1165,7 @@ sealed class PinSquare : TabChromeControl
             var aSize = S(11);
             Theme.DrawAudioGlyph(g, new Rectangle(Width - aSize - S(2), S(2), aSize, aSize), audio, active, DeviceDpi, tiny: true);
         }
+        PaintAppearWash(g);
         PaintDragGhost(g);
     }
 }
@@ -1041,8 +1182,8 @@ sealed class TabPill : TabChromeControl
     int loadingPhase;
     bool closeHovered;
 
-    internal TabPill(string title, string? url, bool active, Image? favicon, Action onSelect, Action onClose, TabDragCallbacks? drag = null, bool loading = false, TabAudioState audio = TabAudioState.None, int loadingPhase = 0)
-        : base(onSelect, onClose, drag)
+    internal TabPill(string title, string? url, bool active, Image? favicon, Action onSelect, Action onClose, TabDragCallbacks? drag = null, bool loading = false, TabAudioState audio = TabAudioState.None, int loadingPhase = 0, MotionClock? motion = null)
+        : base(onSelect, onClose, drag, motion, active)
     {
         this.title = title;
         badge = url is null ? null : Theme.Monogram(url, title);
@@ -1067,6 +1208,7 @@ sealed class TabPill : TabChromeControl
         var nextCompact = Theme.Monogram(url, title);
         if (this.title == title && badge == nextBadge && compactLetter == nextCompact && this.active == active && ReferenceEquals(this.favicon, favicon)
             && this.loading == loading && this.audio == audio && (!loading || this.loadingPhase == loadingPhase)) return;
+        var activeChanged = this.active != active;
         this.title = title;
         badge = nextBadge;
         compactLetter = nextCompact;
@@ -1076,6 +1218,7 @@ sealed class TabPill : TabChromeControl
         this.audio = audio;
         this.loadingPhase = loadingPhase;
         AccessibleName = title;
+        if (activeChanged) AnimateActiveState(active);
         Invalidate();
     }
 
@@ -1089,21 +1232,37 @@ sealed class TabPill : TabChromeControl
     bool Compact => Width < S(78);
     Rectangle CloseDotRect => new(Width - S(7) - S(15), (Height - S(15)) / 2, S(15), S(15));
     protected override bool IsClosePoint(Point p) => hovered && !Compact && p.X >= Width - S(26);
-    protected override void ClearCloseHover() => closeHovered = false;
+    protected override void ClearCloseHover()
+    {
+        closeHovered = false;
+        SetCloseHoverState(false);
+    }
     protected override void UpdateCloseHover(Point p)
     {
         var over = IsClosePoint(p);
-        if (over != closeHovered) { closeHovered = over; Invalidate(); }
+        if (over != closeHovered)
+        {
+            closeHovered = over;
+            SetCloseHoverState(over);
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
         g.Clear(BackColor);
+        if (Width <= 1 || Height <= 1) return;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-        if (active || hovered)
-            Theme.FillRounded(g, active ? Theme.StripActive : Theme.StripHover, new RectangleF(0, 0, Width, Height), Sf(9f));
+        var ht = hoverAnim.Value;
+        var at = activeAnim.Value;
+        var cht = closeHoverAnim.Value;
+        var surface = Motion.Blend(Motion.Blend(BackColor, Theme.StripHover, ht), Theme.StripActive, at);
+        if (ht > 0.001f || at > 0.001f)
+        {
+            var lift = (1f - MathF.Max(ht, at)) * Sf(0.6f);
+            Theme.FillRounded(g, surface, new RectangleF(lift * 0.5f, lift, Math.Max(0, Width - lift), Math.Max(0, Height - lift)), Sf(9f));
+        }
 
         var mark = S(16);
         if (Compact)
@@ -1117,6 +1276,7 @@ sealed class TabPill : TabChromeControl
                 var aSize = S(10);
                 Theme.DrawAudioGlyph(g, new Rectangle(Width - aSize - S(2), S(2), aSize, aSize), audio, active, DeviceDpi, tiny: true);
             }
+            PaintAppearWash(g);
             PaintDragGhost(g);
             return;
         }
@@ -1131,20 +1291,24 @@ sealed class TabPill : TabChromeControl
             x += mark + S(6);
         }
 
-        var showAudio = audio != TabAudioState.None && (!hovered || Width >= S(100));
-        var rightPad = hovered ? (showAudio ? S(44) : S(26)) : (showAudio ? S(26) : S(8));
+        var showClose = ht > 0.01f;
+        var showAudio = audio != TabAudioState.None && (!showClose || Width >= S(100));
+        var rightPad = showClose ? (showAudio ? S(44) : S(26)) : (showAudio ? S(26) : S(8));
         var textRect = new Rectangle(x, 0, Math.Max(0, Width - x - rightPad), Height);
-        var textColor = active ? Theme.Ink : hovered ? Theme.InkSoft : Theme.Muted;
+        var textColor = Motion.Blend(Motion.Blend(Theme.Muted, Theme.InkSoft, ht), Theme.Ink, at);
         TextRenderer.DrawText(g, title, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, textColor,
             TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
 
         if (showAudio)
         {
             var audioSize = S(15);
-            var audioX = hovered ? CloseDotRect.Left - S(3) - audioSize : Width - S(6) - audioSize;
+            var restAudioX = Width - S(6) - audioSize;
+            var hoverAudioX = CloseDotRect.Left - S(3) - audioSize;
+            var audioX = (int)MathF.Round(Motion.Lerp(restAudioX, hoverAudioX, ht));
             Theme.DrawAudioGlyph(g, new Rectangle(audioX, (Height - audioSize) / 2, audioSize, audioSize), audio, active, DeviceDpi);
         }
-        if (hovered) Theme.DrawCloseDot(g, CloseDotRect, closeHovered, DeviceDpi);
+        if (showClose) Theme.DrawCloseDot(g, CloseDotRect, cht, ht, surface, DeviceDpi);
+        PaintAppearWash(g);
         PaintDragGhost(g);
     }
 }
@@ -1313,7 +1477,7 @@ sealed class TabStack : Panel
         content.Top = -scrollOffset;
     }
 
-    internal void SetItems(IReadOnlyList<Control> controls, Control footer, int? rowHeight = null, int? itemGap = null)
+    internal void SetItems(IReadOnlyList<Control> controls, Control footer, int? rowHeight = null, int? itemGap = null, Func<Control, int>? heightOf = null, Func<TabChromeControl, Point>? offsetOf = null)
     {
         content.SuspendLayout();
         var keep = new HashSet<Control>(controls) { footer };
@@ -1331,8 +1495,10 @@ sealed class TabStack : Panel
             var c = controls[i];
             if (c.Parent != content) content.Controls.Add(c);
             if (content.Controls.GetChildIndex(c) != i) content.Controls.SetChildIndex(c, i);
-            c.SetBounds(0, y, w, rowH);
-            y += rowH + gap;
+            var h = heightOf is not null ? Math.Max(0, heightOf(c)) : rowH;
+            if (c is TabChromeControl tc) tc.SetBaseBounds(0, y, w, h, offsetOf?.Invoke(tc) ?? Point.Empty);
+            else c.SetBounds(0, y, w, h);
+            if (h > 0) y += h + (h < rowH ? (int)MathF.Round(gap * (h / (float)rowH)) : gap);
         }
         if (footer.Parent != content) content.Controls.Add(footer);
         if (content.Controls.GetChildIndex(footer) != controls.Count) content.Controls.SetChildIndex(footer, controls.Count);
@@ -1341,6 +1507,26 @@ sealed class TabStack : Panel
         ClampScroll();
         content.SetBounds(0, -scrollOffset, w, Math.Max(contentHeight, ClientSize.Height));
         content.ResumeLayout();
+    }
+
+    internal void LayoutItemBounds(IReadOnlyList<Control> controls, Control footer, int rowH, int gap, Func<Control, int> heightOf, Func<TabChromeControl, Point>? offsetOf = null)
+    {
+        content.SuspendLayout();
+        var y = 0;
+        var w = Math.Max(0, ClientSize.Width);
+        for (var i = 0; i < controls.Count; i++)
+        {
+            var c = controls[i];
+            var h = Math.Max(0, heightOf(c));
+            if (c is TabChromeControl tc) tc.SetBaseBounds(0, y, w, h, offsetOf?.Invoke(tc) ?? Point.Empty);
+            else c.SetBounds(0, y, w, h);
+            if (h > 0) y += h + (h < rowH ? (int)MathF.Round(gap * (h / (float)rowH)) : gap);
+        }
+        footer.SetBounds(0, y, w, rowH);
+        contentHeight = y + rowH;
+        ClampScroll();
+        content.SetBounds(0, -scrollOffset, w, Math.Max(contentHeight, ClientSize.Height));
+        content.ResumeLayout(false);
     }
 
     protected override void OnMouseWheel(MouseEventArgs e)

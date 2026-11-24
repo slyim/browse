@@ -450,6 +450,18 @@ def run_checks():
                     'keyboardReorder': True,
                     'sessionOrderMatches': True,
                 }, report.get('tabDrag')
+                assert report.get('tabAnim') == {
+                    'easingHelperOk': True,
+                    'hoverFadeOk': True,
+                    'dragNeighborGapOk': True,
+                    'dragCancelGlideOk': True,
+                    'dragDropGlideOk': True,
+                    'openGrowOk': True,
+                    'closeRemovesOk': True,
+                    'closeReduceMotionOk': True,
+                    'rapidCloseSafeOk': True,
+                    'clockStopsIdle': True,
+                }, report.get('tabAnim')
                 assert report.get('postClean') == {
                     'url': base + '/post-target?utm_source=email&id=1',
                     'echo': 'msg=hello-post',
