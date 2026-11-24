@@ -1,4 +1,4 @@
-using System.Text.Json;
+using System.Runtime.InteropServices;
 using Microsoft.Web.WebView2.Core;
 
 namespace SearchPort;
@@ -77,9 +77,190 @@ static class CleanLink
     }
 }
 
+sealed class ShieldAttachment
+{
+    readonly CoreWebView2 core;
+    readonly Func<Uri?> pageUri;
+    readonly Func<Uri?> pendingMainFrameUri;
+    readonly Func<bool> isGlobalEnabled;
+    readonly Func<string?, bool> isSiteEnabled;
+    readonly SemaphoreSlim cosmeticLock = new(1, 1);
+    int blocked;
+    string? cosmeticScriptId;
+    string? cosmeticHost;
+    int cosmeticEngineVersion;
+    bool cosmeticActive;
+    bool ownsWorkerFilter;
+
+    internal ShieldAttachment(
+        CoreWebView2 core,
+        Func<Uri?> pageUri,
+        Func<Uri?> pendingMainFrameUri,
+        Func<bool> isGlobalEnabled,
+        Func<string?, bool> isSiteEnabled)
+    {
+        this.core = core;
+        this.pageUri = pageUri;
+        this.pendingMainFrameUri = pendingMainFrameUri;
+        this.isGlobalEnabled = isGlobalEnabled;
+        this.isSiteEnabled = isSiteEnabled;
+    }
+
+    public int BlockedCount => Volatile.Read(ref blocked);
+    public bool OwnsWorkerFilter => ownsWorkerFilter;
+
+    public int IncrementBlocked() => Interlocked.Increment(ref blocked);
+    public void ResetBlocked() => Interlocked.Exchange(ref blocked, 0);
+
+    public void SetWorkerFilterOwned(bool owned)
+    {
+        if (ownsWorkerFilter == owned) return;
+        try
+        {
+            if (owned)
+                core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All, Shield.WorkerSourceKinds);
+            else
+                core.RemoveWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All, Shield.WorkerSourceKinds);
+            ownsWorkerFilter = owned;
+        }
+        catch (Exception ex) when (ex is COMException or InvalidOperationException or ObjectDisposedException) { }
+    }
+
+    public bool NeedsCosmeticSync(string? host)
+    {
+        var wantActive = isGlobalEnabled() && !string.IsNullOrWhiteSpace(host) && isSiteEnabled(host);
+        if (!wantActive) return cosmeticActive || cosmeticScriptId is not null;
+        var normHost = NormalizeHost(host);
+        return !cosmeticActive
+            || cosmeticScriptId is null
+            || cosmeticEngineVersion != Shield.CurrentEngine.Version
+            || !string.Equals(cosmeticHost, normHost, StringComparison.Ordinal);
+    }
+
+    public void ClearCosmeticScriptSync()
+    {
+        if (cosmeticScriptId is not null)
+        {
+            try { core.RemoveScriptToExecuteOnDocumentCreated(cosmeticScriptId); } catch { }
+            cosmeticScriptId = null;
+        }
+        cosmeticActive = false;
+        cosmeticHost = null;
+        cosmeticEngineVersion = 0;
+    }
+
+    public Task SetEnabledAsync(bool enabled) => SyncCosmeticAsync((pendingMainFrameUri() ?? pageUri())?.IdnHost, applyToCurrentPage: true);
+
+    public async Task SyncCosmeticAsync(string? host, bool applyToCurrentPage)
+    {
+        await cosmeticLock.WaitAsync();
+        try
+        {
+            var globalOn = isGlobalEnabled();
+            try
+            {
+                if (core.Profile is not null)
+                    core.Profile.PreferredTrackingPreventionLevel = globalOn
+                        ? CoreWebView2TrackingPreventionLevel.Balanced
+                        : CoreWebView2TrackingPreventionLevel.None;
+            }
+            catch { }
+
+            var wantActive = globalOn && !string.IsNullOrWhiteSpace(host) && isSiteEnabled(host);
+            var engine = Shield.CurrentEngine;
+            var normHost = NormalizeHost(host);
+
+            if (!wantActive)
+            {
+                if (cosmeticScriptId is not null)
+                {
+                    try { core.RemoveScriptToExecuteOnDocumentCreated(cosmeticScriptId); } catch { }
+                    cosmeticScriptId = null;
+                }
+                cosmeticActive = false;
+                cosmeticHost = null;
+                cosmeticEngineVersion = 0;
+                if (applyToCurrentPage)
+                {
+                    try
+                    {
+                        if (!core.IsSuspended)
+                            await core.ExecuteScriptAsync("document.getElementById('search-shield-css')?.remove()");
+                    }
+                    catch { }
+                }
+                return;
+            }
+
+            if (cosmeticActive
+                && cosmeticScriptId is not null
+                && cosmeticEngineVersion == engine.Version
+                && string.Equals(cosmeticHost, normHost, StringComparison.Ordinal))
+            {
+                if (applyToCurrentPage)
+                {
+                    try
+                    {
+                        var curScript = engine.BuildCosmeticScriptForHost(normHost.AsSpan());
+                        if (curScript is not null && !core.IsSuspended)
+                            await core.ExecuteScriptAsync(curScript);
+                    }
+                    catch { }
+                }
+                return;
+            }
+
+            var script = engine.BuildCosmeticScriptForHost(normHost.AsSpan());
+            if (cosmeticScriptId is not null)
+            {
+                try { core.RemoveScriptToExecuteOnDocumentCreated(cosmeticScriptId); } catch { }
+                cosmeticScriptId = null;
+            }
+
+            if (script is not null)
+            {
+                var id = await core.AddScriptToExecuteOnDocumentCreatedAsync(script);
+                if (!isGlobalEnabled() || !isSiteEnabled(host))
+                {
+                    try { core.RemoveScriptToExecuteOnDocumentCreated(id); } catch { }
+                    cosmeticActive = false;
+                    cosmeticHost = null;
+                    cosmeticEngineVersion = 0;
+                    return;
+                }
+                cosmeticScriptId = id;
+                cosmeticHost = normHost;
+                cosmeticEngineVersion = engine.Version;
+                cosmeticActive = true;
+                if (applyToCurrentPage && !core.IsSuspended)
+                    await core.ExecuteScriptAsync(script);
+            }
+            else
+            {
+                cosmeticHost = normHost;
+                cosmeticEngineVersion = engine.Version;
+                cosmeticActive = true;
+                if (applyToCurrentPage && !core.IsSuspended)
+                    await core.ExecuteScriptAsync("document.getElementById('search-shield-css')?.remove()");
+            }
+        }
+        catch { }
+        finally
+        {
+            cosmeticLock.Release();
+        }
+    }
+
+    static string NormalizeHost(string? host) =>
+        string.IsNullOrWhiteSpace(host) ? "" : host.Trim().TrimEnd('.').ToLowerInvariant();
+}
+
 static class Shield
 {
-    static readonly string[] BlockedDomains =
+    internal const CoreWebView2WebResourceRequestSourceKinds WorkerSourceKinds =
+        CoreWebView2WebResourceRequestSourceKinds.SharedWorker | CoreWebView2WebResourceRequestSourceKinds.ServiceWorker;
+
+    internal static readonly string[] BuiltInBlockedDomains =
     [
         "doubleclick.net", "googlesyndication.com", "googleadservices.com",
         "googletagservices.com", "google-analytics.com", "googletagmanager.com",
@@ -97,9 +278,7 @@ static class Shield
         "dns-finder.com", "confiant-integrations.net", "cloudflareinsights.com",
     ];
 
-    static readonly HashSet<string> BlockedSet = new(BlockedDomains, StringComparer.OrdinalIgnoreCase);
-
-    static readonly string[] GenericSelectors =
+    internal static readonly string[] BuiltInGenericSelectors =
     [
         ".adsbygoogle", "ins.adsbygoogle", "[id^=\"google_ads_\"]",
         "[id^=\"div-gpt-ad\"]", "[id^=\"taboola-\"]", "#taboola-below-article",
@@ -110,7 +289,7 @@ static class Shield
         ".ad-unit", ".adunit", ".adslot", ".dfp-ad", ".gpt-ad", ".w_ad",
     ];
 
-    static readonly (string[] Sites, string Selector)[] SiteSelectors =
+    internal static readonly (string[] Sites, string Selector)[] BuiltInSiteSelectors =
     [
         (["as.com", "elpais.com"], ".ad"),
         (["theguardian.com"], ".top-fronts-banner-ad-container"),
@@ -119,52 +298,25 @@ static class Shield
         (["albumoftheyear.org"], ".headerAd, .homePageAdSquare"),
     ];
 
-    static readonly string[] RedditSelectors =
+    internal static readonly string[] BuiltInRedditSelectors =
     [
         "shreddit-ad-post", "shreddit-comments-page-ad", "shreddit-sidebar-ad",
         "shreddit-dynamic-ad-link", "comment-tree-ad", ".promotedlink",
     ];
 
-    public static bool IsBlockedHost(string host)
-    {
-        if (string.IsNullOrEmpty(host)) return false;
-        var lookup = BlockedSet.GetAlternateLookup<ReadOnlySpan<char>>();
-        var span = host.AsSpan().TrimEnd('.');
-        while (!span.IsEmpty)
-        {
-            if (lookup.Contains(span)) return true;
-            var dot = span.IndexOf('.');
-            if (dot < 0) return false;
-            span = span[(dot + 1)..];
-        }
-        return false;
-    }
+    static FilterEngine currentEngine = FilterEngine.CreateFallback();
+    static int workerBlockedIntercepted;
 
-    // shortcut: last-two-labels eTLD+1 heuristic treats multi-label public suffixes (e.g. co.uk) as one site; upgrade to a Public Suffix List if first/third-party precision on those matters.
-    public static bool IsThirdParty(Uri request, Uri? page)
-    {
-        if (page is null || !request.IsAbsoluteUri || !page.IsAbsoluteUri) return true;
-        if (string.IsNullOrEmpty(request.Host) || string.IsNullOrEmpty(page.Host)) return true;
-        return !string.Equals(SiteKey(request), SiteKey(page), StringComparison.OrdinalIgnoreCase);
-    }
+    public static FilterEngine CurrentEngine => Volatile.Read(ref currentEngine);
+    public static void SetEngine(FilterEngine engine) => Volatile.Write(ref currentEngine, engine);
+    internal static int WorkerBlockedIntercepted => Volatile.Read(ref workerBlockedIntercepted);
+    internal static void ResetWorkerBlockedIntercepted() => Interlocked.Exchange(ref workerBlockedIntercepted, 0);
 
-    static string SiteKey(Uri uri)
-    {
-        if (uri.HostNameType is UriHostNameType.IPv4 or UriHostNameType.IPv6) return uri.Host;
-        var host = uri.Host.TrimEnd('.');
-        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase))
-            return host;
-        var last = host.LastIndexOf('.');
-        if (last <= 0) return host;
-        var prev = host.LastIndexOf('.', last - 1);
-        return prev < 0 ? host : host[(prev + 1)..];
-    }
+    public static bool IsThirdParty(Uri request, Uri? page) =>
+        CurrentEngine.Psl.IsThirdParty(request, page);
 
     public static bool ShouldBlock(Uri request, Uri? page) =>
-        request.IsAbsoluteUri
-        && (request.Scheme == Uri.UriSchemeHttp || request.Scheme == Uri.UriSchemeHttps)
-        && IsBlockedHost(request.Host)
-        && IsThirdParty(request, page);
+        CurrentEngine.ShouldBlock(request, page, CoreWebView2WebResourceContext.All);
 
     public static bool IsTopLevelDocument(
         CoreWebView2WebResourceContext context,
@@ -188,113 +340,78 @@ static class Shield
         CoreWebView2WebResourceRequestSourceKinds sourceKind = CoreWebView2WebResourceRequestSourceKinds.Document,
         string? secFetchDest = null) =>
         !IsTopLevelDocument(context, request, pendingMainFrame, sourceKind, secFetchDest)
-        && ShouldBlock(request, pendingMainFrame ?? page);
+        && CurrentEngine.ShouldBlock(request, pendingMainFrame ?? page, context);
 
-    public static string CosmeticScript { get; } = BuildCosmeticScript();
-
-    static string BuildCosmeticScript()
+    static Uri? ExtractWorkerInitiator(CoreWebView2HttpRequestHeaders headers, Func<Uri?> activePageUri)
     {
-        var generic = JsonSerializer.Serialize($"{string.Join(", ", GenericSelectors)}{{display:none!important}}");
-        var scoped = JsonSerializer.Serialize(
-            SiteSelectors
-                .Append((Sites: new[] { "reddit.com" }, Selector: string.Join(", ", RedditSelectors)))
-                .Select(x => new object[] { x.Sites, $"{x.Selector}{{display:none!important}}" }));
-
-        // Inject into documentElement if <head> doesn't exist yet at document creation; style id keeps it idempotent.
-        return $$"""
-            (() => {
-              try {
-                if (!(document instanceof HTMLDocument)) return; // XML/SVG documents have no ads; a <style> would show up in them
-                const id = 'search-shield-css';
-                if (document.getElementById(id)) return;
-                const h = (location.hostname || '').toLowerCase().replace(/\.+$/, '');
-                const match = d => h === d || h.endsWith('.' + d);
-                const css = [{{generic}}];
-                for (const [sites, rule] of {{scoped}}) {
-                  if (sites.some(match)) css.push(rule);
-                }
-                const inject = () => {
-                  if (document.getElementById(id)) return;
-                  const root = document.head || document.documentElement;
-                  if (!root) return;
-                  const s = document.createElement('style');
-                  s.id = id;
-                  s.textContent = css.join('\n');
-                  root.appendChild(s);
-                };
-                if (document.head || document.documentElement) inject();
-                else document.addEventListener('DOMContentLoaded', inject, { once: true });
-              } catch {}
-            })();
-            """;
+        foreach (var name in new[] { "Origin", "Referer" })
+        {
+            if (!headers.Contains(name)) continue;
+            var val = headers.GetHeader(name);
+            if (!string.IsNullOrWhiteSpace(val)
+                && Uri.TryCreate(val, UriKind.Absolute, out var parsed)
+                && (parsed.Scheme == Uri.UriSchemeHttp || parsed.Scheme == Uri.UriSchemeHttps))
+                return parsed;
+        }
+        return activePageUri();
     }
 
-    public static async Task<(Func<int> BlockedCount, Func<bool, Task> SetEnabledAsync)> AttachAsync(
+    public static async Task<ShieldAttachment> AttachAsync(
         CoreWebView2 core,
         CoreWebView2Environment environment,
         Func<Uri?> pageUri,
         Func<Uri?> pendingMainFrameUri,
-        Func<bool> isEnabled)
+        Func<Uri?> activePageUri,
+        Func<bool> isGlobalEnabled,
+        Func<string?, bool> isSiteEnabled,
+        Action onBlocked,
+        Action<Uri?> onWorkerBlocked)
     {
         // Profile-wide and idempotent. Balanced (Edge default) adds Edge's tracker list; Strict breaks embedded sign-ins and pre-empts this handler.
         if (core.Profile is not null)
-            core.Profile.PreferredTrackingPreventionLevel = isEnabled()
+            core.Profile.PreferredTrackingPreventionLevel = isGlobalEnabled()
                 ? CoreWebView2TrackingPreventionLevel.Balanced
                 : CoreWebView2TrackingPreventionLevel.None;
 
-        foreach (var d in BlockedDomains)
-        {
-            core.AddWebResourceRequestedFilter($"*://{d}/*", CoreWebView2WebResourceContext.All, CoreWebView2WebResourceRequestSourceKinds.All);
-            core.AddWebResourceRequestedFilter($"*://*.{d}/*", CoreWebView2WebResourceContext.All, CoreWebView2WebResourceRequestSourceKinds.All);
-        }
+        // Register a single wildcard Document filter per tab; SharedWorker/ServiceWorker filter is attached to only one live tab per profile.
+        core.AddWebResourceRequestedFilter("*", CoreWebView2WebResourceContext.All, CoreWebView2WebResourceRequestSourceKinds.Document);
 
-        var blocked = 0;
+        var attachment = new ShieldAttachment(core, pageUri, pendingMainFrameUri, isGlobalEnabled, isSiteEnabled);
+
         core.WebResourceRequested += (_, e) =>
         {
-            if (!isEnabled() || e.Response is not null || !Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var req)) return;
+            if (!isGlobalEnabled() || e.Response is not null || !Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var req)) return;
+            if (req.Scheme != Uri.UriSchemeHttp && req.Scheme != Uri.UriSchemeHttps) return;
+
+            if (e.RequestedSourceKind != CoreWebView2WebResourceRequestSourceKinds.Document)
+            {
+                var initiator = ExtractWorkerInitiator(e.Request.Headers, activePageUri);
+                if (!isSiteEnabled(initiator?.IdnHost)) return;
+                if (CurrentEngine.ShouldBlock(req, initiator, e.ResourceContext))
+                {
+                    e.Response = environment.CreateWebResourceResponse(null, 403, "Blocked", "Access-Control-Allow-Origin: *");
+                    Interlocked.Increment(ref workerBlockedIntercepted);
+                    onWorkerBlocked(initiator);
+                }
+                return;
+            }
+
             var secFetchDest = e.Request.Headers.Contains("Sec-Fetch-Dest") ? e.Request.Headers.GetHeader("Sec-Fetch-Dest") : null;
-            if (ShouldBlock(req, pageUri(), e.ResourceContext, pendingMainFrameUri(), e.RequestedSourceKind, secFetchDest))
+            var pending = pendingMainFrameUri();
+            if (IsTopLevelDocument(e.ResourceContext, req, pending, e.RequestedSourceKind, secFetchDest)) return;
+
+            var effectivePage = pending ?? pageUri();
+            if (!isSiteEnabled(effectivePage?.IdnHost)) return;
+
+            if (CurrentEngine.ShouldBlock(req, effectivePage, e.ResourceContext))
             {
                 e.Response = environment.CreateWebResourceResponse(null, 403, "Blocked", "Access-Control-Allow-Origin: *");
-                Interlocked.Increment(ref blocked);
+                attachment.IncrementBlocked();
+                onBlocked();
             }
         };
 
-        string? cosmeticScriptId = null;
-        if (isEnabled())
-            cosmeticScriptId = await core.AddScriptToExecuteOnDocumentCreatedAsync(CosmeticScript);
-
-        async Task SetEnabledAsync(bool enabled)
-        {
-            try
-            {
-                if (core.Profile is not null)
-                    core.Profile.PreferredTrackingPreventionLevel = enabled
-                        ? CoreWebView2TrackingPreventionLevel.Balanced
-                        : CoreWebView2TrackingPreventionLevel.None;
-                if (enabled)
-                {
-                    if (cosmeticScriptId is null)
-                    {
-                        var id = await core.AddScriptToExecuteOnDocumentCreatedAsync(CosmeticScript);
-                        if (!isEnabled()) { core.RemoveScriptToExecuteOnDocumentCreated(id); return; }
-                        cosmeticScriptId = id;
-                    }
-                    if (!core.IsSuspended) await core.ExecuteScriptAsync(CosmeticScript);
-                }
-                else
-                {
-                    if (cosmeticScriptId is not null)
-                    {
-                        core.RemoveScriptToExecuteOnDocumentCreated(cosmeticScriptId);
-                        cosmeticScriptId = null;
-                    }
-                    if (!core.IsSuspended) await core.ExecuteScriptAsync("document.getElementById('search-shield-css')?.remove()");
-                }
-            }
-            catch { }
-        }
-
-        return (() => Volatile.Read(ref blocked), SetEnabledAsync);
+        await attachment.SyncCosmeticAsync(pageUri()?.IdnHost, applyToCurrentPage: false);
+        return attachment;
     }
 }

@@ -19,6 +19,8 @@ sealed record AppSettings
     public bool AutoUpdateCheck { get; init; } = true;
     public bool ShareEnabled { get; init; } = true;
     public ExternalAppPermission[] AllowedExternalApps { get; init; } = [];
+    public string[] DisabledFilterLists { get; init; } = [];
+    public string[] CustomFilterLists { get; init; } = [];
 
     public bool Equals(AppSettings? other) =>
         other is not null
@@ -30,7 +32,9 @@ sealed record AppSettings
         && SleepingTabsEnabled == other.SleepingTabsEnabled
         && AutoUpdateCheck == other.AutoUpdateCheck
         && ShareEnabled == other.ShareEnabled
-        && (AllowedExternalApps ?? []).SequenceEqual(other.AllowedExternalApps ?? []);
+        && (AllowedExternalApps ?? []).SequenceEqual(other.AllowedExternalApps ?? [])
+        && (DisabledFilterLists ?? []).SequenceEqual(other.DisabledFilterLists ?? [], StringComparer.Ordinal)
+        && (CustomFilterLists ?? []).SequenceEqual(other.CustomFilterLists ?? [], StringComparer.Ordinal);
 
     public override int GetHashCode()
     {
@@ -44,6 +48,8 @@ sealed record AppSettings
         hash.Add(AutoUpdateCheck);
         hash.Add(ShareEnabled);
         foreach (var p in AllowedExternalApps ?? []) hash.Add(p);
+        foreach (var d in DisabledFilterLists ?? []) hash.Add(d, StringComparer.Ordinal);
+        foreach (var c in CustomFilterLists ?? []) hash.Add(c, StringComparer.Ordinal);
         return hash.ToHashCode();
     }
 }
@@ -57,6 +63,13 @@ static class SettingsStore
         Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
     };
 
+    static AppSettings Normalize(AppSettings s) => s with
+    {
+        AllowedExternalApps = ExternalSchemes.NormalizePermissions(s.AllowedExternalApps),
+        DisabledFilterLists = FilterListService.NormalizeDisabledLists(s.DisabledFilterLists),
+        CustomFilterLists = FilterListService.NormalizeCustomLists(s.CustomFilterLists),
+    };
+
     // Missing, empty, unreadable, or corrupt -> defaults with Exists = false.
     public static (AppSettings Settings, bool Exists) Load(string path)
     {
@@ -67,7 +80,7 @@ static class SettingsStore
             if (string.IsNullOrWhiteSpace(text)) return (new AppSettings(), false);
             var parsed = JsonSerializer.Deserialize<AppSettings>(text, Json);
             if (parsed is null) return (new AppSettings(), false);
-            return (parsed with { AllowedExternalApps = ExternalSchemes.NormalizePermissions(parsed.AllowedExternalApps) }, true);
+            return (Normalize(parsed), true);
         }
         catch
         {
@@ -79,7 +92,7 @@ static class SettingsStore
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-        var normalized = settings with { AllowedExternalApps = ExternalSchemes.NormalizePermissions(settings.AllowedExternalApps) };
+        var normalized = Normalize(settings);
         var tmp = $"{path}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
         try
         {
@@ -137,18 +150,29 @@ static class SettingsStore
                 AutoUpdateCheck = false,
                 ShareEnabled = false,
                 AllowedExternalApps = [new ExternalAppPermission("https://example.com", "mailto")],
+                DisabledFilterLists = ["peter-lowe"],
+                CustomFilterLists = ["https://example.com/custom-list.txt"],
             };
             Save(file, custom);
             var raw = File.ReadAllText(file);
-            if (!raw.Contains("\"theme\"", StringComparison.Ordinal) || !raw.Contains("\"light\"", StringComparison.Ordinal) || !raw.Contains("\"verticalTabs\"", StringComparison.Ordinal) || !raw.Contains("\"tabBarCollapsed\"", StringComparison.Ordinal) || !raw.Contains("\"allowedExternalApps\"", StringComparison.Ordinal))
+            if (!raw.Contains("\"theme\"", StringComparison.Ordinal)
+                || !raw.Contains("\"light\"", StringComparison.Ordinal)
+                || !raw.Contains("\"verticalTabs\"", StringComparison.Ordinal)
+                || !raw.Contains("\"tabBarCollapsed\"", StringComparison.Ordinal)
+                || !raw.Contains("\"allowedExternalApps\"", StringComparison.Ordinal)
+                || !raw.Contains("\"disabledFilterLists\"", StringComparison.Ordinal)
+                || !raw.Contains("\"customFilterLists\"", StringComparison.Ordinal))
                 return false;
             var (loaded, loadedExists) = Load(file);
             if (!loadedExists || loaded != custom) return false;
 
             // Dangerous or invalid entries in settings.json must be dropped on load.
-            File.WriteAllText(file, """{"allowedExternalApps":[{"site":"https://example.com","scheme":"ms-msdt"},{"site":"https://example.com","scheme":"vscode"}]}""");
+            File.WriteAllText(file, """{"allowedExternalApps":[{"site":"https://example.com","scheme":"ms-msdt"},{"site":"https://example.com","scheme":"vscode"}],"disabledFilterLists":["EasyList","unknown-list","easylist"],"customFilterLists":["http://insecure.example/list.txt","javascript:alert(1)","https://filters.example.com/my.txt"]}""");
             var (sanitized, sanitizedExists) = Load(file);
-            return sanitizedExists && sanitized.AllowedExternalApps.SequenceEqual([new ExternalAppPermission("https://example.com", "vscode")]);
+            return sanitizedExists
+                && sanitized.AllowedExternalApps.SequenceEqual([new ExternalAppPermission("https://example.com", "vscode")])
+                && sanitized.DisabledFilterLists.SequenceEqual(["easylist"])
+                && sanitized.CustomFilterLists.SequenceEqual(["https://filters.example.com/my.txt"]);
         }
         finally
         {
@@ -170,6 +194,13 @@ sealed class SettingsDialog : Form
     readonly CheckBox sleepingCheck;
     readonly CheckBox autoUpdateCheck;
     readonly CheckBox shareCheck;
+    readonly Dictionary<string, (CheckBox Check, Label Status)> filterListRows = new(StringComparer.OrdinalIgnoreCase);
+    readonly TableLayoutPanel customListsPanel;
+    readonly TextBox customListUrlBox;
+    readonly Button addCustomListBtn;
+    readonly Label customListErrorHint;
+    readonly Label filterListsHint;
+    readonly Button updateListsBtn;
     readonly Label defaultBrowserHint;
     readonly FlowLayoutPanel defaultBrowserButtons;
     readonly Button makeDefaultBtn;
@@ -184,6 +215,8 @@ sealed class SettingsDialog : Form
     readonly Func<bool> isDefaultBrowserRegistered;
     readonly Action onRegisterDefaultBrowser;
     readonly Action onUnregisterDefaultBrowser;
+    readonly Func<IReadOnlyList<FilterListStatus>> getFilterListStatuses;
+    readonly Func<Task> onUpdateFilterLists;
     readonly bool noUpdateCheckFlag;
     readonly int? dpiOverride;
     int currentDpi;
@@ -198,6 +231,8 @@ sealed class SettingsDialog : Form
         Func<bool>? isDefaultBrowserRegistered = null,
         Action? onRegisterDefaultBrowser = null,
         Action? onUnregisterDefaultBrowser = null,
+        Func<IReadOnlyList<FilterListStatus>>? getFilterListStatuses = null,
+        Func<Task>? onUpdateFilterLists = null,
         int? dpiOverride = null)
     {
         current = initial;
@@ -207,6 +242,10 @@ sealed class SettingsDialog : Form
         this.isDefaultBrowserRegistered = isDefaultBrowserRegistered ?? (() => false);
         this.onRegisterDefaultBrowser = onRegisterDefaultBrowser ?? (() => { });
         this.onUnregisterDefaultBrowser = onUnregisterDefaultBrowser ?? (() => { });
+        this.getFilterListStatuses = getFilterListStatuses ?? (() => FilterListService.BuiltInLists
+            .Select(d => new FilterListStatus(d.Id, d.Name, d.Url, !(current.DisabledFilterLists ?? []).Contains(d.Id, StringComparer.OrdinalIgnoreCase), false, null, false, null))
+            .ToArray());
+        this.onUpdateFilterLists = onUpdateFilterLists ?? (() => Task.CompletedTask);
         this.dpiOverride = dpiOverride;
         currentDpi = dpiOverride ?? DeviceDpi;
 
@@ -368,6 +407,121 @@ sealed class SettingsDialog : Form
         shareCheck = AddToggle("Show Share button in toolbar", "Show Share button");
 
         AddDivider();
+        AddSection("Filter lists");
+        foreach (var def in FilterListService.BuiltInLists)
+        {
+            var cb = new CheckBox
+            {
+                Text = def.Name.Replace("&", "&&", StringComparison.Ordinal),
+                AutoSize = true,
+                ForeColor = Theme.Ink,
+                BackColor = Theme.Ground,
+                Anchor = AnchorStyles.Left,
+                Margin = new(0, S(2), S(12), S(2)),
+                AccessibleName = def.Name,
+                TabStop = true,
+            };
+            var statusLbl = new Label
+            {
+                Text = "Not downloaded",
+                Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
+                ForeColor = Theme.Muted,
+                AutoSize = true,
+                Anchor = AnchorStyles.Right,
+                Margin = new(0, S(3), 0, S(2)),
+                AccessibleName = $"{def.Name} status",
+            };
+            hintLabels.Add(statusLbl);
+            filterListRows[def.Id] = (cb, statusLbl);
+            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            table.Controls.Add(cb, 0, row);
+            table.Controls.Add(statusLbl, 1, row);
+            row++;
+        }
+
+        customListsPanel = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 2,
+            BackColor = Theme.Ground,
+            Margin = new(0, S(2), 0, S(2)),
+            Padding = Padding.Empty,
+            Visible = false,
+        };
+        customListsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        customListsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        table.Controls.Add(customListsPanel, 0, row);
+        table.SetColumnSpan(customListsPanel, 2);
+        row++;
+
+        customListUrlBox = new TextBox
+        {
+            Dock = DockStyle.Fill,
+            PlaceholderText = "https://example.com/filters.txt",
+            Margin = new(0, S(4), S(8), S(2)),
+            AccessibleName = "Custom filter list URL",
+            TabStop = true,
+        };
+        addCustomListBtn = new Button
+        {
+            Text = "Add list",
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new(S(8), S(2), S(8), S(2)),
+            Anchor = AnchorStyles.Right,
+            Margin = new(0, S(3), 0, S(2)),
+            AccessibleName = "Add custom filter list",
+            TabStop = true,
+        };
+        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        table.Controls.Add(customListUrlBox, 0, row);
+        table.Controls.Add(addCustomListBtn, 1, row);
+        row++;
+
+        customListErrorHint = new Label
+        {
+            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
+            ForeColor = Theme.Muted,
+            AutoSize = true,
+            Margin = new(0, 0, 0, S(4)),
+            Visible = false,
+        };
+        hintLabels.Add(customListErrorHint);
+        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        table.Controls.Add(customListErrorHint, 0, row);
+        table.SetColumnSpan(customListErrorHint, 2);
+        row++;
+
+        filterListsHint = new Label
+        {
+            Text = "HTTPS lists only. Refreshes automatically every 4 days.",
+            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
+            ForeColor = Theme.Muted,
+            AutoSize = true,
+            Anchor = AnchorStyles.Left,
+            Margin = new(0, S(4), S(12), S(2)),
+        };
+        hintLabels.Add(filterListsHint);
+        updateListsBtn = new Button
+        {
+            Text = "Update now",
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            Padding = new(S(8), S(2), S(8), S(2)),
+            Anchor = AnchorStyles.Right,
+            Margin = new(0, S(2), 0, S(2)),
+            AccessibleName = "Update filter lists now",
+            TabStop = true,
+        };
+        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        table.Controls.Add(filterListsHint, 0, row);
+        table.Controls.Add(updateListsBtn, 1, row);
+        row++;
+
+        AddDivider();
         AddSection("Default browser");
         defaultBrowserHint = new Label
         {
@@ -507,6 +661,7 @@ sealed class SettingsDialog : Form
         Controls.Add(table);
         SyncFrom(initial);
         RefreshDefaultBrowserState();
+        RefreshFilterListStatuses();
 
         themeBox.SelectedIndexChanged += (_, _) => Emit();
         layoutBox.SelectedIndexChanged += (_, _) => Emit();
@@ -516,6 +671,16 @@ sealed class SettingsDialog : Form
         sleepingCheck.CheckedChanged += (_, _) => Emit();
         autoUpdateCheck.CheckedChanged += (_, _) => Emit();
         shareCheck.CheckedChanged += (_, _) => Emit();
+        foreach (var (_, pair) in filterListRows)
+            pair.Check.CheckedChanged += (_, _) => Emit();
+        addCustomListBtn.Click += (_, _) => AddCustomListClicked();
+        customListUrlBox.KeyDown += (_, e) =>
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            e.SuppressKeyPress = true;
+            AddCustomListClicked();
+        };
+        updateListsBtn.Click += async (_, _) => await UpdateListsClickedAsync();
         makeDefaultBtn.Click += (_, _) => RegisterDefaultBrowserClicked();
         removeDefaultBtn.Click += (_, _) => UnregisterDefaultBrowserClicked();
         clearBtn.Click += async (_, _) => await ClearDataClickedAsync();
@@ -571,6 +736,8 @@ sealed class SettingsDialog : Form
         makeDefaultBtn.Padding = new(S(8), S(2), S(8), S(2));
         makeDefaultBtn.Margin = new(0, 0, S(8), 0);
         removeDefaultBtn.Padding = new(S(8), S(2), S(8), S(2));
+        addCustomListBtn.Padding = new(S(8), S(2), S(8), S(2));
+        updateListsBtn.Padding = new(S(8), S(2), S(8), S(2));
         clearBtn.Padding = new(S(8), S(2), S(8), S(2));
         clearAppsBtn.Padding = new(S(8), S(2), S(8), S(2));
         closeBtn.MinimumSize = new(S(78), 0);
@@ -590,9 +757,9 @@ sealed class SettingsDialog : Form
             if (!c.Visible) continue;
             var r = new Rectangle(table.Left + c.Left, table.Top + c.Top, c.Width, c.Height);
             if (r.Width <= 0 || r.Height <= 0 || !client.Contains(r)) return false;
-            if (c is FlowLayoutPanel flow)
+            if (c is FlowLayoutPanel or TableLayoutPanel)
             {
-                foreach (Control child in flow.Controls)
+                foreach (Control child in c.Controls)
                 {
                     if (!child.Visible) continue;
                     var cr = new Rectangle(r.Left + child.Left, r.Top + child.Top, child.Width, child.Height);
@@ -601,6 +768,129 @@ sealed class SettingsDialog : Form
             }
         }
         return true;
+    }
+
+    internal void RefreshFilterListStatuses()
+    {
+        if (IsDisposed) return;
+        var statuses = getFilterListStatuses();
+        var anyUpdating = false;
+        foreach (var st in statuses)
+        {
+            if (st.Updating) anyUpdating = true;
+            if (!st.IsCustom && filterListRows.TryGetValue(st.Id, out var pair))
+                pair.Status.Text = FilterListService.FormatLastUpdated(st.LastUpdatedUtc, st.Updating, st.LastError);
+        }
+        updateListsBtn.Enabled = !anyUpdating;
+        updateListsBtn.Text = anyUpdating ? "Updating..." : "Update now";
+        RebuildCustomLists(statuses);
+        FitClientSize();
+    }
+
+    void RebuildCustomLists(IReadOnlyList<FilterListStatus> statuses)
+    {
+        var custom = statuses.Where(s => s.IsCustom).ToArray();
+        customListsPanel.SuspendLayout();
+        while (customListsPanel.Controls.Count > 0)
+        {
+            var ctrl = customListsPanel.Controls[0];
+            customListsPanel.Controls.RemoveAt(0);
+            ctrl.Dispose();
+        }
+        customListsPanel.RowStyles.Clear();
+        customListsPanel.RowCount = 0;
+
+        for (var i = 0; i < custom.Length; i++)
+        {
+            var item = custom[i];
+            var urlText = item.Name.Length > 42 ? item.Name[..39] + "..." : item.Name;
+            var status = FilterListService.FormatLastUpdated(item.LastUpdatedUtc, item.Updating, item.LastError);
+            var lbl = new Label
+            {
+                Text = $"{urlText} ({status})".Replace("&", "&&", StringComparison.Ordinal),
+                Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
+                ForeColor = Theme.InkSoft,
+                AutoSize = true,
+                Anchor = AnchorStyles.Left,
+                Margin = new(0, S(3), S(8), S(2)),
+            };
+            var urlCopy = item.Url;
+            var remBtn = new Button
+            {
+                Text = "Remove",
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Padding = new(S(6), S(1), S(6), S(1)),
+                Anchor = AnchorStyles.Right,
+                Margin = new(0, S(1), 0, S(1)),
+                AccessibleName = $"Remove {item.Url}",
+                TabStop = true,
+            };
+            remBtn.Click += (_, _) => RemoveCustomListClicked(urlCopy);
+            customListsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            customListsPanel.Controls.Add(lbl, 0, i);
+            customListsPanel.Controls.Add(remBtn, 1, i);
+        }
+        customListsPanel.Visible = custom.Length > 0;
+        customListsPanel.ResumeLayout();
+    }
+
+    void AddCustomListClicked()
+    {
+        var raw = customListUrlBox.Text;
+        if (!FilterListService.IsValidCustomListUrl(raw, out var normalized))
+        {
+            customListErrorHint.Text = "Enter a valid https:// filter list URL.";
+            customListErrorHint.Visible = true;
+            FitClientSize();
+            return;
+        }
+        var existing = current.CustomFilterLists ?? [];
+        if (existing.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+        {
+            customListErrorHint.Text = "That filter list URL is already added.";
+            customListErrorHint.Visible = true;
+            FitClientSize();
+            return;
+        }
+        if (existing.Length >= FilterListService.MaxCustomLists)
+        {
+            customListErrorHint.Text = $"You can add up to {FilterListService.MaxCustomLists} custom lists.";
+            customListErrorHint.Visible = true;
+            FitClientSize();
+            return;
+        }
+        customListUrlBox.Text = "";
+        customListErrorHint.Visible = false;
+        current = current with { CustomFilterLists = [.. existing, normalized] };
+        onChanged(current);
+        RefreshFilterListStatuses();
+    }
+
+    void RemoveCustomListClicked(string url)
+    {
+        var nextCustom = (current.CustomFilterLists ?? [])
+            .Where(u => !string.Equals(u, url, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (nextCustom.Length == (current.CustomFilterLists?.Length ?? 0)) return;
+        current = current with { CustomFilterLists = nextCustom };
+        onChanged(current);
+        RefreshFilterListStatuses();
+    }
+
+    async Task UpdateListsClickedAsync()
+    {
+        updateListsBtn.Enabled = false;
+        updateListsBtn.Text = "Updating...";
+        try
+        {
+            await onUpdateFilterLists();
+        }
+        catch { }
+        finally
+        {
+            if (!IsDisposed) RefreshFilterListStatuses();
+        }
     }
 
     static string FormatExternalAppsHint(int count) => count switch
@@ -675,6 +965,9 @@ sealed class SettingsDialog : Form
             sleepingCheck.Checked = next.SleepingTabsEnabled;
             autoUpdateCheck.Checked = !noUpdateCheckFlag && next.AutoUpdateCheck;
             shareCheck.Checked = next.ShareEnabled;
+            var disabledLists = new HashSet<string>(next.DisabledFilterLists ?? [], StringComparer.OrdinalIgnoreCase);
+            foreach (var (id, pair) in filterListRows)
+                pair.Check.Checked = !disabledLists.Contains(id);
             var appCount = next.AllowedExternalApps?.Length ?? 0;
             clearAppsHint.Text = FormatExternalAppsHint(appCount);
             clearAppsBtn.Enabled = appCount > 0;
@@ -685,6 +978,11 @@ sealed class SettingsDialog : Form
     void Emit()
     {
         if (syncing) return;
+        var disabledLists = filterListRows
+            .Where(kv => !kv.Value.Check.Checked)
+            .Select(kv => kv.Key)
+            .OrderBy(static x => x, StringComparer.Ordinal)
+            .ToArray();
         var next = current with
         {
             Theme = themeBox.SelectedIndex switch
@@ -700,6 +998,7 @@ sealed class SettingsDialog : Form
             SleepingTabsEnabled = sleepingCheck.Checked,
             AutoUpdateCheck = noUpdateCheckFlag ? current.AutoUpdateCheck : autoUpdateCheck.Checked,
             ShareEnabled = shareCheck.Checked,
+            DisabledFilterLists = disabledLists,
         };
         if (next == current) return;
         current = next;

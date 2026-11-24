@@ -293,9 +293,13 @@ sealed class BrowserWindow : Form
     readonly ThemePreference startupTheme;
     readonly FaviconCache favicons;
     SitePrefs sitePrefs;
+    readonly FilterListService filterLists;
     readonly DownloadManager downloads;
     DownloadsFlyout? downloadsFlyout;
     long downloadsFlyoutClosedAt;
+    ShieldFlyout? shieldFlyout;
+    long shieldFlyoutClosedAt;
+    BrowserTab? workerFilterOwner;
     readonly Task<CoreWebView2Environment> envTask;
     readonly Task<SessionState?>? sessionTask;
     readonly string? smokeReport;
@@ -499,6 +503,7 @@ sealed class BrowserWindow : Form
         public bool Navigating => ActiveNavigationId is not null;
         public Func<int> BlockedCount { get; set; } = () => 0;
         public Func<bool, Task> SetShieldEnabledAsync { get; set; } = _ => Task.CompletedTask;
+        public ShieldAttachment? Shield { get; set; }
         public bool IsAllowedFileNavigation(string? uri)
         {
             if (AllowedFileUri is null || string.IsNullOrEmpty(uri)) return false;
@@ -548,6 +553,13 @@ sealed class BrowserWindow : Form
         this.settingsExisted = settingsExisted;
         startupTheme = initialSettings.Theme;
         favicons = new FaviconCache(sessionFile);
+        filterLists = new FilterListService(
+            Path.GetDirectoryName(settingsFile)!,
+            allowLoopbackHttp: smokeReport is not null,
+            urlOverrides: BuildSmokeFilterListOverrides(smokeReport, fixture));
+        filterLists.EngineUpdated += OnFilterEngineUpdated;
+        filterLists.StatusChanged += OnFilterListsStatusChanged;
+        Shield.SetEngine(filterLists.Engine);
         downloads = new DownloadManager(Path.Combine(Path.GetDirectoryName(settingsFile)!, "downloads.json"));
         this.envTask = envTask;
         this.sessionTask = sessionTask;
@@ -606,6 +618,7 @@ sealed class BrowserWindow : Form
         findBar = new FindBar(tips, ReturnFocusFromFind);
         address.ZoomResetRequested += ResetZoom;
         address.Input.LostFocus += (_, _) => HandleAddressLostFocus();
+        address.ShieldClicked += () => ToggleShieldFlyout(fromButtonClick: true);
 
         minBtn = MakeCaption(Theme.Glyphs.Minimize, "Minimize", isClose: false, () => WindowState = FormWindowState.Minimized);
         maxBtn = MakeCaption(Theme.Glyphs.Maximize, "Maximize", isClose: false, ToggleMaximize);
@@ -677,12 +690,12 @@ sealed class BrowserWindow : Form
         peekDelayTimer.Tick += (_, _) => HandlePeekDelayTick();
         peekWatchTimer.Tick += (_, _) => HandlePeekWatchTick();
         Activated += (_, _) => SetCaptionWindowActive(true);
-        Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); if (downloadsFlyout is null && activeTabMenuCount == 0) CancelPeek(animate: false); };
-        LocationChanged += (_, _) => CloseDownloadsFlyout();
-        SizeChanged += (_, _) => CloseDownloadsFlyout();
+        Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); if (downloadsFlyout is null && shieldFlyout is null && activeTabMenuCount == 0) CancelPeek(animate: false); };
+        LocationChanged += (_, _) => { CloseDownloadsFlyout(); CloseShieldFlyout(); };
+        SizeChanged += (_, _) => { CloseDownloadsFlyout(); CloseShieldFlyout(); };
         Load += async (_, _) => await Start();
         FormClosing += HandleFormClosing;
-        FormClosed += (_, _) => { closed = true; Application.RemoveMessageFilter(peekFilter); StopLaunchPipe(); CancelTabDrag(animate: false); CancelPeek(animate: false); CloseDownloadsFlyout(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); peekDelayTimer.Stop(); peekDelayTimer.Dispose(); peekWatchTimer.Stop(); peekWatchTimer.Dispose(); layoutMotion.Dispose(); motion.Dispose(); };
+        FormClosed += (_, _) => { closed = true; Application.RemoveMessageFilter(peekFilter); StopLaunchPipe(); CancelTabDrag(animate: false); CancelPeek(animate: false); CloseDownloadsFlyout(); CloseShieldFlyout(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); peekDelayTimer.Stop(); peekDelayTimer.Dispose(); peekWatchTimer.Stop(); peekWatchTimer.Dispose(); layoutMotion.Dispose(); motion.Dispose(); };
     }
 
     int S(int px) => dpiOverride is { } dpi
@@ -709,6 +722,10 @@ sealed class BrowserWindow : Form
             CancelTabDrag(animate: false);
             CancelPeek(animate: false);
             CloseDownloadsFlyout();
+            CloseShieldFlyout();
+            filterLists.EngineUpdated -= OnFilterEngineUpdated;
+            filterLists.StatusChanged -= OnFilterListsStatusChanged;
+            filterLists.Dispose();
             downloads.Dispose();
             pending?.Cancel();
             updateCts?.Cancel();
@@ -1803,6 +1820,7 @@ sealed class BrowserWindow : Form
                 if (selected?.Url is null) FocusAddressBar();
                 else if (selected.View is { IsDisposed: false } view) FocusView(view); // a focused address bar ignores redirects
                 ExitCode = 0;
+                filterLists.StartBackgroundLoadAndRefresh(settings);
                 if (!noUpdateCheck && settings.AutoUpdateCheck) _ = CheckForUpdateAsync();
             }
         }
@@ -2022,6 +2040,8 @@ sealed class BrowserWindow : Form
     {
         if (!pages.IsDisposed) pages.Controls.Remove(view);
         if (!view.IsDisposed) view.Dispose();
+        if (workerFilterOwner is not { Closed: false, Shield: { OwnsWorkerFilter: true }, View: { IsDisposed: false } })
+            EnsureWorkerFilterOwner();
     }
 
     async Task UpdateFaviconAsync(BrowserTab tab, CoreWebView2 core)
@@ -2079,21 +2099,43 @@ sealed class BrowserWindow : Form
                 core.Settings.AreBrowserAcceleratorKeysEnabled = true;
                 if (core.Profile is not null)
                     core.Profile.PreferredColorScheme = SettingsStore.ToWebViewColorScheme(startupTheme);
-                var (blocked, setShieldEnabled) = await Shield.AttachAsync(
+                var shield = await Shield.AttachAsync(
                     core,
                     environment!,
                     () => TryCore(() => !view.IsDisposed && Uri.TryCreate(core.Source, UriKind.Absolute, out var u) ? u : null),
                     () => tab.PendingPageUri,
-                    () => settings.BlockingEnabled);
+                    GetActivePageUri,
+                    () => settings.BlockingEnabled,
+                    host => !sitePrefs.IsShieldDisabled(host),
+                    () => HandleTabBlocked(tab),
+                    HandleWorkerBlocked);
                 if (closed || tab.Closed || view.IsDisposed) { CleanupView(view); return; }
-                tab.BlockedCount = blocked;
-                tab.SetShieldEnabledAsync = setShieldEnabled;
+                tab.Shield = shield;
+                tab.BlockedCount = () => shield.BlockedCount;
+                tab.SetShieldEnabledAsync = shield.SetEnabledAsync;
                 var recentCleaned = new List<(string Url, long At)>(8);
                 void TrackNavigation(CoreWebView2NavigationStartingEventArgs e)
                 {
                     findBar.StopIfBoundTo(core);
-                    SetNavigationState(tab, e.NavigationId, Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u : null);
+                    var navUri = Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u : null;
+                    SetNavigationState(tab, e.NavigationId, navUri);
+                    tab.Shield?.ResetBlocked();
+                    if (tab == selected) UpdateShieldIndicator();
+                    var navHost = navUri is not null && (navUri.Scheme == Uri.UriSchemeHttp || navUri.Scheme == Uri.UriSchemeHttps) ? navUri.IdnHost : null;
+                    if (tab.Shield is { } sh && sh.NeedsCosmeticSync(navHost))
+                    {
+                        if (!settings.BlockingEnabled || sitePrefs.IsShieldDisabled(navHost))
+                            sh.ClearCosmeticScriptSync();
+                        _ = sh.SyncCosmeticAsync(navHost, applyToCurrentPage: false);
+                    }
                 }
+                core.DOMContentLoaded += (_, _) => {
+                    if (closed || tab.Closed || tab.Shield is not { } sh) return;
+                    var curUri = TryCore(() => !view.IsDisposed && Uri.TryCreate(core.Source, UriKind.Absolute, out var u) ? u : null);
+                    var curHost = curUri is not null && (curUri.Scheme == Uri.UriSchemeHttp || curUri.Scheme == Uri.UriSchemeHttps) ? curUri.IdnHost : null;
+                    if (curHost is not null && settings.BlockingEnabled && !sitePrefs.IsShieldDisabled(curHost))
+                        _ = sh.SyncCosmeticAsync(curHost, applyToCurrentPage: true);
+                };
                 core.NavigationStarting += (_, e) => {
                     if (tab.SubframeNotice is not null)
                     {
@@ -2236,7 +2278,7 @@ sealed class BrowserWindow : Form
                     }
                     ApplyOriginZoomForTab(tab, view, src);
                     if (selected == tab && !address.InputFocused) UpdateAddress();
-                    if (selected == tab) { UpdateNavButtons(); UpdateWindowTitle(); }
+                    if (selected == tab) { UpdateShieldIndicator(); UpdateNavButtons(); UpdateWindowTitle(); }
                     RefreshTab(tab);
                     SaveSession();
                 };
@@ -2268,6 +2310,7 @@ sealed class BrowserWindow : Form
                     RefreshTab(tab);
                 };
                 tab.View = view;
+                EnsureWorkerFilterOwner(tab);
             }
             catch
             {
@@ -3020,6 +3063,9 @@ sealed class BrowserWindow : Form
         SyncCrashOverlay();
         SyncPageBanner();
         if (focusView || !address.InputFocused) UpdateAddress();
+        EnsureWorkerFilterOwner(tab);
+        CloseShieldFlyout();
+        UpdateShieldIndicator();
         UpdateZoomIndicator();
         UpdateNavButtons();
         UpdateWindowTitle();
@@ -3144,6 +3190,12 @@ sealed class BrowserWindow : Form
             CleanupView(view);
         }
         SyncResponsiveTimer();
+        tab.Shield = null;
+        if (ReferenceEquals(workerFilterOwner, tab))
+        {
+            workerFilterOwner = null;
+            EnsureWorkerFilterOwner();
+        }
     }
 
     List<BrowserTab> TabsBelow(BrowserTab tab)
@@ -3861,6 +3913,7 @@ sealed class BrowserWindow : Form
         CancelTabDrag(animate: false);
         CancelPeek(animate: false);
         CloseDownloadsFlyout();
+        CloseShieldFlyout();
         vertical = sidebarMode;
         SuspendLayout();
         var surface = sidebarMode ? Theme.Frame : Theme.Ground;
@@ -4303,7 +4356,7 @@ sealed class BrowserWindow : Form
     bool IsHandledShortcut(Keys keyData)
     {
         if (keyData == Keys.Escape)
-            return !ElementFullscreen && (dragTab is not null || downloadsFlyout is { IsDisposed: false, Visible: true } || findBar.Visible || address.InputFocused || selected is { Navigating: true });
+            return !ElementFullscreen && (dragTab is not null || downloadsFlyout is { IsDisposed: false, Visible: true } || shieldFlyout is { IsDisposed: false, Visible: true } || findBar.Visible || address.InputFocused || selected is { Navigating: true });
         switch (keyData)
         {
             case Keys.Control | Keys.F:
@@ -4359,6 +4412,11 @@ sealed class BrowserWindow : Form
         if (keyData == Keys.Escape && downloadsFlyout is { IsDisposed: false, Visible: true })
         {
             CloseDownloadsFlyout();
+            return true;
+        }
+        if (keyData == Keys.Escape && shieldFlyout is { IsDisposed: false, Visible: true })
+        {
+            CloseShieldFlyout();
             return true;
         }
         if (keyData == Keys.Escape && findBar.Visible)
@@ -4485,9 +4543,203 @@ sealed class BrowserWindow : Form
             ClearBrowsingDataAsync,
             () => BrowserRegistration.IsRegistered(),
             RegisterDefaultBrowser,
-            UnregisterDefaultBrowser);
+            UnregisterDefaultBrowser,
+            () => filterLists.GetStatuses(settings),
+            () => filterLists.UpdateNowAsync(settings));
         settingsDialog.FormClosed += (_, _) => { settingsDialog = null; };
         settingsDialog.Show(this);
+    }
+
+    static IReadOnlyDictionary<string, string>? BuildSmokeFilterListOverrides(string? smokeReport, string? fixture)
+    {
+        if (smokeReport is null || string.IsNullOrEmpty(fixture)) return null;
+        return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["easylist"] = fixture + "/lists/easylist.txt",
+            ["easyprivacy"] = fixture + "/lists/easyprivacy.txt",
+            ["ublock-filters"] = fixture + "/lists/ublock-filters.txt",
+            ["peter-lowe"] = fixture + "/lists/peter-lowe.txt",
+            ["psl"] = fixture + "/lists/public_suffix_list.dat",
+        };
+    }
+
+    Uri? GetActivePageUri()
+    {
+        var url = selected?.PendingPageUri?.AbsoluteUri ?? selected?.Url;
+        return url is not null && Uri.TryCreate(url, UriKind.Absolute, out var u) ? u : null;
+    }
+
+    void EnsureWorkerFilterOwner(BrowserTab? preferred = null)
+    {
+        var desired = preferred is { Closed: false, Shield: not null, View: { IsDisposed: false } }
+            ? preferred
+            : selected is { Closed: false, Shield: not null, View: { IsDisposed: false } }
+                ? selected
+                : null;
+
+        if (desired is not null)
+        {
+            if (ReferenceEquals(workerFilterOwner, desired) && desired.Shield!.OwnsWorkerFilter)
+                return;
+            if (workerFilterOwner is { Shield: { OwnsWorkerFilter: true } oldShield })
+                oldShield.SetWorkerFilterOwned(false);
+            workerFilterOwner = null;
+            desired.Shield!.SetWorkerFilterOwned(true);
+            if (desired.Shield.OwnsWorkerFilter) { workerFilterOwner = desired; return; }
+        }
+
+        if (workerFilterOwner is { Closed: false, Shield: { OwnsWorkerFilter: true }, View: { IsDisposed: false } })
+            return;
+        if (workerFilterOwner is { Shield: { OwnsWorkerFilter: true } staleShield })
+            staleShield.SetWorkerFilterOwned(false);
+        workerFilterOwner = null;
+        foreach (var t in opened)
+        {
+            if (t.Closed || t.Shield is not { } sh || t.View is not { IsDisposed: false }) continue;
+            sh.SetWorkerFilterOwned(true);
+            if (sh.OwnsWorkerFilter) { workerFilterOwner = t; return; }
+        }
+    }
+
+    void HandleTabBlocked(BrowserTab tab)
+    {
+        if (closed || IsDisposed || tab != selected) return;
+        UpdateShieldIndicator();
+    }
+
+    void HandleWorkerBlocked(Uri? initiator)
+    {
+        if (closed || IsDisposed) return;
+        var initOrigin = initiator is not null ? SitePrefsStore.OriginOf(initiator.AbsoluteUri) : null;
+        BrowserTab? target = null;
+        if (selected is { Closed: false, Shield: not null } sel
+            && (initOrigin is null || string.Equals(SitePrefsStore.OriginOf(sel.Url), initOrigin, StringComparison.OrdinalIgnoreCase)))
+        {
+            target = sel;
+        }
+        else if (initOrigin is not null)
+        {
+            target = opened.FirstOrDefault(t => !t.Closed && t.Shield is not null
+                && string.Equals(SitePrefsStore.OriginOf(t.Url), initOrigin, StringComparison.OrdinalIgnoreCase));
+        }
+        target ??= workerFilterOwner;
+        if (target?.Shield is { } sh)
+        {
+            sh.IncrementBlocked();
+            HandleTabBlocked(target);
+        }
+    }
+
+    void OnFilterEngineUpdated(FilterEngine compiled)
+    {
+        Shield.SetEngine(compiled);
+        if (closed || IsDisposed || !IsHandleCreated) return;
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (closed || IsDisposed) return;
+                _ = ApplyBlockingAsync(settings.BlockingEnabled);
+                settingsDialog?.RefreshFilterListStatuses();
+            });
+        }
+        catch { }
+    }
+
+    void OnFilterListsStatusChanged()
+    {
+        if (closed || IsDisposed || !IsHandleCreated) return;
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (!closed && !IsDisposed) settingsDialog?.RefreshFilterListStatuses();
+            });
+        }
+        catch { }
+    }
+
+    void UpdateShieldIndicator()
+    {
+        if (closed || IsDisposed || address.IsDisposed) return;
+        var site = SitePrefsStore.HostOf(selected?.Url);
+        var enabled = settings.BlockingEnabled && !sitePrefs.IsShieldDisabled(site);
+        var count = selected?.BlockedCount() ?? 0;
+        address.SetShield(visible: site is not null, enabled: enabled, blockedCount: count);
+        if (shieldFlyout is { IsDisposed: false, Visible: true } flyout && string.Equals(flyout.SiteName, site, StringComparison.OrdinalIgnoreCase))
+            flyout.UpdateState(!sitePrefs.IsShieldDisabled(site), count);
+    }
+
+    void RememberShieldDisabled(string site, bool disabled)
+    {
+        if (closed) return;
+        var fresh = SitePrefsStore.Load(sitePrefsFile);
+        fresh.SetShieldDisabled(site, disabled);
+        sitePrefs = fresh;
+        try { SitePrefsStore.Save(sitePrefsFile, sitePrefs); }
+        catch { }
+    }
+
+    async Task SetSiteShieldEnabledAsync(BrowserTab tab, string site, bool enabled)
+    {
+        RememberShieldDisabled(site, !enabled);
+        UpdateShieldIndicator();
+        foreach (var t in opened.ToArray())
+        {
+            if (t.Closed || t.Shield is not { } sh) continue;
+            if (string.Equals(SitePrefsStore.HostOf(t.Url), site, StringComparison.OrdinalIgnoreCase))
+                await sh.SyncCosmeticAsync(site, applyToCurrentPage: true);
+        }
+        if (!closed && !tab.Closed && tab.View is { IsDisposed: false, CoreWebView2: { } core })
+            TryCore(() => core.Reload());
+    }
+
+    void ToggleShieldFlyout(bool fromButtonClick)
+    {
+        if (closed || IsDisposed) return;
+        if (shieldFlyout is { IsDisposed: false, Visible: true })
+        {
+            CloseShieldFlyout();
+            return;
+        }
+        if (fromButtonClick && Environment.TickCount64 - shieldFlyoutClosedAt < 250)
+            return;
+        if (selected is not { Closed: false } tab) return;
+        var site = SitePrefsStore.HostOf(tab.Url);
+        if (site is null) return;
+
+        var flyout = new ShieldFlyout(
+            site,
+            settings.BlockingEnabled,
+            !sitePrefs.IsShieldDisabled(site),
+            tab.BlockedCount(),
+            enabled => _ = SetSiteShieldEnabledAsync(tab, site, enabled),
+            OpenSettings,
+            closedByDeactivate =>
+            {
+                if (closedByDeactivate && !address.IsDisposed && address.IsHandleCreated && address.ShieldButtonVisible
+                    && address.RectangleToScreen(address.ShieldButtonBounds).Contains(Cursor.Position))
+                    shieldFlyoutClosedAt = Environment.TickCount64;
+                if (ReferenceEquals(shieldFlyout, null)) return;
+                shieldFlyout = null;
+                if (!closed && !IsDisposed && !address.IsDisposed) address.SetShieldOpen(false);
+            },
+            address,
+            () => address.ShieldButtonBounds);
+        shieldFlyout = flyout;
+        address.SetShieldOpen(true);
+        flyout.Show(this);
+        flyout.RepositionToAnchor();
+    }
+
+    void CloseShieldFlyout()
+    {
+        if (shieldFlyout is { IsDisposed: false } flyout)
+        {
+            shieldFlyout = null;
+            flyout.Close();
+        }
+        if (!closed && !IsDisposed && !address.IsDisposed) address.SetShieldOpen(false);
     }
 
     void RegisterDefaultBrowser()
@@ -4528,7 +4780,16 @@ sealed class BrowserWindow : Form
         }
 
         if (next.BlockingEnabled != prev.BlockingEnabled)
+        {
             _ = ApplyBlockingAsync(next.BlockingEnabled);
+            UpdateShieldIndicator();
+        }
+
+        if (!(next.DisabledFilterLists ?? []).SequenceEqual(prev.DisabledFilterLists ?? [], StringComparer.Ordinal)
+            || !(next.CustomFilterLists ?? []).SequenceEqual(prev.CustomFilterLists ?? [], StringComparer.Ordinal))
+        {
+            _ = filterLists.RecompileFromSettingsAsync(next, fetchMissing: smokeReport is null);
+        }
 
         if (!next.SleepingTabsEnabled && prev.SleepingTabsEnabled)
         {
@@ -4942,11 +5203,14 @@ sealed class BrowserWindow : Form
         }
         if (smokePhase == "restore")
         {
+            await filterLists.CompileFromDiskNowAsync(settings);
             await Restore();
             await WaitForSelectedLoad();
             var firstPinned = opened.FirstOrDefault(t => t.Pinned);
             if (firstPinned is not null) CloseTab(firstPinned);
             PerformLayout();
+            var noCosmeticAfterRestore = selected?.View?.CoreWebView2 is { } rCore
+                && await rCore.ExecuteScriptAsync("document.getElementById('search-shield-css') === null") == "true";
             File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new
             {
                 tabs = opened.Select(t => new
@@ -4972,7 +5236,11 @@ sealed class BrowserWindow : Form
                 windowTitle = Text,
                 sessionNoticeVisible = sessionNotice.Visible,
                 restoringDuringEnv,
-                restoringCleared = !restoring && sidebar.Enabled && topStrip.Enabled
+                restoringCleared = !restoring && sidebar.Enabled && topStrip.Enabled,
+                shieldDisabledRestored = sitePrefs.IsShieldDisabled("127.0.0.1"),
+                shieldUiOffRestored = !address.ShieldEnabledForSite,
+                noCosmeticAfterRestore,
+                cachedListsLoaded = !Shield.CurrentEngine.IsFallback && Shield.CurrentEngine.NetworkRuleCount > 0,
             }));
             ExitCode = 0;
             Close();
@@ -7542,6 +7810,265 @@ sealed class BrowserWindow : Form
             chromeHiddenAndAnchorOk = chromeRestoredRailOk && downloadsAnchorOk,
         };
 
+        // #19: Filter list download/ETag/compile, ABP/uBO rules, PSL, cosmetic + #@#, worker dedup, per-site shield UI + persistence, corrupt fallback, benchmark.
+        var smokeRootDir = Path.GetDirectoryName(settingsFile)!;
+        await filterLists.UpdateNowAsync(settings);
+        var listsDownloadedOk = !Shield.CurrentEngine.IsFallback
+            && !Shield.CurrentEngine.Psl.IsFallback
+            && File.Exists(Path.Combine(filterLists.CacheDir, "easylist.txt"))
+            && File.Exists(Path.Combine(filterLists.CacheDir, "psl.txt"))
+            && File.Exists(Path.Combine(filterLists.CacheDir, "metadata.json"));
+        // Conditional second update should receive 304 Not Modified without error.
+        await filterLists.UpdateNowAsync(settings);
+        var etagStatusesOk = filterLists.GetStatuses(settings).All(s => s.LastUpdatedUtc is not null && s.LastError is null);
+
+        var eng = Shield.CurrentEngine;
+        var pslOk = eng.Psl.IsThirdParty(new Uri("https://foo.co.uk/a.js"), new Uri("https://bar.co.uk/"))
+            && !eng.Psl.IsThirdParty(new Uri("https://cdn.foo.co.uk/a.js"), new Uri("https://www.foo.co.uk/"))
+            && eng.Psl.IsThirdParty(new Uri("https://foo.com.au/a.js"), new Uri("https://bar.com.au/"))
+            && eng.Psl.IsThirdParty(new Uri("https://alice.github.io/a.js"), new Uri("https://bob.github.io/"))
+            && eng.Psl.IsThirdParty(new Uri("https://a.foo.ck/x"), new Uri("https://b.bar.ck/"))
+            && !eng.Psl.IsThirdParty(new Uri("https://sub.www.ck/x"), new Uri("https://www.ck/"));
+
+        var rulesOk =
+            // ||domain^$third-party,script blocks third-party script, allows image & first-party
+            eng.ShouldBlock(new Uri("https://blocked-ads.test/ad.js"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.Script)
+            && !eng.ShouldBlock(new Uri("https://blocked-ads.test/logo.png"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.Image)
+            && !eng.ShouldBlock(new Uri("https://blocked-ads.test/ad.js"), new Uri("https://blocked-ads.test/"), CoreWebView2WebResourceContext.Script)
+            // @@ exception unblocks allowed path, leaves other paths blocked
+            && !eng.ShouldBlock(new Uri("https://allowed-ads.test/ok.js"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.Script)
+            && eng.ShouldBlock(new Uri("https://allowed-ads.test/bad.js"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.Script)
+            // $important overrides @@ exception
+            && eng.ShouldBlock(new Uri("https://force-blocked.test/pixel.js"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.Script)
+            // $domain=a.com|~b.com scoping
+            && eng.ShouldBlock(new Uri("https://scoped-tracker.test/t.js"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.Script)
+            && !eng.ShouldBlock(new Uri("https://scoped-tracker.test/t.js"), new Uri("https://safe.news.example.com/"), CoreWebView2WebResourceContext.Script)
+            && !eng.ShouldBlock(new Uri("https://scoped-tracker.test/t.js"), new Uri("https://other.example.org/"), CoreWebView2WebResourceContext.Script)
+            // plain/wildcard URL pattern with * and ^
+            && eng.ShouldBlock(new Uri("https://cdn.example.net/ads/banner-300x250.js?v=1"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.Script)
+            // $~third-party (first-party only)
+            && eng.ShouldBlock(new Uri("https://fp-site.example/fp-track.js"), new Uri("https://fp-site.example/"), CoreWebView2WebResourceContext.Script)
+            && !eng.ShouldBlock(new Uri("https://fp-site.example/fp-track.js"), new Uri("https://other.example/"), CoreWebView2WebResourceContext.Script)
+            // Hosts-format line
+            && eng.ShouldBlock(new Uri("https://hosts-tracker.test/beacon"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.XmlHttpRequest)
+            // Unsupported options ($redirect, $csp, $removeparam) must NOT falsely block
+            && !eng.ShouldBlock(new Uri("https://unsupported-opt.test/safe.js"), new Uri("https://news.example.com/"), CoreWebView2WebResourceContext.Script)
+            // Existing Shield expectations still hold with fixture lists loaded
+            && Shield.ShouldBlock(new Uri("http://doubleclick.net/pixel.js"), fixtureAdsUri)
+            && !Shield.ShouldBlock(segmentUri, segmentUri)
+            && !Shield.ShouldBlock(segmentCdnUri, segmentUri);
+
+        // Live cosmetic (generic + domain-scoped + #@# exception) + live network block & exception
+        var filterTab = await Open();
+        var filterCore = filterTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Filter tab view not ready.");
+        filterCore.WebResourceRequested += (_, e) =>
+        {
+            if (e.Response is null && (e.Request.Uri.Contains("blocked-ads.test", StringComparison.OrdinalIgnoreCase)
+                || e.Request.Uri.Contains("allowed-ads.test", StringComparison.OrdinalIgnoreCase)))
+                e.Response = environment!.CreateWebResourceResponse(null, 200, "FixtureOK", "Access-Control-Allow-Origin: *");
+        };
+        filterTab.Loaded = false;
+        filterCore.Navigate(fixture + "/filter-test");
+        await WaitForLoad(filterTab);
+        var liveBlockedStatus = "null";
+        var liveAllowedStatus = "null";
+        var ftWatch = Stopwatch.StartNew();
+        while (ftWatch.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            liveBlockedStatus = await filterCore.ExecuteScriptAsync("window.__blockedScriptStatus ?? null");
+            liveAllowedStatus = await filterCore.ExecuteScriptAsync("window.__allowedScriptStatus ?? null");
+            if (liveBlockedStatus != "null" && liveAllowedStatus != "null") break;
+            await Task.Delay(50);
+        }
+        var liveCosGenericHidden = await filterCore.ExecuteScriptAsync("getComputedStyle(document.getElementById('cos-generic')).display === 'none'") == "true";
+        var liveCosDomainHidden = await filterCore.ExecuteScriptAsync("getComputedStyle(document.getElementById('cos-domain')).display === 'none'") == "true";
+        var liveCosExemptVisible = await filterCore.ExecuteScriptAsync("getComputedStyle(document.getElementById('cos-exempt')).display !== 'none'") == "true";
+        var liveCosOkVisible = await filterCore.ExecuteScriptAsync("getComputedStyle(document.getElementById('cos-ok')).display !== 'none'") == "true";
+        var liveFilterRulesOk = liveBlockedStatus == "403" && liveAllowedStatus == "200"
+            && liveCosGenericHidden && liveCosDomainHidden && liveCosExemptVisible && liveCosOkVisible;
+
+        // Worker deduplication with multiple live tabs open: SharedWorker fetch must be intercepted strictly ONCE.
+        Shield.ResetWorkerBlockedIntercepted();
+        var workerCountBefore = Shield.WorkerBlockedIntercepted;
+        var extraLiveTab = await Open(fixture + "/second");
+        await WaitForLoad(extraLiveTab);
+        var workerTab = await Open(fixture + "/worker-dedup");
+        await WaitForLoad(workerTab);
+        var workerCore = workerTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Worker tab view not ready.");
+        var wAdStatus = "null";
+        var wStatus = "null";
+        var wWatch = Stopwatch.StartNew();
+        while (wWatch.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            wAdStatus = await workerCore.ExecuteScriptAsync("window.__adStatus ?? null");
+            wStatus = await workerCore.ExecuteScriptAsync("window.__workerAdStatus ?? null");
+            if (wAdStatus != "null" && wStatus != "null") break;
+            await Task.Delay(50);
+        }
+        var workerOwnersCount = opened.Count(t => t.Shield is { OwnsWorkerFilter: true });
+        var workerBlockedDelta = Shield.WorkerBlockedIntercepted - workerCountBefore;
+        var workerDedupOk = wAdStatus == "403"
+            && wStatus == "403"
+            && workerOwnersCount == 1
+            && workerBlockedDelta == 1
+            && workerTab.BlockedCount() == 2;
+        var workerDedupDetail = workerDedupOk ? null : $"ad={wAdStatus} worker={wStatus} owners={workerOwnersCount} delta={workerBlockedDelta} tabBlocked={workerTab.BlockedCount()}";
+
+        // Per-site Shield button + popover + toggle off allows ad & leaves #ad visible + reloads
+        SelectTab(workerTab);
+        UpdateShieldIndicator();
+        var shieldBtnOk = address.ShieldButtonVisible && address.ShieldEnabledForSite && address.ShieldBlockedCount >= 2;
+        var sRect = address.ShieldButtonBounds;
+        var sCenter = new Point(sRect.Left + sRect.Width / 2, sRect.Top + sRect.Height / 2);
+        SendMessage(address.Handle, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, MakeLParam(sCenter.X, sCenter.Y));
+        SendMessage(address.Handle, WM_LBUTTONUP, IntPtr.Zero, MakeLParam(sCenter.X, sCenter.Y));
+        var shieldFlyoutOk = shieldFlyout is { IsDisposed: false, Visible: true }
+            && shieldFlyout.SiteName == "127.0.0.1"
+            && shieldFlyout.ToggleCheckBox.Checked
+            && shieldFlyout.VerifyLayoutInsideClient();
+        CloseShieldFlyout();
+
+        async Task WaitReloadAsync(CoreWebView2 c, Func<Task> action)
+        {
+            var reloaded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            void OnDone(object? _, CoreWebView2NavigationCompletedEventArgs e)
+            {
+                if (e.IsSuccess) reloaded.TrySetResult();
+            }
+            c.NavigationCompleted += OnDone;
+            try
+            {
+                await action();
+                await reloaded.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            finally { c.NavigationCompleted -= OnDone; }
+        }
+
+        // Add fixture responder so when per-site shield is toggled OFF, doubleclick.net returns 200 instead of DNS error.
+        workerCore.WebResourceRequested += (_, e) =>
+        {
+            if (e.Response is null && e.Request.Uri.Contains("doubleclick.net", StringComparison.OrdinalIgnoreCase))
+                e.Response = environment!.CreateWebResourceResponse(null, 200, "FixtureOK", "Access-Control-Allow-Origin: *");
+        };
+        await WaitReloadAsync(workerCore, () => SetSiteShieldEnabledAsync(workerTab, "127.0.0.1", false));
+        var siteOffStatus = "null";
+        var soWatch = Stopwatch.StartNew();
+        while (soWatch.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            siteOffStatus = await workerCore.ExecuteScriptAsync("window.__adStatus ?? null");
+            if (siteOffStatus != "null") break;
+            await Task.Delay(50);
+        }
+        var siteOffAdVisible = await workerCore.ExecuteScriptAsync("getComputedStyle(document.getElementById('ad')).display !== 'none'") == "true";
+        var perSiteToggleOffOk = siteOffStatus == "200"
+            && siteOffAdVisible
+            && !address.ShieldEnabledForSite
+            && SitePrefsStore.Load(sitePrefsFile).IsShieldDisabled("127.0.0.1");
+
+        // Re-enable for 127.0.0.1 and verify it blocks again cleanly
+        await WaitReloadAsync(workerCore, () => SetSiteShieldEnabledAsync(workerTab, "127.0.0.1", true));
+        var siteBackStatus = "null";
+        var sbWatch = Stopwatch.StartNew();
+        while (sbWatch.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            siteBackStatus = await workerCore.ExecuteScriptAsync("window.__adStatus ?? null");
+            if (siteBackStatus != "null") break;
+            await Task.Delay(50);
+        }
+        var siteBackHidden = await workerCore.ExecuteScriptAsync("getComputedStyle(document.getElementById('ad')).display === 'none'") == "true";
+        var perSiteToggleBackOnOk = siteBackStatus == "403" && siteBackHidden && address.ShieldEnabledForSite;
+
+        CloseTab(workerTab, recordClosed: false);
+        CloseTab(extraLiveTab, recordClosed: false);
+        CloseTab(filterTab, recordClosed: false);
+        SelectTab(first);
+
+        // Corrupt / missing list file fallback check
+        var corruptDir = Path.Combine(smokeRootDir, $"corrupt-lists-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(Path.Combine(corruptDir, "FilterLists"));
+        File.WriteAllText(Path.Combine(corruptDir, "FilterLists", "easylist.txt"), "\0\0!!!not valid rules\n[corrupt\n");
+        File.WriteAllText(Path.Combine(corruptDir, "FilterLists", "psl.txt"), "///corrupt\n   \n");
+        File.WriteAllText(Path.Combine(corruptDir, "FilterLists", "metadata.json"), "{not json");
+        bool corruptFallbackOk;
+        using (var corruptSvc = new FilterListService(corruptDir))
+        {
+            await corruptSvc.CompileFromDiskNowAsync(new AppSettings());
+            corruptFallbackOk = corruptSvc.Engine.IsFallback
+                && corruptSvc.Engine.Psl.IsFallback
+                && corruptSvc.Engine.ShouldBlock(new Uri("http://doubleclick.net/pixel.js"), fixtureAdsUri)
+                && corruptSvc.Engine.Psl.IsThirdParty(new Uri("https://foo.co.uk/a"), new Uri("https://bar.co.uk/"));
+        }
+        try { Directory.Delete(corruptDir, recursive: true); } catch { }
+
+        // Micro-benchmark (measure compiled engine memory + p95 match latency over 3,000 synthetic URLs)
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        var memBefore = GC.GetTotalMemory(true);
+        var benchContents = new List<string>();
+        foreach (var def in FilterListService.BuiltInLists)
+        {
+            var fp = Path.Combine(filterLists.CacheDir, def.Id + ".txt");
+            if (File.Exists(fp)) benchContents.Add(File.ReadAllText(fp));
+        }
+        var benchPslText = File.Exists(Path.Combine(filterLists.CacheDir, "psl.txt"))
+            ? File.ReadAllText(Path.Combine(filterLists.CacheDir, "psl.txt"))
+            : "";
+        var benchPsl = PublicSuffixList.Parse(benchPslText);
+        var benchEngine = FilterEngine.Compile(benchContents, benchPsl);
+        var memAfter = GC.GetTotalMemory(true);
+        var engineMemMB = Math.Max(0.01, (memAfter - memBefore) / (1024.0 * 1024.0));
+        var benchmark = FilterEngine.RunBenchmark(benchEngine, engineMemMB, sampleCount: 3000);
+        GC.KeepAlive(benchEngine);
+
+        // Optional real-lists benchmark when BROWSE_BENCH_LISTS_DIR is set during development (smoke test never uses internet).
+        FilterBenchmarkResult? realListsBenchmark = null;
+        double? realListsCompileMs = null;
+        var benchListsDir = Environment.GetEnvironmentVariable("BROWSE_BENCH_LISTS_DIR");
+        if (!string.IsNullOrWhiteSpace(benchListsDir) && Directory.Exists(benchListsDir))
+        {
+            var realTexts = new List<string>();
+            foreach (var fn in new[] { "easylist.txt", "easyprivacy.txt", "ublock-filters.txt", "peter-lowe.txt" })
+            {
+                var p = Path.Combine(benchListsDir, fn);
+                if (File.Exists(p)) realTexts.Add(File.ReadAllText(p));
+            }
+            var realPslPath = Path.Combine(benchListsDir, "public_suffix_list.dat");
+            var realPslRaw = File.Exists(realPslPath) ? File.ReadAllText(realPslPath) : "";
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            var rMemBefore = GC.GetTotalMemory(true);
+            var swCompile = Stopwatch.StartNew();
+            var realPsl = PublicSuffixList.Parse(realPslRaw);
+            var realEng = FilterEngine.Compile(realTexts, realPsl);
+            swCompile.Stop();
+            var rMemAfter = GC.GetTotalMemory(true);
+            realListsCompileMs = Math.Round(swCompile.Elapsed.TotalMilliseconds, 1);
+            var rMemMB = Math.Max(0.01, (rMemAfter - rMemBefore) / (1024.0 * 1024.0));
+            realListsBenchmark = FilterEngine.RunBenchmark(realEng, rMemMB, sampleCount: 5000);
+            GC.KeepAlive(realEng);
+        }
+
+        var filterEngineReport = new
+        {
+            listsDownloadedOk,
+            etagStatusesOk,
+            pslOk,
+            rulesOk,
+            liveFilterRulesOk,
+            workerDedupOk,
+            workerDedupDetail,
+            shieldBtnOk,
+            shieldFlyoutOk,
+            perSiteToggleOffOk,
+            perSiteToggleBackOnOk,
+            corruptFallbackOk,
+            benchmark,
+            realListsCompileMs,
+            realListsBenchmark,
+        };
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -7553,6 +8080,7 @@ sealed class BrowserWindow : Form
             urlWhenCleanOff, cliFlags, cliUrl, browserRegistration, externalSchemes,
             faviconCached, addressDisplayOk, tabDrag, tabAnim, tabFixes, highDpi, shareTimeout,
             tabCycle, loadingStop, tabMenuAndNewWindow, findInPage, zoomAndPrint,
+            filterEngine = filterEngineReport,
             postClean, blobUrl, permissions, downloads = downloadsReport, processCrash,
             crashUi, fullscreen = fullscreenReport, collapsibleTabBar,
             sessionDebounce, restoreShortcuts,
@@ -7595,6 +8123,8 @@ sealed class BrowserWindow : Form
                 "https://example.com/search?q=hello&page=2#top"
             }.ToDictionary(u => u, CleanLink.Clean)
         }));
+        // Persist per-site shield OFF for 127.0.0.1 so the restore phase verifies persistence across restart.
+        RememberShieldDisabled("127.0.0.1", true);
         var secondSaved = await Open(fixture + "/second?a");
         await WaitForLoad(secondSaved);
         var thirdSaved = await Open(fixture + "/third");

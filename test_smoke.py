@@ -94,9 +94,77 @@ CLEAN_LINK = {
 }
 
 
+SAMPLE_LISTS = {
+    '/lists/easylist.txt': (
+        '[Adblock Plus 2.0]\n'
+        '! Sample EasyList for smoke test\n'
+        '||doubleclick.net^$third-party\n'
+        '||googlesyndication.com^$third-party\n'
+        '||blocked-ads.test^$third-party,script\n'
+        '||allowed-ads.test^\n'
+        '@@||allowed-ads.test/ok.js$script\n'
+        '||force-blocked.test^\n'
+        '@@||force-blocked.test^\n'
+        '||force-blocked.test/pixel.js$script,important\n'
+        '/ads/banner-*.js^\n'
+        '||fp-site.example/fp-track.js$~third-party\n'
+        '! Unsupported options must be safely skipped\n'
+        '||unsupported-opt.test^$redirect=noopjs\n'
+        '||unsupported-opt.test^$csp=script-src none\n'
+        '||unsupported-opt.test^$removeparam=foo\n'
+        'example.com##+js(nobab)\n'
+        'example.com##div:has-text(Sponsored)\n'
+        '! Cosmetic rules & exceptions\n'
+        '##.adsbygoogle\n'
+        '##.smoke-ad-banner\n'
+        '##.smoke-exempt-ad\n'
+        '127.0.0.1##.smoke-local-ad\n'
+        '127.0.0.1#@#.smoke-exempt-ad\n'
+        'example.org,~sub.example.org##.promo-box\n'
+    ),
+    '/lists/easyprivacy.txt': (
+        '[Adblock Plus 2.0]\n'
+        '! Sample EasyPrivacy for smoke test\n'
+        '||segment.com^$third-party\n'
+        '||google-analytics.com^$third-party\n'
+        '||scoped-tracker.test^$script,domain=news.example.com|~safe.news.example.com\n'
+        '||beacon.tracker.test^$ping,third-party\n'
+        '||pixel.quantserve.com^$image,third-party\n'
+    ),
+    '/lists/ublock-filters.txt': (
+        '! Sample uBlock filters for smoke test\n'
+        '||ads.example.net^$3p,xhr\n'
+        '||analytics.tiktok.com^$3p\n'
+        '##[id^="div-gpt-ad"]\n'
+    ),
+    '/lists/peter-lowe.txt': (
+        '! Sample hosts + ABP entries for smoke test\n'
+        '# comment line\n'
+        '0.0.0.0 hosts-tracker.test # inline comment\n'
+        '127.0.0.1 localhost\n'
+        '||adservice.google.com^\n'
+    ),
+    '/lists/public_suffix_list.dat': (
+        '// Sample PSL for smoke test\n'
+        'com\n'
+        'net\n'
+        'org\n'
+        'uk\n'
+        'co.uk\n'
+        'org.uk\n'
+        'au\n'
+        'com.au\n'
+        'github.io\n'
+        '*.ck\n'
+        '!www.ck\n'
+    ),
+}
+
+
 class Fixture(BaseHTTPRequestHandler):
     requested = []
     post_requests = []
+    list_not_modified = 0
     loop_seq = 0
     stop_event = Event()
 
@@ -117,6 +185,25 @@ class Fixture(BaseHTTPRequestHandler):
 
     def do_GET(self):
         type(self).requested.append(self.path)
+        if self.path in SAMPLE_LISTS:
+            etag = f'"smoke-{self.path.rsplit("/", 1)[-1]}"'
+            if self.headers.get('If-None-Match') == etag:
+                type(self).list_not_modified += 1
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.end_headers()
+                return
+            data = SAMPLE_LISTS[self.path].encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain; charset=utf-8')
+            self.send_header('ETag', etag)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except (ConnectionAbortedError, BrokenPipeError):
+                pass
+            return
         if self.path.startswith('/download/'):
             filename = self.path.rsplit('/', 1)[-1]
             if filename.endswith('.exe'):
@@ -158,7 +245,7 @@ class Fixture(BaseHTTPRequestHandler):
             self.send_header('Content-Length', '0')
             self.end_headers()
             return
-        if self.path == '/ad-worker.js':
+        if self.path == '/ad-worker.js' or self.path.startswith('/ad-worker-dedup.js'):
             body = (
                 "onconnect=e=>{const p=e.ports[0];"
                 "fetch('http://sub.doubleclick.net/worker-pixel.js')"
@@ -248,6 +335,33 @@ class Fixture(BaseHTTPRequestHandler):
         elif self.path.startswith('/slow'):
             type(self).stop_event.wait(3.0)
             body = b'<!doctype html><title>Slow page</title><main>Slow page done</main>'
+        elif self.path.startswith('/filter-test'):
+            body = (
+                '<!doctype html><title>Filter test</title>'
+                '<div id="cos-generic" class="smoke-ad-banner">generic</div>'
+                '<div id="cos-domain" class="smoke-local-ad">domain</div>'
+                '<div id="cos-exempt" class="smoke-exempt-ad">exempt</div>'
+                '<div id="cos-ok">ok</div>'
+                '<script>'
+                "const s1=document.createElement('script');s1.src='http://blocked-ads.test/ad.js';"
+                "s1.onload=()=>window.__blockedScriptStatus=200;s1.onerror=()=>window.__blockedScriptStatus=403;"
+                'document.head.appendChild(s1);'
+                "const s2=document.createElement('script');s2.src='http://allowed-ads.test/ok.js';"
+                "s2.onload=()=>window.__allowedScriptStatus=200;s2.onerror=()=>window.__allowedScriptStatus=403;"
+                'document.head.appendChild(s2);'
+                '</script>'
+            ).encode()
+        elif self.path.startswith('/worker-dedup'):
+            body = (
+                '<!doctype html><title>Worker dedup</title>'
+                '<div id="ad" class="adsbygoogle">ad</div><div id="ok">ok</div>'
+                "<script>fetch('http://doubleclick.net/pixel.js')"
+                ".then(r=>window.__adStatus=r.status)"
+                ".catch(()=>window.__adStatus='error');"
+                "const w=new SharedWorker('/ad-worker-dedup.js?t='+Date.now());"
+                "w.port.onmessage=e=>window.__workerAdStatus=e.data;"
+                "w.port.start();</script>"
+            ).encode()
         elif self.path.startswith('/ads'):
             body = (
                 '<!doctype html><title>Ads</title>'
@@ -628,6 +742,23 @@ def run_checks():
                     'wheelZoomCapturedOk': True,
                     'printSaveWiredOk': True,
                 }, report.get('zoomAndPrint')
+                fe = report.get('filterEngine')
+                assert fe is not None, report
+                for key in (
+                    'listsDownloadedOk', 'etagStatusesOk', 'pslOk', 'rulesOk',
+                    'liveFilterRulesOk', 'workerDedupOk', 'shieldBtnOk', 'shieldFlyoutOk',
+                    'perSiteToggleOffOk', 'perSiteToggleBackOnOk', 'corruptFallbackOk',
+                ):
+                    assert fe.get(key) is True, (key, fe)
+                assert Fixture.list_not_modified >= 5, Fixture.list_not_modified
+                bench = fe.get('benchmark')
+                assert bench is not None and bench['Samples'] >= 3000, bench
+                assert bench['P95Ms'] < 0.2, bench
+                assert bench['EngineMemoryMB'] > 0, bench
+                assert (path / 'FilterLists' / 'easylist.txt').is_file()
+                assert (path / 'FilterLists' / 'psl.txt').is_file()
+                assert (path / 'FilterLists' / 'metadata.json').is_file()
+                assert not list((path / 'FilterLists').glob('*.tmp'))
                 favicon_files = list((path / 'Favicons').glob('*.png'))
                 assert len(favicon_files) == 1, favicon_files
                 assert favicon_files[0].read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
@@ -705,6 +836,8 @@ def run_checks():
                     'autoUpdateCheck': True,
                     'shareEnabled': True,
                     'allowedExternalApps': [],
+                    'disabledFilterLists': [],
+                    'customFilterLists': [],
                 }, saved_settings
 
                 Fixture.requested.clear()
@@ -729,6 +862,10 @@ def run_checks():
                 assert restore['sessionNoticeVisible'] is False, restore
                 assert restore['restoringDuringEnv'] is True, restore
                 assert restore['restoringCleared'] is True, restore
+                assert restore['shieldDisabledRestored'] is True, restore
+                assert restore['shieldUiOffRestored'] is True, restore
+                assert restore['noCosmeticAfterRestore'] is True, restore
+                assert restore['cachedListsLoaded'] is True, restore
                 assert not list(path.glob('*.tmp')), list(path.glob('*.tmp'))
 
                 # Also verify vertical collapsed startup restores directly to the rail width without expanding.
