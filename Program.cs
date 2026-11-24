@@ -218,7 +218,7 @@ sealed class BrowserWindow : Form
         this.smokeReport = smokeReport;
         this.fixture = fixture;
         this.smokePhase = smokePhase;
-        Text = "Search";
+        Text = "browse";
         Font = Theme.UiFont;
         ForeColor = Theme.Ink;
         BackColor = Theme.Frame;
@@ -365,7 +365,7 @@ sealed class BrowserWindow : Form
     void UpdateWindowTitle()
     {
         var title = selected?.Title;
-        var next = string.IsNullOrWhiteSpace(title) ? "Search" : $"{title} — Search";
+        var next = string.IsNullOrWhiteSpace(title) ? "browse" : $"{title} — browse";
         if (Text != next) Text = next;
     }
 

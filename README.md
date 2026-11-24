@@ -1,4 +1,4 @@
-# Search for Windows
+# browse
 
 Windows port of [Office Commun's Search](https://github.com/driceroland/Search), built with WinForms on .NET 10 and the system Microsoft Edge WebView2 runtime. It does not bundle Chromium, Electron, or .NET.
 
@@ -16,7 +16,7 @@ From the folder containing `Search.Windows.csproj`:
 ```powershell
 dotnet run
 dotnet publish Search.Windows.csproj -c Release -warnaserror -o publish
-python test_smoke.py publish/Search.Windows.exe
+python test_smoke.py publish/browse.exe
 ```
 
 `test_smoke.py` launches the built executable against a local loopback fixture in a temporary profile and verifies navigation, URL resolution, tab layouts, custom title bar hit-testing, tracker/ad blocking, link cleaning, session save/restore (including multi-instance lock behavior), sleeping tabs, and one-time Share delivery.
