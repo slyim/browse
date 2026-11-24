@@ -221,6 +221,9 @@ sealed class BrowserWindow : Form
     readonly DropLineBar dropLine = new();
 
     readonly ChromePanel topStrip = new() { Dock = DockStyle.Top, BackColor = Theme.Ground, Visible = false };
+    readonly Panel topPeekBorder = new() { BackColor = Theme.Hairline, Visible = false };
+    // Focus mode: the page's WebView2 window is cross-process and swallows WM_NCHITTEST at y=0; this strip hands the top resize edge back to the Form.
+    readonly ChromePanel focusResizeGrip = new() { BackColor = Theme.Ground, Visible = false };
     readonly ChromePanel stripTabs = new() { BackColor = Theme.Ground };
     readonly ActiveTabTitle stripActiveTitle = new();
 
@@ -272,6 +275,7 @@ sealed class BrowserWindow : Form
     readonly PeekMotionTarget peekMotion;
     readonly SidebarPeekFilter peekFilter;
     AnimScalar peekAnim;
+    AnimScalar topPeekAnim;
     int loadingPhase;
 
     readonly List<BrowserTab> opened = [];
@@ -320,10 +324,16 @@ sealed class BrowserWindow : Form
     CancellationTokenSource? pending;
     UpdateRelease? availableUpdate;
     bool updating;
+    enum PeekEdge { None, Left, Top }
+
     bool vertical = true;
     bool tabBarCollapsed;
+    bool focusMode;
     bool peekOpen;
     bool peekTrackCursor;
+    bool topPeekOpen;
+    bool topPeekTrackCursor;
+    PeekEdge pendingPeekEdge;
     bool suppressPeekOnCollapseBtn;
     bool sidebarInRailLayout;
     bool collapsedAtStartup;
@@ -356,11 +366,18 @@ sealed class BrowserWindow : Form
     public int ExitCode { get; private set; } = 1;
     public bool ChromeHidden => chromeHidden;
     public bool TabBarCollapsed => tabBarCollapsed;
+    public bool FocusMode => focusMode;
     internal bool PeekOpen => peekOpen;
     internal float PeekProgress => peekAnim.Value;
+    internal bool TopPeekOpen => topPeekOpen;
+    internal float TopPeekProgress => topPeekAnim.Value;
     int ExpandedSidebarWidth => S(232);
     int RailWidth => S(48);
-    bool IsVerticalRailOnly => vertical && tabBarCollapsed && !peekOpen && peekAnim.Value <= 0.001f;
+    int FocusEdgeZone => S(8);
+    bool ToolbarInTopStrip => !vertical || focusMode;
+    bool CanLeftPeek => vertical && !IsFullscreen && (focusMode || (tabBarCollapsed && !chromeHidden));
+    bool CanTopPeek => focusMode && !IsFullscreen;
+    bool IsVerticalRailOnly => !focusMode && vertical && tabBarCollapsed && !peekOpen && peekAnim.Value <= 0.001f;
     public bool IsFullscreen => fullscreen.IsFullscreen;
     internal bool BrowserFullscreen => fullscreen.BrowserFullscreen;
     internal bool ElementFullscreen => fullscreen.ElementFullscreen;
@@ -444,6 +461,14 @@ sealed class BrowserWindow : Form
 
     [DllImport("user32.dll")]
     static extern IntPtr WindowFromPoint(Point point);
+
+    const uint GA_ROOT = 2;
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetForegroundWindow();
 
     static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
 
@@ -627,7 +652,7 @@ sealed class BrowserWindow : Form
         ApplyChromeMetrics();
         sidebar.Resize += (_, _) => LayoutSideContent();
         sideTopBand.Resize += (_, _) => LayoutSideTopBand();
-        sideAddressWrap.Resize += (_, _) => { if (vertical && !IsVerticalRailOnly) address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28)); };
+        sideAddressWrap.Resize += (_, _) => { if (!ToolbarInTopStrip && !IsVerticalRailOnly) address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28)); };
 
         // WinForms docks in reverse order: Fill first, then Top stack bottom-to-top.
         sideContent.Controls.Add(sideTabs);
@@ -641,8 +666,10 @@ sealed class BrowserWindow : Form
         topStrip.Controls.Add(stripTabs);
         topStrip.Controls.Add(stripNewTabBtn);
         topStrip.Controls.Add(stripActiveTitle);
+        topStrip.Controls.Add(topPeekBorder);
+        topPeekBorder.BringToFront();
         stripTabs.MouseWheel += HandleStripWheel;
-        topStrip.Resize += (_, _) => { if (!vertical) LayoutTopStrip(); };
+        topStrip.Resize += (_, _) => { if (ToolbarInTopStrip) LayoutTopStrip(); };
 
         pages.Controls.Add(findBar);
         pages.Resize += (_, _) => { if (findBar.Visible) findBar.PositionIn(pages); };
@@ -664,6 +691,7 @@ sealed class BrowserWindow : Form
         Controls.Add(minBtn);
         Controls.Add(maxBtn);
         Controls.Add(closeBtn);
+        Controls.Add(focusResizeGrip);
         minBtn.BringToFront();
         maxBtn.BringToFront();
         closeBtn.BringToFront();
@@ -689,8 +717,8 @@ sealed class BrowserWindow : Form
         responsiveTimer.Tick += (_, _) => ProbeUnresponsiveTabs();
         peekDelayTimer.Tick += (_, _) => HandlePeekDelayTick();
         peekWatchTimer.Tick += (_, _) => HandlePeekWatchTick();
-        Activated += (_, _) => SetCaptionWindowActive(true);
-        Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); if (downloadsFlyout is null && shieldFlyout is null && activeTabMenuCount == 0) CancelPeek(animate: false); };
+        Activated += (_, _) => { SetCaptionWindowActive(true); SyncPeekWatchTimer(); };
+        Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); if (downloadsFlyout is null && shieldFlyout is null && activeTabMenuCount == 0) CancelPeek(animate: false); SyncPeekWatchTimer(); };
         LocationChanged += (_, _) => { CloseDownloadsFlyout(); CloseShieldFlyout(); };
         SizeChanged += (_, _) => { CloseDownloadsFlyout(); CloseShieldFlyout(); };
         Load += async (_, _) => await Start();
@@ -756,8 +784,12 @@ sealed class BrowserWindow : Form
         MinimumSize = new(S(640), S(420));
         railSpacer.Width = RailWidth;
         sidebar.Padding = Padding.Empty;
-        sidebar.Width = vertical && tabBarCollapsed ? CurrentCollapsedSidebarWidth() : ExpandedSidebarWidth;
-        sideContent.Padding = IsVerticalRailOnly ? new(S(6), 0, S(6), S(10)) : new(S(10), 0, S(10), S(10));
+        sidebar.Width = !focusMode && vertical && tabBarCollapsed ? CurrentCollapsedSidebarWidth() : ExpandedSidebarWidth;
+        sideContent.Padding = IsVerticalRailOnly
+            ? new(S(6), 0, S(6), S(10))
+            : focusMode
+                ? new(S(10), S(10), S(10), S(10))
+                : new(S(10), 0, S(10), S(10));
         sideTopBand.Height = S(36);
         sideAddressWrap.Height = S(28) + S(8);
         sideAddressWrap.Padding = new(0, 0, 0, S(8));
@@ -774,7 +806,7 @@ sealed class BrowserWindow : Form
         var contentW = IsVerticalRailOnly ? RailWidth : ExpandedSidebarWidth;
         var h = sidebar.ClientSize.Height;
         sideContent.SetBounds(0, 0, contentW, h);
-        var showBorder = vertical && tabBarCollapsed && sidebar.Width > RailWidth;
+        var showBorder = vertical && ((focusMode && sidebar.Visible) || (!focusMode && tabBarCollapsed && sidebar.Width > RailWidth));
         if (peekBorder.Visible != showBorder) peekBorder.Visible = showBorder;
         if (showBorder)
         {
@@ -788,14 +820,19 @@ sealed class BrowserWindow : Form
         var railOnly = IsVerticalRailOnly;
         sidebarInRailLayout = railOnly;
         sideContent.SuspendLayout();
-        sideContent.Padding = railOnly ? new(S(6), 0, S(6), S(10)) : new(S(10), 0, S(10), S(10));
-        sideAddressWrap.Visible = !railOnly;
+        sideContent.Padding = railOnly
+            ? new(S(6), 0, S(6), S(10))
+            : focusMode
+                ? new(S(10), S(10), S(10), S(10))
+                : new(S(10), 0, S(10), S(10));
+        sideTopBand.Visible = !focusMode;
+        sideAddressWrap.Visible = !railOnly && !focusMode;
         LayoutSideContent();
         sideContent.ResumeLayout(true);
         if (vertical)
         {
-            LayoutSideTopBand();
-            if (!railOnly) address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28));
+            if (!focusMode) LayoutSideTopBand();
+            if (!railOnly && !focusMode) address.SetBounds(0, 0, sideAddressWrap.ClientSize.Width, S(28));
             if (syncTabs) SyncTabs();
         }
     }
@@ -866,104 +903,349 @@ sealed class BrowserWindow : Form
 
     void ToggleTabBarCollapsed() => SetTabBarCollapsed(!tabBarCollapsed);
 
-    void ApplyPeekWidth()
+    public void SetFocusMode(bool enabled)
     {
-        if (!vertical || !tabBarCollapsed || !sidebar.Visible) return;
+        if (closed || IsDisposed || focusMode == enabled) return;
+        CancelTabDrag(animate: false);
+        CloseDownloadsFlyout();
+        CloseShieldFlyout();
+        CancelPeek(animate: false);
+        ClearCaptionInteraction();
+        focusMode = enabled;
+
+        SuspendLayout();
+        SyncChromeControlParents();
+        ApplyChromeMetrics();
+        ApplyChromeVisibility();
+        ResumeLayout(true);
+
+        if (vertical)
+            SyncSidebarLayoutMode(syncTabs: true);
+        else
+            SyncActiveTabTitle();
+        if (ToolbarInTopStrip)
+            LayoutTopStrip();
+        if (findBar.Visible) findBar.PositionIn(pages);
+        SyncPeekWatchTimer();
+    }
+
+    void ToggleFocusMode() => SetFocusMode(!focusMode);
+
+    void SyncChromeControlParents()
+    {
+        var inTop = ToolbarInTopStrip;
+        var surface = inTop ? Theme.Ground : Theme.Frame;
+        var hover = inTop ? Theme.StripHover : Theme.SideHover;
+        var activeFill = inTop ? Theme.StripActive : Theme.SideActive;
+
+        foreach (var b in new[] { collapseBtn, backBtn, forwardBtn, reloadBtn, shareBtn, updateBtn, settingsBtn })
+            b.SetSurface(surface, hover, activeFill);
+        downloadsBtn.SetSurface(surface, hover, activeFill);
+        address.SetSurface(surface, hover);
+
+        if (inTop)
+        {
+            if (vertical)
+            {
+                if (collapseBtn.Parent != sideTopBand) sideTopBand.Controls.Add(collapseBtn);
+            }
+            else if (collapseBtn.Parent != topStrip)
+            {
+                topStrip.Controls.Add(collapseBtn);
+            }
+            foreach (Control c in new Control[] { backBtn, forwardBtn, reloadBtn, address, updateBtn, downloadsBtn, shareBtn, settingsBtn })
+                if (c.Parent != topStrip) topStrip.Controls.Add(c);
+            collapseBtn.Visible = !focusMode;
+            stripTabs.SendToBack();
+        }
+        else
+        {
+            foreach (Control c in new Control[] { collapseBtn, backBtn, forwardBtn, reloadBtn, updateBtn, downloadsBtn, shareBtn, settingsBtn })
+                if (c.Parent != sideTopBand) sideTopBand.Controls.Add(c);
+            if (address.Parent != sideAddressWrap) sideAddressWrap.Controls.Add(address);
+            collapseBtn.Visible = true;
+        }
+    }
+
+    void ApplyLeftPeekBounds()
+    {
+        if (!vertical) return;
+        if (focusMode && !IsFullscreen)
+        {
+            var fullW = ExpandedSidebarWidth;
+            var visibleW = Math.Clamp((int)MathF.Round(Motion.Lerp(0, fullW, peekAnim.Value)), 0, fullW);
+            var show = visibleW > 0 || peekOpen;
+            if (!show)
+            {
+                if (sidebar.Visible) sidebar.Visible = false;
+                if (peekBorder.Visible) peekBorder.Visible = false;
+                return;
+            }
+            var h = ClientSize.Height;
+            var x = visibleW - fullW;
+            if (!sidebar.Visible) sidebar.Visible = true;
+            if (sidebar.Left != x || sidebar.Top != 0 || sidebar.Width != fullW || sidebar.Height != h)
+                sidebar.SetBounds(x, 0, fullW, h);
+            if (!peekBorder.Visible) peekBorder.Visible = true;
+            peekBorder.SetBounds(fullW - 1, 0, 1, h);
+            peekBorder.BringToFront();
+            if (Controls.GetChildIndex(sidebar) > Math.Min(Controls.GetChildIndex(cardFrame), Controls.GetChildIndex(focusResizeGrip)))
+                sidebar.BringToFront();
+            if (topStrip.Visible) topStrip.BringToFront();
+            if (minBtn.Visible) { minBtn.BringToFront(); maxBtn.BringToFront(); closeBtn.BringToFront(); }
+            return;
+        }
+        if (focusMode || !tabBarCollapsed || !sidebar.Visible) return;
         var w = CurrentCollapsedSidebarWidth();
-        var h = ClientSize.Height;
-        if (sidebar.Left != 0 || sidebar.Top != 0 || sidebar.Width != w || sidebar.Height != h)
-            sidebar.SetBounds(0, 0, w, h);
+        var sh = ClientSize.Height;
+        if (sidebar.Left != 0 || sidebar.Top != 0 || sidebar.Width != w || sidebar.Height != sh)
+            sidebar.SetBounds(0, 0, w, sh);
         var showBorder = w > RailWidth;
         if (peekBorder.Visible != showBorder) peekBorder.Visible = showBorder;
         if (showBorder)
         {
-            peekBorder.SetBounds(w - 1, 0, 1, h);
+            peekBorder.SetBounds(w - 1, 0, 1, sh);
             peekBorder.BringToFront();
         }
+    }
+
+    void ApplyTopPeekBounds()
+    {
+        if (!focusMode || IsFullscreen) return;
+        var fullH = S(52);
+        var visibleH = Math.Clamp((int)MathF.Round(Motion.Lerp(0, fullH, topPeekAnim.Value)), 0, fullH);
+        var show = visibleH > 0 || topPeekOpen;
+        if (!show)
+        {
+            if (topStrip.Visible) topStrip.Visible = false;
+            if (topPeekBorder.Visible) topPeekBorder.Visible = false;
+            if (minBtn.Visible || maxBtn.Visible || closeBtn.Visible)
+            {
+                minBtn.Visible = maxBtn.Visible = closeBtn.Visible = false;
+                ClearCaptionInteraction();
+            }
+            return;
+        }
+        var w = ClientSize.Width;
+        var y = visibleH - fullH;
+        var becameVisible = !topStrip.Visible;
+        if (topStrip.Left != 0 || topStrip.Top != y || topStrip.Width != w || topStrip.Height != fullH)
+            topStrip.SetBounds(0, y, w, fullH);
+        if (becameVisible) topStrip.Visible = true;
+        if (becameVisible || topStrip.Width != w) LayoutTopStrip(w, fullH);
+        if (!topPeekBorder.Visible) topPeekBorder.Visible = true;
+        topPeekBorder.SetBounds(0, fullH - 1, w, 1);
+        topPeekBorder.BringToFront();
+        topStrip.BringToFront();
+        minBtn.Visible = maxBtn.Visible = closeBtn.Visible = true;
+        LayoutCaptionButtons(w);
+        minBtn.BringToFront();
+        maxBtn.BringToFront();
+        closeBtn.BringToFront();
+        if (downloadsFlyout is { IsDisposed: false, Visible: true } df) df.RepositionToAnchor();
+        if (shieldFlyout is { IsDisposed: false, Visible: true } sf) sf.RepositionToAnchor();
     }
 
     internal void SetPeekOpen(bool open, bool trackCursor = false)
     {
         if (closed || IsDisposed) return;
-        peekDelayTimer.Stop();
-        if (!vertical || !tabBarCollapsed || chromeHidden || IsFullscreen)
+        if (pendingPeekEdge == PeekEdge.Left)
         {
-            CancelPeek(animate: false);
+            peekDelayTimer.Stop();
+            pendingPeekEdge = PeekEdge.None;
+        }
+        if (!CanLeftPeek)
+        {
+            if (peekOpen || peekAnim.Active || peekAnim.Value > 0.001f)
+            {
+                peekOpen = false;
+                peekTrackCursor = false;
+                peekAnim.Snap(0f);
+                ApplyLeftPeekBounds();
+            }
+            SyncPeekWatchTimer();
             return;
         }
         if (open)
         {
+            if (focusMode && topPeekOpen && !address.InputFocused
+                && downloadsFlyout is not { IsDisposed: false, Visible: true }
+                && shieldFlyout is not { IsDisposed: false, Visible: true })
+                SetTopPeekOpen(false);
             peekTrackCursor = peekTrackCursor || trackCursor;
-            if (peekTrackCursor && !peekWatchTimer.Enabled) peekWatchTimer.Start();
         }
         else
         {
             peekTrackCursor = false;
         }
-        if (peekOpen == open && !peekAnim.Active) return;
+        if (peekOpen == open && !peekAnim.Active)
+        {
+            SyncPeekWatchTimer();
+            return;
+        }
         peekOpen = open;
         if (open && sidebarInRailLayout)
             SyncSidebarLayoutMode(syncTabs: true);
         var changed = peekAnim.SetTarget(open ? 1f : 0f, motion, Motion.PeekSlideDurationMs);
         if (peekAnim.Active)
         {
+            if (focusMode && open) ApplyLeftPeekBounds();
             motion.Track(peekMotion);
         }
-        else if (changed || sidebar.Width != CurrentCollapsedSidebarWidth())
+        else if (changed || focusMode || sidebar.Width != CurrentCollapsedSidebarWidth())
         {
-            ApplyPeekWidth();
-            if (!open && peekAnim.Value <= 0.001f && !sidebarInRailLayout)
+            ApplyLeftPeekBounds();
+            if (!open && peekAnim.Value <= 0.001f && !focusMode && !sidebarInRailLayout)
                 SyncSidebarLayoutMode(syncTabs: true);
-            if (!open && !peekDelayTimer.Enabled) peekWatchTimer.Stop();
         }
+        SyncPeekWatchTimer();
+    }
+
+    internal void SetTopPeekOpen(bool open, bool trackCursor = false)
+    {
+        if (closed || IsDisposed) return;
+        if (pendingPeekEdge == PeekEdge.Top)
+        {
+            peekDelayTimer.Stop();
+            pendingPeekEdge = PeekEdge.None;
+        }
+        if (!CanTopPeek)
+        {
+            topPeekOpen = false;
+            topPeekTrackCursor = false;
+            topPeekAnim.Snap(0f);
+            SyncPeekWatchTimer();
+            return;
+        }
+        if (open)
+        {
+            if (peekOpen) SetPeekOpen(false);
+            topPeekTrackCursor = topPeekTrackCursor || trackCursor;
+        }
+        else
+        {
+            topPeekTrackCursor = false;
+        }
+        if (topPeekOpen == open && !topPeekAnim.Active)
+        {
+            SyncPeekWatchTimer();
+            return;
+        }
+        topPeekOpen = open;
+        var changed = topPeekAnim.SetTarget(open ? 1f : 0f, motion, Motion.PeekSlideDurationMs);
+        if (topPeekAnim.Active)
+        {
+            if (open) ApplyTopPeekBounds();
+            motion.Track(peekMotion);
+        }
+        else if (changed || topStrip.Visible != open)
+        {
+            ApplyTopPeekBounds();
+        }
+        SyncPeekWatchTimer();
     }
 
     void CancelPeek(bool animate = false)
     {
         peekDelayTimer.Stop();
-        peekWatchTimer.Stop();
-        peekTrackCursor = false;
-        if (animate && vertical && tabBarCollapsed && !chromeHidden && !IsFullscreen)
+        pendingPeekEdge = PeekEdge.None;
+        if (animate)
         {
-            SetPeekOpen(false);
+            if (CanLeftPeek && (peekOpen || peekAnim.Active)) SetPeekOpen(false);
+            if (CanTopPeek && (topPeekOpen || topPeekAnim.Active)) SetTopPeekOpen(false);
+            SyncPeekWatchTimer();
             return;
         }
         peekOpen = false;
+        peekTrackCursor = false;
         peekAnim.Snap(0f);
+        topPeekOpen = false;
+        topPeekTrackCursor = false;
+        topPeekAnim.Snap(0f);
         motion.Untrack(peekMotion);
-        if (vertical && tabBarCollapsed)
+        if (focusMode && !IsFullscreen)
         {
-            ApplyPeekWidth();
+            if (vertical) ApplyLeftPeekBounds();
+            ApplyTopPeekBounds();
+        }
+        else if (vertical && tabBarCollapsed)
+        {
+            ApplyLeftPeekBounds();
             if (!sidebarInRailLayout) SyncSidebarLayoutMode(syncTabs: true);
         }
+        SyncPeekWatchTimer();
     }
 
     bool StepPeekMotion(double nowMs)
     {
-        if (closed || IsDisposed || !vertical || !tabBarCollapsed)
+        if (closed || IsDisposed)
         {
             peekAnim.Snap(0f);
+            topPeekAnim.Snap(0f);
             return false;
         }
-        var still = peekAnim.Step(nowMs);
-        ApplyPeekWidth();
-        if (!still && !peekOpen && peekAnim.Value <= 0.001f)
+        var leftStill = false;
+        if (peekAnim.Active)
         {
-            if (!sidebarInRailLayout) SyncSidebarLayoutMode(syncTabs: true);
-            if (!peekDelayTimer.Enabled) peekWatchTimer.Stop();
+            if (!CanLeftPeek) peekAnim.Snap(0f);
+            else
+            {
+                leftStill = peekAnim.Step(nowMs);
+                ApplyLeftPeekBounds();
+                if (!leftStill && !peekOpen && peekAnim.Value <= 0.001f && !focusMode && !sidebarInRailLayout)
+                    SyncSidebarLayoutMode(syncTabs: true);
+            }
         }
-        return still;
+        var topStill = false;
+        if (topPeekAnim.Active)
+        {
+            if (!CanTopPeek) topPeekAnim.Snap(0f);
+            else
+            {
+                topStill = topPeekAnim.Step(nowMs);
+                ApplyTopPeekBounds();
+            }
+        }
+        if (!leftStill && !topStill) SyncPeekWatchTimer();
+        return leftStill || topStill;
     }
 
     void SnapPeekMotion()
     {
         peekAnim.Snap(peekAnim.Target);
-        if (closed || IsDisposed || !vertical || !tabBarCollapsed) return;
-        ApplyPeekWidth();
-        if (!peekOpen && peekAnim.Value <= 0.001f)
+        topPeekAnim.Snap(topPeekAnim.Target);
+        if (closed || IsDisposed) return;
+        if (CanLeftPeek)
         {
-            if (!sidebarInRailLayout) SyncSidebarLayoutMode(syncTabs: true);
-            if (!peekDelayTimer.Enabled) peekWatchTimer.Stop();
+            ApplyLeftPeekBounds();
+            if (!peekOpen && peekAnim.Value <= 0.001f && !focusMode && !sidebarInRailLayout)
+                SyncSidebarLayoutMode(syncTabs: true);
+        }
+        if (CanTopPeek)
+            ApplyTopPeekBounds();
+        SyncPeekWatchTimer();
+    }
+
+    void SyncPeekWatchTimer()
+    {
+        if (closed || IsDisposed || IsFullscreen)
+        {
+            peekWatchTimer.Stop();
+            return;
+        }
+        var focusActive = focusMode && !restoring && IsHandleCreated && !IsIconic(Handle)
+            && (ContainsFocus || GetForegroundWindow() == Handle || peekOpen || topPeekOpen || peekAnim.Active || topPeekAnim.Active);
+        var need = focusActive
+            || peekDelayTimer.Enabled
+            || (peekOpen && peekTrackCursor)
+            || (topPeekOpen && topPeekTrackCursor);
+        if (need)
+        {
+            if (!peekWatchTimer.Enabled) peekWatchTimer.Start();
+        }
+        else if (peekWatchTimer.Enabled)
+        {
+            peekWatchTimer.Stop();
         }
     }
 
@@ -974,22 +1256,71 @@ sealed class BrowserWindow : Form
         return false;
     }
 
+    bool IsInTopStrip(Control c)
+    {
+        for (Control? cur = c; cur is not null; cur = cur.Parent)
+            if (ReferenceEquals(cur, topStrip)) return true;
+        return false;
+    }
+
     bool IsCursorOverSidebar() =>
         !closed && !IsDisposed && sidebar.Visible && sidebar.IsHandleCreated
         && sidebar.RectangleToScreen(sidebar.ClientRectangle).Contains(Cursor.Position);
 
+    bool IsCursorOverTopPeek() =>
+        !closed && !IsDisposed && topStrip.Visible && topStrip.IsHandleCreated
+        && topStrip.RectangleToScreen(topStrip.ClientRectangle).Contains(Cursor.Position);
+
+    bool IsWindowExposedAtCursor()
+    {
+        if (closed || IsDisposed || !IsHandleCreated || !Visible || IsIconic(Handle)) return false;
+        var pt = Cursor.Position;
+        if (!RectangleToScreen(ClientRectangle).Contains(pt)) return false;
+        var hit = WindowFromPoint(pt);
+        return hit != IntPtr.Zero && GetAncestor(hit, GA_ROOT) == Handle;
+    }
+
+    PeekEdge DetectFocusEdgeAt(Point clientPt)
+    {
+        if (!focusMode || IsFullscreen || restoring) return PeekEdge.None;
+        if (!ClientRectangle.Contains(clientPt)) return PeekEdge.None;
+        var zone = FocusEdgeZone;
+        var nearLeft = vertical && clientPt.X >= 0 && clientPt.X < zone;
+        var nearTop = clientPt.Y >= 0 && clientPt.Y < zone;
+        if (nearLeft && nearTop) return clientPt.X < clientPt.Y ? PeekEdge.Left : PeekEdge.Top;
+        if (nearLeft) return PeekEdge.Left;
+        if (nearTop) return PeekEdge.Top;
+        return PeekEdge.None;
+    }
+
     void HandleAppMouseMove(IntPtr hwnd)
     {
-        if (closed || IsDisposed || !vertical || !tabBarCollapsed || chromeHidden || IsFullscreen || restoring || !sidebar.Visible)
-            return;
+        if (closed || IsDisposed || IsFullscreen || restoring) return;
         var ctrl = Control.FromHandle(hwnd);
         if (ctrl is null) return;
+        if (focusMode)
+        {
+            if (peekOpen && !peekTrackCursor && (IsInSidebar(ctrl) || (ReferenceEquals(ctrl, this) && IsCursorOverSidebar())))
+            {
+                peekTrackCursor = true;
+                SyncPeekWatchTimer();
+            }
+            if (topPeekOpen && !topPeekTrackCursor && (IsInTopStrip(ctrl) || ReferenceEquals(ctrl, minBtn) || ReferenceEquals(ctrl, maxBtn) || ReferenceEquals(ctrl, closeBtn) || (ReferenceEquals(ctrl, this) && IsCursorOverTopPeek())))
+            {
+                topPeekTrackCursor = true;
+                SyncPeekWatchTimer();
+            }
+            return;
+        }
+        if (!vertical || !tabBarCollapsed || chromeHidden || !sidebar.Visible)
+            return;
         var overSidebar = IsInSidebar(ctrl) || ((ReferenceEquals(ctrl, this) || ReferenceEquals(ctrl, railSpacer)) && IsCursorOverSidebar());
         if (!overSidebar) return;
         if (suppressPeekOnCollapseBtn && ReferenceEquals(ctrl, collapseBtn)) return;
         suppressPeekOnCollapseBtn = false;
         if (!peekOpen)
         {
+            pendingPeekEdge = PeekEdge.Left;
             if (!peekDelayTimer.Enabled) peekDelayTimer.Start();
             if (!peekWatchTimer.Enabled) peekWatchTimer.Start();
         }
@@ -1011,8 +1342,22 @@ sealed class BrowserWindow : Form
 
     void HandlePeekDelayTick()
     {
+        var edge = pendingPeekEdge;
+        pendingPeekEdge = PeekEdge.None;
         peekDelayTimer.Stop();
-        if (closed || IsDisposed || !vertical || !tabBarCollapsed || chromeHidden || IsFullscreen || restoring)
+        if (closed || IsDisposed || IsFullscreen || restoring)
+            return;
+        if (focusMode)
+        {
+            if (!IsWindowExposedAtCursor()) return;
+            var curEdge = DetectFocusEdgeAt(PointToClient(Cursor.Position));
+            if (edge == PeekEdge.Left && curEdge == PeekEdge.Left && CanLeftPeek)
+                SetPeekOpen(true, trackCursor: true);
+            else if (edge == PeekEdge.Top && curEdge == PeekEdge.Top && CanTopPeek)
+                SetTopPeekOpen(true, trackCursor: true);
+            return;
+        }
+        if (!vertical || !tabBarCollapsed || chromeHidden)
             return;
         if (IsSidebarExposedAtCursor())
             SetPeekOpen(true, trackCursor: true);
@@ -1022,7 +1367,60 @@ sealed class BrowserWindow : Form
 
     void HandlePeekWatchTick()
     {
-        if (closed || IsDisposed || !vertical || !tabBarCollapsed || chromeHidden || IsFullscreen)
+        if (closed || IsDisposed || IsFullscreen)
+        {
+            CancelPeek(animate: false);
+            return;
+        }
+        if (focusMode)
+        {
+            var exposed = IsWindowExposedAtCursor();
+            var keepLeft = IsCursorOverSidebar() || dragTab is not null || activeTabMenuCount > 0;
+            if (peekOpen && peekTrackCursor && !keepLeft)
+                SetPeekOpen(false);
+
+            var keepTop = IsCursorOverTopPeek()
+                || address.InputFocused
+                || dragTab is not null
+                || activeTabMenuCount > 0
+                || pressedCaptionHit != 0
+                || downloadsFlyout is { IsDisposed: false, Visible: true }
+                || shieldFlyout is { IsDisposed: false, Visible: true };
+            if (topPeekOpen && topPeekTrackCursor && !keepTop)
+                SetTopPeekOpen(false);
+
+            var edge = exposed ? DetectFocusEdgeAt(PointToClient(Cursor.Position)) : PeekEdge.None;
+            // Moving along the top of an open sidebar (or the left of an open band) must not swap one peek for the other.
+            if ((edge == PeekEdge.Top && peekOpen && IsCursorOverSidebar()) || (edge == PeekEdge.Left && topPeekOpen && IsCursorOverTopPeek()))
+                edge = PeekEdge.None;
+            if (edge == PeekEdge.Left && !peekOpen)
+            {
+                if (pendingPeekEdge != PeekEdge.Left || !peekDelayTimer.Enabled)
+                {
+                    pendingPeekEdge = PeekEdge.Left;
+                    peekDelayTimer.Stop();
+                    peekDelayTimer.Start();
+                }
+            }
+            else if (edge == PeekEdge.Top && !topPeekOpen)
+            {
+                if (pendingPeekEdge != PeekEdge.Top || !peekDelayTimer.Enabled)
+                {
+                    pendingPeekEdge = PeekEdge.Top;
+                    peekDelayTimer.Stop();
+                    peekDelayTimer.Start();
+                }
+            }
+            else if (pendingPeekEdge != PeekEdge.None)
+            {
+                pendingPeekEdge = PeekEdge.None;
+                peekDelayTimer.Stop();
+            }
+
+            SyncPeekWatchTimer();
+            return;
+        }
+        if (!vertical || !tabBarCollapsed || chromeHidden)
         {
             CancelPeek(animate: false);
             return;
@@ -1031,24 +1429,62 @@ sealed class BrowserWindow : Form
             || address.InputFocused
             || dragTab is not null
             || activeTabMenuCount > 0
-            || downloadsFlyout is { IsDisposed: false, Visible: true };
+            || downloadsFlyout is { IsDisposed: false, Visible: true }
+            || shieldFlyout is { IsDisposed: false, Visible: true };
         if (keepOpen) return;
         if (peekDelayTimer.Enabled) peekDelayTimer.Stop();
+        pendingPeekEdge = PeekEdge.None;
         if (peekOpen && peekTrackCursor)
             SetPeekOpen(false);
         else if (!peekOpen && !peekAnim.Active)
             peekWatchTimer.Stop();
     }
 
+    void MaybeCloseTopPeekAfterFlyout()
+    {
+        if (closed || IsDisposed || !focusMode || !topPeekOpen) return;
+        if (address.InputFocused
+            || downloadsFlyout is { IsDisposed: false, Visible: true }
+            || shieldFlyout is { IsDisposed: false, Visible: true })
+            return;
+        if (IsCursorOverTopPeek())
+        {
+            topPeekTrackCursor = true;
+            SyncPeekWatchTimer();
+        }
+        else
+        {
+            SetTopPeekOpen(false);
+        }
+    }
+
     void HandleAddressLostFocus()
     {
-        if (closed || IsDisposed || !vertical || !tabBarCollapsed || !peekOpen) return;
+        if (closed || IsDisposed) return;
+        if (focusMode && topPeekOpen)
+        {
+            if (IsCursorOverTopPeek())
+            {
+                topPeekTrackCursor = true;
+                SyncPeekWatchTimer();
+            }
+            else if (dragTab is null && activeTabMenuCount == 0
+                && downloadsFlyout is not { IsDisposed: false, Visible: true }
+                && shieldFlyout is not { IsDisposed: false, Visible: true })
+            {
+                SetTopPeekOpen(false);
+            }
+            return;
+        }
+        if (!vertical || !tabBarCollapsed || !peekOpen) return;
         if (IsCursorOverSidebar())
         {
             peekTrackCursor = true;
             if (!peekWatchTimer.Enabled) peekWatchTimer.Start();
         }
-        else if (dragTab is null && activeTabMenuCount == 0 && downloadsFlyout is not { IsDisposed: false, Visible: true })
+        else if (dragTab is null && activeTabMenuCount == 0
+            && downloadsFlyout is not { IsDisposed: false, Visible: true }
+            && shieldFlyout is not { IsDisposed: false, Visible: true })
         {
             SetPeekOpen(false);
         }
@@ -1056,7 +1492,9 @@ sealed class BrowserWindow : Form
 
     void FocusAddressBar()
     {
-        if (vertical && tabBarCollapsed && !chromeHidden && !IsFullscreen)
+        if (focusMode && !IsFullscreen)
+            SetTopPeekOpen(true, trackCursor: false);
+        else if (vertical && tabBarCollapsed && !chromeHidden && !IsFullscreen)
             SetPeekOpen(true, trackCursor: false);
         address.FocusInput();
     }
@@ -1069,10 +1507,11 @@ sealed class BrowserWindow : Form
     {
         if (closeBtn is null) return;
         var bw = S(46);
-        var bh = vertical ? S(32) : topStrip.Height;
-        closeBtn.SetBounds(w - bw, 0, bw, bh);
-        maxBtn.SetBounds(w - bw * 2, 0, bw, bh);
-        minBtn.SetBounds(w - bw * 3, 0, bw, bh);
+        var bh = ToolbarInTopStrip ? topStrip.Height : S(32);
+        var top = focusMode && !IsFullscreen ? topStrip.Top : 0;
+        closeBtn.SetBounds(w - bw, top, bw, bh);
+        maxBtn.SetBounds(w - bw * 2, top, bw, bh);
+        minBtn.SetBounds(w - bw * 3, top, bw, bh);
     }
 
     void UpdateMaximizeButton()
@@ -1111,7 +1550,7 @@ sealed class BrowserWindow : Form
         var brand = CanSaveSession ? "browse" : "browse (tabs not saved)";
         var next = string.IsNullOrWhiteSpace(title) ? brand : $"{title} — {brand}";
         if (Text != next) Text = next;
-        sessionNotice.Visible = !chromeHidden && !CanSaveSession;
+        sessionNotice.Visible = !(focusMode || chromeHidden || IsFullscreen) && !CanSaveSession;
         SyncActiveTabTitle();
     }
 
@@ -1174,6 +1613,7 @@ sealed class BrowserWindow : Form
         ApplyChromeVisibility();
         ResumeLayout(true);
         UpdateMaximizeButton();
+        SyncPeekWatchTimer();
     }
 
     void ToggleBrowserFullscreen() =>
@@ -1210,13 +1650,17 @@ sealed class BrowserWindow : Form
 
     void ApplyChromeVisibility()
     {
-        var hideChrome = chromeHidden || IsFullscreen;
-        var floatingRail = vertical && tabBarCollapsed;
+        var hideChrome = focusMode || chromeHidden || IsFullscreen;
+        var floatingRail = !focusMode && vertical && tabBarCollapsed;
+        var overlaySidebar = focusMode && vertical && !IsFullscreen;
+        var overlayTop = focusMode && !IsFullscreen;
+
         BackColor = hideChrome ? Theme.Ground : (vertical ? Theme.Frame : Theme.Ground);
         railSpacer.Width = RailWidth;
         railSpacer.Visible = !hideChrome && floatingRail;
         if (Controls.GetChildIndex(railSpacer) < Controls.GetChildIndex(cardFrame))
             railSpacer.SendToBack();
+
         if (floatingRail)
         {
             if (sidebar.Dock != DockStyle.None) sidebar.Dock = DockStyle.None;
@@ -1227,6 +1671,11 @@ sealed class BrowserWindow : Form
                 sidebar.BringToFront();
             }
         }
+        else if (overlaySidebar)
+        {
+            if (sidebar.Dock != DockStyle.None) sidebar.Dock = DockStyle.None;
+            ApplyLeftPeekBounds();
+        }
         else
         {
             if (sidebar.Dock != DockStyle.Left) sidebar.Dock = DockStyle.Left;
@@ -1235,15 +1684,34 @@ sealed class BrowserWindow : Form
             if (Controls.GetChildIndex(sidebar) < Controls.GetChildIndex(cardFrame))
                 sidebar.SendToBack();
         }
-        topStrip.Visible = !hideChrome && !vertical;
-        minBtn.Visible = maxBtn.Visible = closeBtn.Visible = !hideChrome;
+
+        if (overlayTop)
+        {
+            if (topStrip.Dock != DockStyle.None) topStrip.Dock = DockStyle.None;
+            ApplyTopPeekBounds();
+        }
+        else
+        {
+            if (topStrip.Dock != DockStyle.Top) topStrip.Dock = DockStyle.Top;
+            topStrip.Height = S(52);
+            topStrip.Visible = !hideChrome && !vertical;
+            topPeekBorder.Visible = false;
+            if (Controls.GetChildIndex(topStrip) < Controls.GetChildIndex(cardFrame))
+                topStrip.SendToBack();
+            minBtn.Visible = maxBtn.Visible = closeBtn.Visible = !hideChrome;
+        }
+
+        SyncFocusResizeGrip();
+        focusResizeGrip.BringToFront();
+        if (overlaySidebar && sidebar.Visible) sidebar.BringToFront();
+        if (overlayTop && topStrip.Visible) topStrip.BringToFront();
         minBtn.BringToFront();
         maxBtn.BringToFront();
         closeBtn.BringToFront();
         sessionNotice.Visible = !hideChrome && !CanSaveSession;
         sessionNotice.BackColor = vertical ? Theme.Frame : Theme.Ground;
 
-        if (IsFullscreen)
+        if (IsFullscreen || focusMode)
         {
             cardFrame.BackColor = Theme.Ground;
             cardFrame.Padding = Padding.Empty;
@@ -1272,13 +1740,20 @@ sealed class BrowserWindow : Form
             cardBorder.Padding = Padding.Empty;
         }
 
-        var capSurface = vertical ? Theme.Frame : Theme.Ground;
-        var capHover = vertical ? Theme.SideHover : Theme.StripHover;
-        var capActive = vertical ? Theme.SideActive : Theme.StripActive;
+        var capSurface = ToolbarInTopStrip ? Theme.Ground : Theme.Frame;
+        var capHover = ToolbarInTopStrip ? Theme.StripHover : Theme.SideHover;
+        var capActive = ToolbarInTopStrip ? Theme.StripActive : Theme.SideActive;
         minBtn.SetSurface(capSurface, capHover, capActive);
         maxBtn.SetSurface(capSurface, capHover, capActive);
         closeBtn.SetSurface(capSurface, capHover, capActive);
         LayoutCaptionButtons();
+    }
+
+    void SyncFocusResizeGrip()
+    {
+        var show = focusMode && !IsFullscreen && WindowState == FormWindowState.Normal;
+        if (show) focusResizeGrip.SetBounds(0, 0, ClientSize.Width, S(5));
+        if (focusResizeGrip.Visible != show) focusResizeGrip.Visible = show;
     }
 
     int TopFrameInset(IntPtr hwnd)
@@ -1308,7 +1783,7 @@ sealed class BrowserWindow : Form
     {
         foreach (Control c in topStrip.Controls)
         {
-            if (!c.Visible || !BoundsInForm(c).Contains(formPt)) continue;
+            if (!c.Visible || ReferenceEquals(c, topPeekBorder) || !BoundsInForm(c).Contains(formPt)) continue;
             if (ReferenceEquals(c, stripTabs)) return AnyChildContains(stripTabs, formPt);
             return true;
         }
@@ -1329,11 +1804,17 @@ sealed class BrowserWindow : Form
                 return HTTOP;
             }
         }
-        if (!chromeHidden)
+        if (!chromeHidden || focusMode)
         {
             if (closeBtn.Visible && closeBtn.Bounds.Contains(pt)) return HTCLOSE;
             if (maxBtn.Visible && maxBtn.Bounds.Contains(pt)) return HTMAXBUTTON;
             if (minBtn.Visible && minBtn.Bounds.Contains(pt)) return HTMINBUTTON;
+        }
+        if (focusMode)
+        {
+            if (topStrip.Visible && BoundsInForm(topStrip).Contains(pt))
+                return AnyStripControlContains(pt) ? HTCLIENT : HTCAPTION;
+            return HTCLIENT;
         }
         if (chromeHidden)
             return pt.Y >= 0 && pt.Y < S(12) ? HTCAPTION : HTCLIENT;
@@ -1371,8 +1852,16 @@ sealed class BrowserWindow : Form
     protected override void OnSizeChanged(EventArgs e)
     {
         base.OnSizeChanged(e);
-        if (vertical && tabBarCollapsed && sidebar.Visible && sidebar.Dock == DockStyle.None)
+        if (focusMode && !IsFullscreen)
+        {
+            if (vertical) ApplyLeftPeekBounds();
+            ApplyTopPeekBounds();
+        }
+        else if (vertical && tabBarCollapsed && sidebar.Visible && sidebar.Dock == DockStyle.None)
+        {
             sidebar.SetBounds(0, 0, CurrentCollapsedSidebarWidth(), ClientSize.Height);
+        }
+        SyncFocusResizeGrip();
         LayoutCaptionButtons();
         UpdateMaximizeButton();
     }
@@ -1409,12 +1898,13 @@ sealed class BrowserWindow : Form
         if (vertical)
         {
             SyncSidebarLayoutMode(syncTabs: false);
-            if (!IsVerticalRailOnly) address.PerformLayout();
+            if (!IsVerticalRailOnly && !focusMode) address.PerformLayout();
         }
         else
         {
             SyncActiveTabTitle();
         }
+        if (ToolbarInTopStrip) LayoutTopStrip();
         RebuildTabs();
         if (findBar.Visible) findBar.PositionIn(pages);
         Invalidate(true);
@@ -1555,7 +2045,7 @@ sealed class BrowserWindow : Form
         var yRow = (h - rowH) / 2;
 
         var x = pad;
-        collapseBtn.SetBounds(x, yBtn, btn, btn); x += btn + gap;
+        if (!focusMode) { collapseBtn.SetBounds(x, yBtn, btn, btn); x += btn + gap; }
         backBtn.SetBounds(x, yBtn, btn, btn); x += btn + gap;
         forwardBtn.SetBounds(x, yBtn, btn, btn); x += btn + gap;
         reloadBtn.SetBounds(x, yBtn, btn, btn); x += btn + S(8);
@@ -1571,12 +2061,25 @@ sealed class BrowserWindow : Form
         var rx = rightStart;
         foreach (var rb in rightBtns) { rb.SetBounds(rx, yBtn, btn, btn); rx += btn + gap; }
 
+        if (focusMode && vertical)
+        {
+            stripActiveTitle.Visible = false;
+            stripTabs.Visible = false;
+            stripNewTabBtn.Visible = false;
+            var maxAddrFocus = Math.Max(0, rightStart - S(48) - x);
+            var addrWFocus = Math.Min(Math.Clamp((w - pad * 2) * 42 / 100, S(200), S(480)), maxAddrFocus);
+            address.SetBounds(x, yRow, addrWFocus, rowH);
+            lastStripX = x;
+            lastStripMaxRun = 0;
+            return;
+        }
+
         var maxAddr = Math.Max(0, rightStart - x - S(8) - btn - S(8));
         var addrW = Math.Min(Math.Clamp((w - pad * 2) * 26 / 100, S(160), S(340)), maxAddr);
         address.SetBounds(x, yRow, addrW, rowH);
         x += addrW + S(8);
 
-        if (tabBarCollapsed)
+        if (tabBarCollapsed && !focusMode)
         {
             stripTabs.Visible = false;
             stripNewTabBtn.Visible = false;
@@ -2238,6 +2741,20 @@ sealed class BrowserWindow : Form
                 core.ProcessFailed += (_, e) => HandleProcessFailed(tab, view, e);
                 core.ContainsFullScreenElementChanged += (_, _) => HandleContainsFullScreenElementChanged(tab, core);
                 core.LaunchingExternalUriScheme += (_, e) => HandleLaunchingExternalUriScheme(tab, e);
+                core.ContextMenuRequested += (_, e) => {
+                    if (closed || IsDisposed || environment is null || restoring) return;
+                    TryCore(() => {
+                        var sep = environment.CreateContextMenuItem("", null, CoreWebView2ContextMenuItemKind.Separator);
+                        var item = environment.CreateContextMenuItem("Focus mode", null, CoreWebView2ContextMenuItemKind.CheckBox);
+                        item.IsChecked = focusMode;
+                        item.CustomItemSelected += (_, _) => {
+                            if (!closed && !IsDisposed && IsHandleCreated)
+                                BeginInvoke(ToggleFocusMode);
+                        };
+                        e.MenuItems.Add(sep);
+                        e.MenuItems.Add(item);
+                    });
+                };
                 core.NewWindowRequested += (_, e) => {
                     e.Handled = true;
                     if (!e.IsUserInitiated || !IsPopupAllowed(e.Uri) || environment is null || closed || restoring || IsDisposed || !IsHandleCreated)
@@ -2474,6 +2991,8 @@ sealed class BrowserWindow : Form
         // Clicking the button while the flyout was open triggers Deactivate->Close first; don't immediately reopen.
         if (fromButtonClick && Environment.TickCount64 - downloadsFlyoutClosedAt < 250)
             return;
+        if (focusMode && !IsFullscreen)
+            SetTopPeekOpen(true, trackCursor: false);
         var anchor = DownloadsAnchor();
         var flyout = new DownloadsFlyout(
             downloads,
@@ -2486,6 +3005,7 @@ sealed class BrowserWindow : Form
                 if (ReferenceEquals(downloadsFlyout, null)) return;
                 downloadsFlyout = null;
                 if (!closed && !IsDisposed && !downloadsBtn.IsDisposed) downloadsBtn.SetActive(false);
+                MaybeCloseTopPeekAfterFlyout();
             },
             anchor);
         downloadsFlyout = flyout;
@@ -2502,6 +3022,7 @@ sealed class BrowserWindow : Form
             flyout.Close();
         }
         if (!closed && !IsDisposed && !downloadsBtn.IsDisposed) downloadsBtn.SetActive(false);
+        MaybeCloseTopPeekAfterFlyout();
     }
 
     void SyncDownloadsUi()
@@ -2519,8 +3040,8 @@ sealed class BrowserWindow : Form
         if (tips.GetToolTip(downloadsBtn) != tip) tips.SetToolTip(downloadsBtn, tip);
         if (visChanged)
         {
-            if (vertical) LayoutSideTopBand();
-            else LayoutTopStrip();
+            if (ToolbarInTopStrip) LayoutTopStrip();
+            else LayoutSideTopBand();
         }
         if (downloadsFlyout is { IsDisposed: false, Visible: true } flyout)
             flyout.RefreshEntries();
@@ -2979,6 +3500,7 @@ sealed class BrowserWindow : Form
             }
             TryCore(() => core.Navigate(target));
             FocusView(tab.View);
+            if (focusMode && topPeekOpen && !topPeekTrackCursor && !address.InputFocused) HandleAddressLostFocus();
             if (!tab.Loaded) { UpdateAddress(); UpdateNavButtons(); RefreshTab(tab); }
             return Task.CompletedTask;
         }
@@ -3062,6 +3584,7 @@ sealed class BrowserWindow : Form
         }
         SyncCrashOverlay();
         SyncPageBanner();
+        if (focusView && focusMode && topPeekOpen && !topPeekTrackCursor && !address.InputFocused) HandleAddressLostFocus();
         if (focusView || !address.InputFocused) UpdateAddress();
         EnsureWorkerFilterOwner(tab);
         CloseShieldFlyout();
@@ -3432,7 +3955,7 @@ sealed class BrowserWindow : Form
 
     bool StartTabDrag(BrowserTab tab, Point screenPt)
     {
-        if (closed || restoring || chromeHidden || IsVerticalRailOnly || (!vertical && tabBarCollapsed) || !opened.Contains(tab)) return false;
+        if (closed || restoring || chromeHidden || IsVerticalRailOnly || (!vertical && tabBarCollapsed && !focusMode) || !opened.Contains(tab)) return false;
         if (dragTab is not null) CancelTabDrag(animate: false);
         layoutMotion.FinishClosing();
         layoutMotion.SnapOffsetsToZero();
@@ -3916,27 +4439,16 @@ sealed class BrowserWindow : Form
         CloseShieldFlyout();
         vertical = sidebarMode;
         SuspendLayout();
-        var surface = sidebarMode ? Theme.Frame : Theme.Ground;
-        var hover = sidebarMode ? Theme.SideHover : Theme.StripHover;
-        var activeFill = sidebarMode ? Theme.SideActive : Theme.StripActive;
-
-        foreach (var b in new[] { collapseBtn, backBtn, forwardBtn, reloadBtn, shareBtn, updateBtn, settingsBtn })
-            b.SetSurface(surface, hover, activeFill);
-        downloadsBtn.SetSurface(surface, hover, activeFill);
-        address.SetSurface(surface, hover);
-
+        SyncChromeControlParents();
         if (sidebarMode)
         {
-            sideTopBand.Controls.AddRange([collapseBtn, backBtn, forwardBtn, reloadBtn, updateBtn, downloadsBtn, shareBtn, settingsBtn]);
-            sideAddressWrap.Controls.Add(address);
             ApplyChromeVisibility();
             SyncSidebarLayoutMode(syncTabs: false);
+            if (focusMode) LayoutTopStrip();
         }
         else
         {
             stripScroll = 0;
-            topStrip.Controls.AddRange([collapseBtn, backBtn, forwardBtn, reloadBtn, address, updateBtn, downloadsBtn, shareBtn, settingsBtn]);
-            stripTabs.SendToBack();
             ApplyChromeVisibility();
             SyncActiveTabTitle();
         }
@@ -3968,6 +4480,11 @@ sealed class BrowserWindow : Form
         menu.Items.Add(new ToolStripSeparator());
         var printItem = menu.Items.Add("Print...", null, (_, _) => { if (tab != selected) SelectTab(tab); PrintTab(tab); });
         var saveItem = menu.Items.Add("Save page as...", null, (_, _) => { if (tab != selected) SelectTab(tab); _ = SaveTabAsync(tab); });
+        var focusItem = new ToolStripMenuItem("Focus mode", null, (_, _) => ToggleFocusMode())
+        {
+            ShortcutKeyDisplayString = "Ctrl+Shift+F",
+        };
+        menu.Items.Add(focusItem);
         menu.Items.Add(new ToolStripSeparator());
         var closeItem = menu.Items.Add("Close tab", null, (_, _) => CloseTab(tab));
         var closeOthersItem = menu.Items.Add("Close other tabs", null, (_, _) => CloseOtherTabs(tab));
@@ -3982,6 +4499,8 @@ sealed class BrowserWindow : Form
             var pageReady = tab.View is { IsDisposed: false, CoreWebView2: not null } && tab.Url is not null;
             printItem.Enabled = pageReady;
             saveItem.Enabled = pageReady;
+            focusItem.Checked = focusMode;
+            focusItem.Enabled = !restoring;
             closeItem.Enabled = !tab.Pinned;
             closeOthersItem.Enabled = opened.Any(t => t != tab && !t.Pinned);
             closeBelowItem.Enabled = TabsBelow(tab).Count > 0;
@@ -4141,7 +4660,7 @@ sealed class BrowserWindow : Form
         }
         else
         {
-            if (tabBarCollapsed) return;
+            if (tabBarCollapsed && !focusMode) return;
             var gap = S(2);
             var rowH = S(28);
             stripTabs.SuspendLayout();
@@ -4381,6 +4900,7 @@ sealed class BrowserWindow : Form
             case Keys.Control | Keys.Shift | Keys.T:
             case Keys.Control | Keys.Shift | Keys.S:
             case Keys.Control | Keys.Shift | Keys.B:
+            case Keys.Control | Keys.Shift | Keys.F:
             case Keys.Control | Keys.Oemcomma:
             case Keys.Control | Keys.Tab:
             case Keys.Control | Keys.Shift | Keys.Tab:
@@ -4482,6 +5002,7 @@ sealed class BrowserWindow : Form
             case Keys.Control | Keys.Shift | Keys.T: if (!restoring) ReopenClosedTab(); return true;
             case Keys.Control | Keys.Shift | Keys.S: if (!restoring) SetOrientation(!vertical); return true;
             case Keys.Control | Keys.Shift | Keys.B: if (!restoring) ToggleTabBarCollapsed(); return true;
+            case Keys.Control | Keys.Shift | Keys.F: if (!restoring) ToggleFocusMode(); return true;
             case Keys.Control | Keys.Oemcomma: OpenSettings(); return true;
             case Keys.Control | Keys.Tab:
             case Keys.Control | Keys.PageDown: if (!restoring) CycleTab(1); return true;
@@ -4707,6 +5228,8 @@ sealed class BrowserWindow : Form
         if (selected is not { Closed: false } tab) return;
         var site = SitePrefsStore.HostOf(tab.Url);
         if (site is null) return;
+        if (focusMode && !IsFullscreen)
+            SetTopPeekOpen(true, trackCursor: false);
 
         var flyout = new ShieldFlyout(
             site,
@@ -4723,6 +5246,7 @@ sealed class BrowserWindow : Form
                 if (ReferenceEquals(shieldFlyout, null)) return;
                 shieldFlyout = null;
                 if (!closed && !IsDisposed && !address.IsDisposed) address.SetShieldOpen(false);
+                MaybeCloseTopPeekAfterFlyout();
             },
             address,
             () => address.ShieldButtonBounds);
@@ -4740,6 +5264,7 @@ sealed class BrowserWindow : Form
             flyout.Close();
         }
         if (!closed && !IsDisposed && !address.IsDisposed) address.SetShieldOpen(false);
+        MaybeCloseTopPeekAfterFlyout();
     }
 
     void RegisterDefaultBrowser()
@@ -4775,8 +5300,8 @@ sealed class BrowserWindow : Form
         {
             shareBtn.Visible = next.ShareEnabled;
             if (!next.ShareEnabled) pending?.Cancel();
-            if (vertical) LayoutSideTopBand();
-            else LayoutTopStrip();
+            if (ToolbarInTopStrip) LayoutTopStrip();
+            else LayoutSideTopBand();
         }
 
         if (next.BlockingEnabled != prev.BlockingEnabled)
@@ -4887,8 +5412,8 @@ sealed class BrowserWindow : Form
         updateBtn.AccessibleName = label;
         tips.SetToolTip(updateBtn, label);
         updateBtn.Visible = true;
-        if (vertical) LayoutSideTopBand();
-        else LayoutTopStrip();
+        if (ToolbarInTopStrip) LayoutTopStrip();
+        else LayoutSideTopBand();
     }
 
     async Task ApplyUpdate()
@@ -6371,6 +6896,7 @@ sealed class BrowserWindow : Form
         var guardCountBefore = opened.Count;
         var guardVerticalBefore = vertical;
         var guardCollapsedBefore = tabBarCollapsed;
+        var guardFocusBefore = focusMode;
         closedUrls.Push(fixture + "/closed-during-restore");
         var closedCountBefore = closedUrls.Count;
         var restoreLaunchCalled = false;
@@ -6384,6 +6910,7 @@ sealed class BrowserWindow : Form
             PressKey(Keys.Control | Keys.Shift | Keys.T);
             PressKey(Keys.Control | Keys.Shift | Keys.S);
             PressKey(Keys.Control | Keys.Shift | Keys.B);
+            PressKey(Keys.Control | Keys.Shift | Keys.F);
             PressKey(Keys.Control | Keys.Tab);
             PressKey(Keys.Control | Keys.Shift | Keys.Tab);
             PressKey(Keys.Control | Keys.PageUp);
@@ -6400,6 +6927,7 @@ sealed class BrowserWindow : Form
             && selected == guardSelectedBefore
             && vertical == guardVerticalBefore
             && tabBarCollapsed == guardCollapsedBefore
+            && focusMode == guardFocusBefore
             && closedUrls.Count == closedCountBefore;
         if (closedUrls.Count > 0 && closedUrls.Peek() == fixture + "/closed-during-restore") closedUrls.Pop();
         CloseTab(restoreGuardTab, recordClosed: false);
@@ -7810,6 +8338,326 @@ sealed class BrowserWindow : Form
             chromeHiddenAndAnchorOk = chromeRestoredRailOk && downloadsAnchorOk,
         };
 
+        // #56: Focus mode — hides all chrome, pages fills client, persists across tabs/nav/new tab/crash, left & top edge overlays without reflow, shortcuts, F11, restore all 4 layouts, menu toggle.
+        SetOrientation(true, persistSettings: false);
+        SetTabBarCollapsed(false, persistSettings: false);
+        SelectTab(first);
+        PerformLayout();
+        var focusPrevVertExpPages = BoundsInForm(pages);
+        var focusPrevBounds = Bounds;
+
+        // Enter via Ctrl+Shift+F: hides all chrome, pages fills client, stays normal resizable window, Esc does not exit.
+        PressKey(Keys.Control | Keys.Shift | Keys.F);
+        PerformLayout();
+        var focusPagesClient = BoundsInForm(pages);
+        var focusResizeTopHit = HitTestAt(PointToScreen(new Point(ClientSize.Width / 2, 2)));
+        // The real cursor hits the topmost child there, not the Form: it must be the pass-through grip, not the WebView2.
+        var focusGripOnTopOk = ReferenceEquals(GetChildAtPoint(new Point(ClientSize.Width / 2, 2), GetChildAtPointSkip.Invisible), focusResizeGrip)
+            && unchecked((int)SendMessage(focusResizeGrip.Handle, WM_NCHITTEST, IntPtr.Zero, MakeLParam(0, 0)).ToInt64()) == -1;
+        var escBeforeFocus = !IsHandledShortcut(Keys.Escape);
+        PressKey(Keys.Escape);
+        var focusEnterHidesAllOk = FocusMode
+            && !IsFullscreen
+            && FormBorderStyle == FormBorderStyle.Sizable
+            && Bounds == focusPrevBounds
+            && !sidebar.Visible && !railSpacer.Visible && !topStrip.Visible
+            && !minBtn.Visible && !maxBtn.Visible && !closeBtn.Visible
+            && !sessionNotice.Visible
+            && cardFrame.Padding == Padding.Empty
+            && cardBorder.Padding == Padding.Empty
+            && focusPagesClient == ClientRectangle
+            && focusResizeTopHit == HTTOP
+            && focusGripOnTopOk
+            && escBeforeFocus
+            && FocusMode;
+
+        // Stays on across new tab, navigation, tab switch, and crash recovery.
+        await OpenInteractive(null);
+        var focusBlankTab = selected!;
+        var newTabRevealedTop = FocusMode && TopPeekOpen && topStrip.Visible;
+        await Go(fixture + "/second");
+        await WaitForLoad(focusBlankTab);
+        var afterNavFocusOk = FocusMode && !TopPeekOpen && !topStrip.Visible && !sidebar.Visible && BoundsInForm(pages) == ClientRectangle;
+        SelectTab(first);
+        var afterSwitchToFirstOk = FocusMode && !sidebar.Visible && !topStrip.Visible && BoundsInForm(pages) == ClientRectangle;
+        SelectTab(focusBlankTab);
+        focusBlankTab.Loaded = false;
+        focusBlankTab.View!.CoreWebView2!.Navigate(fixture + "/third");
+        await WaitForLoad(focusBlankTab);
+        var afterSecondNavOk = FocusMode && focusBlankTab.Title == "Third page marker" && !sidebar.Visible && !topStrip.Visible;
+        ShowTabCrash(focusBlankTab, new TabCrashInfo(focusBlankTab.Url, "Renderer process crashed", 1, null));
+        var crashInFocusOk = FocusMode && crashPage.Visible && !sidebar.Visible && !topStrip.Visible;
+        RecoverCrashedTab(focusBlankTab);
+        var focusCrashWait = Stopwatch.StartNew();
+        while (focusCrashWait.Elapsed < TimeSpan.FromSeconds(10)
+            && (crashPage.Visible || !focusBlankTab.Loaded || focusBlankTab.Navigating))
+            await Task.Delay(50);
+        var focusStaysAcrossOpsOk = newTabRevealedTop && afterNavFocusOk && afterSwitchToFirstOk && afterSecondNavOk
+            && crashInFocusOk && FocusMode && !crashPage.Visible && BoundsInForm(pages) == ClientRectangle;
+        CloseTab(focusBlankTab, recordClosed: false);
+        SelectTab(first);
+
+        // Left-edge and top-edge peek overlays without changing pages bounds; caption buttons & draggable area reachable in top peek.
+        var focusPagesBeforePeek = BoundsInForm(pages);
+        var leftEdgeDetected = DetectFocusEdgeAt(new Point(2, ClientSize.Height / 2)) == PeekEdge.Left;
+        SetPeekOpen(true);
+        PerformLayout();
+        var leftPeekOpenedOk = leftEdgeDetected
+            && PeekOpen
+            && sidebar.Visible
+            && sidebar.Left == 0
+            && sidebar.Width == ExpandedSidebarWidth
+            && peekBorder.Visible
+            && !sideTopBand.Visible
+            && !sideAddressWrap.Visible
+            && Controls.GetChildIndex(sidebar) < Controls.GetChildIndex(cardFrame)
+            && BoundsInForm(pages) == focusPagesBeforePeek;
+        SetPeekOpen(false);
+        PerformLayout();
+        var focusLeftPeekOk = leftPeekOpenedOk
+            && !PeekOpen
+            && !sidebar.Visible
+            && !peekBorder.Visible
+            && BoundsInForm(pages) == focusPagesBeforePeek;
+
+        var topEdgeDetected = DetectFocusEdgeAt(new Point(ClientSize.Width / 2, 2)) == PeekEdge.Top;
+        SetTopPeekOpen(true);
+        PerformLayout();
+        var focusCaptionInTopPeekOk = minBtn.Visible && maxBtn.Visible && closeBtn.Visible
+            && HitTestAt(CenterOnScreen(minBtn)) == HTMINBUTTON
+            && HitTestAt(CenterOnScreen(maxBtn)) == HTMAXBUTTON
+            && HitTestAt(CenterOnScreen(closeBtn)) == HTCLOSE
+            && HitTestAt(topStrip.PointToScreen(new Point((address.Right + settingsBtn.Left) / 2, topStrip.Height / 2))) == HTCAPTION;
+        var topPeekOpenedOk = topEdgeDetected
+            && TopPeekOpen
+            && topStrip.Visible
+            && topStrip.Top == 0
+            && topPeekBorder.Visible
+            && address.Visible
+            && Controls.GetChildIndex(topStrip) < Controls.GetChildIndex(cardFrame)
+            && BoundsInForm(pages) == focusPagesBeforePeek;
+        SetTopPeekOpen(false);
+        PerformLayout();
+        var focusTopPeekOk = topPeekOpenedOk
+            && !TopPeekOpen
+            && !topStrip.Visible
+            && !topPeekBorder.Visible
+            && !minBtn.Visible && !maxBtn.Visible && !closeBtn.Visible
+            && BoundsInForm(pages) == focusPagesBeforePeek;
+
+        // Animated left & top peek via MotionClock without reflowing pages.
+        var prevFocusMotion = motion.ForceEnabled;
+        bool focusPeekAnimOk;
+        try
+        {
+            motion.ForceEnabled = true;
+            SetPeekOpen(true);
+            var fLeftStart = motion.IsRunning && sidebar.Visible && sidebar.Left < 0 && BoundsInForm(pages) == focusPagesBeforePeek;
+            motion.Advance(Motion.PeekSlideDurationMs / 2);
+            var fLeftMid = sidebar.Left > -ExpandedSidebarWidth && sidebar.Left < 0 && BoundsInForm(pages) == focusPagesBeforePeek;
+            motion.Advance(Motion.PeekSlideDurationMs + 10);
+            var fLeftEnd = sidebar.Left == 0 && !motion.IsRunning && BoundsInForm(pages) == focusPagesBeforePeek;
+            SetPeekOpen(false);
+            motion.Advance(Motion.PeekSlideDurationMs + 10);
+            var fLeftClosed = !sidebar.Visible && !motion.IsRunning && BoundsInForm(pages) == focusPagesBeforePeek;
+
+            SetTopPeekOpen(true);
+            var fTopStart = motion.IsRunning && topStrip.Visible && topStrip.Top < 0 && BoundsInForm(pages) == focusPagesBeforePeek;
+            motion.Advance(Motion.PeekSlideDurationMs / 2);
+            var fTopMid = topStrip.Top > -S(52) && topStrip.Top < 0 && BoundsInForm(pages) == focusPagesBeforePeek;
+            motion.Advance(Motion.PeekSlideDurationMs + 10);
+            var fTopEnd = topStrip.Top == 0 && !motion.IsRunning && BoundsInForm(pages) == focusPagesBeforePeek;
+            SetTopPeekOpen(false);
+            motion.Advance(Motion.PeekSlideDurationMs + 10);
+            var fTopClosed = !topStrip.Visible && !minBtn.Visible && !motion.IsRunning && BoundsInForm(pages) == focusPagesBeforePeek;
+
+            focusPeekAnimOk = fLeftStart && fLeftMid && fLeftEnd && fLeftClosed
+                && fTopStart && fTopMid && fTopEnd && fTopClosed;
+        }
+        finally
+        {
+            motion.ForceEnabled = prevFocusMotion;
+            CancelPeek(animate: false);
+        }
+
+        // Shortcuts in focus mode: Ctrl+L, Ctrl+F, Ctrl+J, shield popover.
+        PressKey(Keys.Control | Keys.L);
+        var ctrlLFocusOk = TopPeekOpen && topStrip.Visible && address.Visible && (!ContainsFocus || address.InputFocused);
+        if (address.InputFocused) PressKey(Keys.Escape);
+        else SetTopPeekOpen(false);
+        var ctrlLCloseOk = ctrlLFocusOk && !address.InputFocused && !TopPeekOpen && !topStrip.Visible && FocusMode;
+
+        PressKey(Keys.Control | Keys.F);
+        var ctrlFFocusOk = findBar.Visible && pages.ClientRectangle.Contains(findBar.Bounds) && FocusMode;
+        PressKey(Keys.Escape);
+        var ctrlFCloseOk = ctrlFFocusOk && !findBar.Visible && FocusMode;
+
+        PressKey(Keys.Control | Keys.J);
+        var ctrlJFocusOk = downloadsFlyout is { IsDisposed: false, Visible: true }
+            && downloadsFlyout.VerifyLayoutInsideClient()
+            && TopPeekOpen && topStrip.Visible && FocusMode;
+        PressKey(Keys.Control | Keys.J);
+        var ctrlJCloseOk = ctrlJFocusOk && downloadsFlyout is null && !TopPeekOpen && !topStrip.Visible && FocusMode;
+
+        UpdateShieldIndicator();
+        ToggleShieldFlyout(fromButtonClick: false);
+        var shieldFocusOpenOk = shieldFlyout is { IsDisposed: false, Visible: true }
+            && shieldFlyout.VerifyLayoutInsideClient()
+            && TopPeekOpen && topStrip.Visible && FocusMode;
+        CloseShieldFlyout();
+        var shieldFocusCloseOk = shieldFocusOpenOk && shieldFlyout is null && !TopPeekOpen && !topStrip.Visible && FocusMode;
+        var focusShortcutsOk = ctrlLCloseOk && ctrlFCloseOk && ctrlJCloseOk && shieldFocusCloseOk;
+
+        // Collapse/orientation changes and a DPI change inside focus mode keep it on, the page filling the client.
+        SetTabBarCollapsed(true, persistSettings: false);
+        var focusCollapseInsideOk = FocusMode && TabBarCollapsed && !sidebar.Visible && !railSpacer.Visible && BoundsInForm(pages) == ClientRectangle;
+        SetTabBarCollapsed(false, persistSettings: false);
+        SetOrientation(false, persistSettings: false);
+        SetTopPeekOpen(true);
+        var focusOrientInsideOk = FocusMode && !vertical && !sidebar.Visible && topStrip.Visible && stripTabs.Visible
+            && BoundsInForm(pages) == ClientRectangle;
+        SetTopPeekOpen(false);
+        SetOrientation(true, persistSettings: false);
+        focusOrientInsideOk &= FocusMode && vertical && !sidebar.Visible && !topStrip.Visible && BoundsInForm(pages) == ClientRectangle;
+        var focusDpiSize = Size;
+        bool focusDpiOk;
+        try
+        {
+            dpiOverride = DeviceDpi > 96 ? 96 : 144;
+            RescaleChrome();
+            PerformLayout();
+            SetTopPeekOpen(true);
+            focusDpiOk = FocusMode && BoundsInForm(pages) == ClientRectangle
+                && topStrip.Top == 0 && topStrip.Width == ClientSize.Width && topStrip.Height == S(52)
+                && closeBtn.Visible && closeBtn.Height == topStrip.Height && closeBtn.Right == ClientSize.Width
+                && focusResizeGrip.Visible && focusResizeGrip.Height == S(5);
+            SetTopPeekOpen(false);
+        }
+        finally
+        {
+            dpiOverride = null;
+            RescaleChrome();
+            Size = focusDpiSize;
+            PerformLayout();
+        }
+        var focusInsideChangesOk = focusCollapseInsideOk && focusOrientInsideOk && focusDpiOk
+            && FocusMode && !topStrip.Visible && BoundsInForm(pages) == ClientRectangle;
+
+        // F11 inside focus mode returns to focus mode.
+        PressKey(Keys.F11);
+        PerformLayout();
+        var f11InFocusEntered = IsFullscreen && BrowserFullscreen && FocusMode && FormBorderStyle == FormBorderStyle.None;
+        PressKey(Keys.F11);
+        PerformLayout();
+        var focusF11ReturnsOk = f11InFocusEntered
+            && !IsFullscreen && !BrowserFullscreen
+            && FocusMode
+            && FormBorderStyle == FormBorderStyle.Sizable
+            && Bounds == focusPrevBounds
+            && !sidebar.Visible && !topStrip.Visible && !minBtn.Visible
+            && focusResizeGrip.Visible
+            && BoundsInForm(pages) == ClientRectangle;
+
+        // Ctrl+Shift+F exits and restores vertical-expanded exactly.
+        PressKey(Keys.Control | Keys.Shift | Keys.F);
+        PerformLayout();
+        var restoreVertExpOk = !FocusMode && vertical && !TabBarCollapsed
+            && CheckVerticalLayout()
+            && sidebar.Width == ExpandedSidebarWidth
+            && BoundsInForm(pages) == focusPrevVertExpPages;
+
+        // Vertical-collapsed -> focus (left peek shows full sidebar) -> exit restores rail exactly.
+        SetTabBarCollapsed(true, persistSettings: false);
+        PerformLayout();
+        var focusPrevVertColPages = BoundsInForm(pages);
+        PressKey(Keys.Control | Keys.Shift | Keys.F);
+        PerformLayout();
+        SetPeekOpen(true);
+        var vertColFocusPeekFull = FocusMode && sidebar.Visible && sidebar.Width == ExpandedSidebarWidth && !railSpacer.Visible;
+        SetPeekOpen(false);
+        PressKey(Keys.Control | Keys.Shift | Keys.F);
+        PerformLayout();
+        var restoreVertColOk = vertColFocusPeekFull
+            && !FocusMode && vertical && TabBarCollapsed
+            && sidebar.Visible && sidebar.Width == RailWidth
+            && railSpacer.Visible && railSpacer.Width == RailWidth
+            && !sideAddressWrap.Visible
+            && BoundsInForm(pages) == focusPrevVertColPages;
+
+        // Horizontal-expanded -> focus (top peek shows strip + captions, left edge unused) -> exit restores strip exactly.
+        SetTabBarCollapsed(false, persistSettings: false);
+        SetOrientation(false, persistSettings: false);
+        PerformLayout();
+        var focusPrevHorizExpPages = BoundsInForm(pages);
+        PressKey(Keys.Control | Keys.Shift | Keys.F);
+        PerformLayout();
+        var horizFocusPages = BoundsInForm(pages);
+        var horizLeftEdgeNone = DetectFocusEdgeAt(new Point(2, ClientSize.Height / 2)) == PeekEdge.None;
+        SetTopPeekOpen(true);
+        PerformLayout();
+        var horizTopPeekStripOk = FocusMode && horizFocusPages == ClientRectangle && horizLeftEdgeNone
+            && TopPeekOpen && topStrip.Visible && stripTabs.Visible && stripNewTabBtn.Visible
+            && minBtn.Visible && maxBtn.Visible && closeBtn.Visible
+            && BoundsInForm(pages) == horizFocusPages;
+        SetTopPeekOpen(false);
+        PressKey(Keys.Control | Keys.Shift | Keys.F);
+        PerformLayout();
+        var restoreHorizExpOk = horizTopPeekStripOk
+            && !FocusMode && !vertical && !TabBarCollapsed
+            && CheckHorizontalLayout()
+            && stripTabs.Visible && !stripActiveTitle.Visible
+            && BoundsInForm(pages) == focusPrevHorizExpPages;
+
+        // Horizontal-collapsed -> focus (top peek shows strip) -> exit restores compact active title exactly.
+        SetTabBarCollapsed(true, persistSettings: false);
+        PerformLayout();
+        var focusPrevHorizColPages = BoundsInForm(pages);
+        PressKey(Keys.Control | Keys.Shift | Keys.F);
+        PerformLayout();
+        SetTopPeekOpen(true);
+        var horizColTopPeekOk = FocusMode && topStrip.Visible && stripTabs.Visible && !stripActiveTitle.Visible;
+        SetTopPeekOpen(false);
+        PressKey(Keys.Control | Keys.Shift | Keys.F);
+        PerformLayout();
+        var restoreHorizColOk = horizColTopPeekOk
+            && !FocusMode && !vertical && TabBarCollapsed
+            && CheckHorizontalLayout()
+            && !stripTabs.Visible && stripActiveTitle.Visible
+            && BoundsInForm(pages) == focusPrevHorizColPages;
+
+        var focusRestoreAllLayoutsOk = restoreVertExpOk && restoreVertColOk && restoreHorizExpOk && restoreHorizColOk;
+
+        // Menu item toggles focus mode and reflects checked state.
+        SetTabBarCollapsed(false, persistSettings: false);
+        SetOrientation(true, persistSettings: false);
+        PerformLayout();
+        var focusMenuBefore = OpenAndGetMenuItem(first, "Focus mode");
+        var menuUncheckedBefore = !focusMenuBefore.Checked;
+        focusMenuBefore.PerformClick();
+        PerformLayout();
+        var menuEnteredFocus = FocusMode && !sidebar.Visible && !topStrip.Visible;
+        SetPeekOpen(true);
+        var focusMenuDuring = OpenAndGetMenuItem(first, "Focus mode");
+        var menuCheckedDuring = focusMenuDuring.Checked;
+        focusMenuDuring.PerformClick();
+        PerformLayout();
+        var focusMenuToggleOk = menuUncheckedBefore && menuEnteredFocus && menuCheckedDuring && !FocusMode && CheckVerticalLayout() && !focusResizeGrip.Visible;
+
+        var focusModeReport = new
+        {
+            enterHidesAllOk = focusEnterHidesAllOk,
+            staysAcrossOpsOk = focusStaysAcrossOpsOk,
+            leftPeekOk = focusLeftPeekOk,
+            topPeekOk = focusTopPeekOk,
+            captionInTopPeekOk = focusCaptionInTopPeekOk,
+            peekAnimOk = focusPeekAnimOk,
+            shortcutsOk = focusShortcutsOk,
+            insideChangesOk = focusInsideChangesOk,
+            f11ReturnsOk = focusF11ReturnsOk,
+            restoreAllLayoutsOk = focusRestoreAllLayoutsOk,
+            menuToggleOk = focusMenuToggleOk,
+        };
+
         // #19: Filter list download/ETag/compile, ABP/uBO rules, PSL, cosmetic + #@#, worker dedup, per-site shield UI + persistence, corrupt fallback, benchmark.
         var smokeRootDir = Path.GetDirectoryName(settingsFile)!;
         await filterLists.UpdateNowAsync(settings);
@@ -8082,7 +8930,7 @@ sealed class BrowserWindow : Form
             tabCycle, loadingStop, tabMenuAndNewWindow, findInPage, zoomAndPrint,
             filterEngine = filterEngineReport,
             postClean, blobUrl, permissions, downloads = downloadsReport, processCrash,
-            crashUi, fullscreen = fullscreenReport, collapsibleTabBar,
+            crashUi, fullscreen = fullscreenReport, collapsibleTabBar, focusMode = focusModeReport,
             sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
             rejectsLocalFiles = Resolve("file:///C:/Windows/win.ini") == null && !PageHandoff.Allowed("file:///C:/Windows/win.ini"),
