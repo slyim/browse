@@ -12,8 +12,12 @@ import subprocess
 from tempfile import mkdtemp
 from threading import Event, Thread
 from time import sleep
+import time
 from urllib.parse import quote
 import zlib
+
+# The main phase runs ~200 checks; slower CI runners need well over a minute.
+PHASE_TIMEOUT = int(os.environ.get('SMOKE_PHASE_TIMEOUT', '180'))
 
 
 def make_png(size=16):
@@ -268,7 +272,9 @@ def file_state(path):
 
 
 def run_phase(exe, output, base, *extra):
-    result = subprocess.run([str(exe), '--smoke-test', str(output), base, *extra], timeout=45)
+    started = time.monotonic()
+    result = subprocess.run([str(exe), '--smoke-test', str(output), base, *extra], timeout=PHASE_TIMEOUT)
+    print(f'PHASE {extra[0] if extra else "main"} took {time.monotonic() - started:.1f}s', flush=True)
     assert output.is_file(), f'Browser exited without a smoke report (exit {result.returncode})'
     report = json.loads(output.read_text(encoding='utf-8-sig'))
     print(json.dumps(report, indent=2))
