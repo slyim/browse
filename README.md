@@ -1,6 +1,12 @@
 # browse
 
-Windows port of [Office Commun's Search](https://github.com/driceroland/Search), built with WinForms on .NET 10 and the system Microsoft Edge WebView2 runtime. It does not bundle Chromium, Electron, or .NET.
+Windows port of [Office Commun's Search](https://github.com/driceroland/Search), built with WinForms on .NET 10 and the system Microsoft Edge WebView2 runtime. It does not bundle Chromium, Electron, or .NET, so the download is a single small `browse.exe`.
+
+![browse on Windows 11: sidebar with pinned tiles and tabs, Wikipedia open](docs/screenshot.png)
+
+## Download
+
+Get `browse.exe` from the [latest release](https://github.com/slyim/browse/releases/latest), unzip, and run it. Needs the .NET 10 Desktop Runtime (see below).
 
 ## Requirements
 
@@ -58,6 +64,8 @@ All user data lives under `%LOCALAPPDATA%\SearchWindows\`:
 
 - `WebView\` — WebView2 profile (cookies, cache, site storage)
 - `session.json` — Open and pinned tabs (`url`, `title`, `pinned`), `selected` tab index, and `vertical` (sidebar vs. top strip). It does not store page text, cookies, or form inputs.
+
+Run `browse.exe --profile <folder>` to keep a separate profile (WebView data and `session.json`) in that folder instead.
 
 ## License
 

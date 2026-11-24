@@ -28,6 +28,7 @@ static class Program
         Application.SetColorMode(SystemColorMode.System);
 #pragma warning restore WFO5001
         var profile = smoke ? Path.Combine(smokeDir!, "WebView") :
+            args is ["--profile", var dir] ? Path.Combine(Path.GetFullPath(dir), "WebView") :
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SearchWindows", "WebView");
         using var sessionLock = Session.TryAcquireLock(profile);
         var envTask = CreateEnvironment(profile);
