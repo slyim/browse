@@ -181,859 +181,413 @@ static class SettingsStore
     }
 }
 
-sealed class SettingsDialog : Form
+static class SettingsPage
 {
-    readonly TableLayoutPanel table;
-    readonly List<Label> sectionLabels = [];
-    readonly List<Label> hintLabels = [];
-    readonly ComboBox themeBox;
-    readonly ComboBox layoutBox;
-    readonly CheckBox collapseTabsCheck;
-    readonly CheckBox blockingCheck;
-    readonly CheckBox cleanLinksCheck;
-    readonly CheckBox sleepingCheck;
-    readonly CheckBox autoUpdateCheck;
-    readonly CheckBox shareCheck;
-    readonly Dictionary<string, (CheckBox Check, Label Status)> filterListRows = new(StringComparer.OrdinalIgnoreCase);
-    readonly TableLayoutPanel customListsPanel;
-    readonly TextBox customListUrlBox;
-    readonly Button addCustomListBtn;
-    readonly Label customListErrorHint;
-    readonly Label filterListsHint;
-    readonly Button updateListsBtn;
-    readonly Label defaultBrowserHint;
-    readonly FlowLayoutPanel defaultBrowserButtons;
-    readonly Button makeDefaultBtn;
-    readonly Button removeDefaultBtn;
-    readonly Button clearBtn;
-    readonly Label clearAppsHint;
-    readonly Button clearAppsBtn;
-    readonly Button closeBtn;
-    readonly Label clearHint;
-    readonly Action<AppSettings> onChanged;
-    readonly Func<Task> onClearBrowsingData;
-    readonly Func<bool> isDefaultBrowserRegistered;
-    readonly Action onRegisterDefaultBrowser;
-    readonly Action onUnregisterDefaultBrowser;
-    readonly Func<IReadOnlyList<FilterListStatus>> getFilterListStatuses;
-    readonly Func<Task> onUpdateFilterLists;
-    readonly bool noUpdateCheckFlag;
-    readonly int? dpiOverride;
-    int currentDpi;
-    AppSettings current;
-    bool syncing;
+    public const string DisplayUrl = "browse://settings";
+    public const string InternalHost = "settings.browse.invalid";
+    public const string InternalOrigin = "https://settings.browse.invalid";
+    public const string InternalUrl = "https://settings.browse.invalid/";
+    public const string ResourceName = "SearchPort.SettingsPage.html";
+    public const string ResponseHeaders =
+        "Content-Type: text/html; charset=utf-8\r\n" +
+        "Cache-Control: no-store\r\n" +
+        "X-Content-Type-Options: nosniff\r\n" +
+        "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
-    internal SettingsDialog(
-        AppSettings initial,
-        bool noUpdateCheckFlag,
-        Action<AppSettings> onChanged,
-        Func<Task> onClearBrowsingData,
-        Func<bool>? isDefaultBrowserRegistered = null,
-        Action? onRegisterDefaultBrowser = null,
-        Action? onUnregisterDefaultBrowser = null,
-        Func<IReadOnlyList<FilterListStatus>>? getFilterListStatuses = null,
-        Func<Task>? onUpdateFilterLists = null,
-        int? dpiOverride = null)
+    public static readonly byte[] HtmlBytes = LoadHtmlBytes();
+
+    static byte[] LoadHtmlBytes()
     {
-        current = initial;
-        this.noUpdateCheckFlag = noUpdateCheckFlag;
-        this.onChanged = onChanged;
-        this.onClearBrowsingData = onClearBrowsingData;
-        this.isDefaultBrowserRegistered = isDefaultBrowserRegistered ?? (() => false);
-        this.onRegisterDefaultBrowser = onRegisterDefaultBrowser ?? (() => { });
-        this.onUnregisterDefaultBrowser = onUnregisterDefaultBrowser ?? (() => { });
-        this.getFilterListStatuses = getFilterListStatuses ?? (() => FilterListService.BuiltInLists
-            .Select(d => new FilterListStatus(d.Id, d.Name, d.Url, !(current.DisabledFilterLists ?? []).Contains(d.Id, StringComparer.OrdinalIgnoreCase), false, null, false, null))
-            .ToArray());
-        this.onUpdateFilterLists = onUpdateFilterLists ?? (() => Task.CompletedTask);
-        this.dpiOverride = dpiOverride;
-        currentDpi = dpiOverride ?? DeviceDpi;
-
-        Text = "Settings";
-        AccessibleName = "Settings";
-        AutoScaleMode = AutoScaleMode.Dpi;
-        Font = Theme.FontForDpi(Theme.UiFont, currentDpi);
-        ForeColor = Theme.Ink;
-        BackColor = Theme.Ground;
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
-        MinimizeBox = false;
-        ShowInTaskbar = false;
-        StartPosition = FormStartPosition.CenterParent;
-        KeyPreview = true;
-        Padding = new(S(20), S(16), S(20), S(16));
-
-        table = new TableLayoutPanel
-        {
-            Dock = DockStyle.Top,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            ColumnCount = 2,
-            BackColor = Theme.Ground,
-            Margin = Padding.Empty,
-            Padding = Padding.Empty,
-        };
-        table.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        table.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-
-        var row = 0;
-        void AddSection(string text, bool first = false)
-        {
-            var lbl = new Label
-            {
-                Text = text,
-                Font = Theme.FontForDpi(Theme.SectionFont, currentDpi),
-                ForeColor = Theme.Muted,
-                AutoSize = true,
-                Margin = new(0, first ? 0 : S(4), 0, S(6)),
-                AccessibleName = text,
-            };
-            sectionLabels.Add(lbl);
-            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            table.Controls.Add(lbl, 0, row);
-            table.SetColumnSpan(lbl, 2);
-            row++;
-        }
-
-        void AddDivider()
-        {
-            var line = new Panel
-            {
-                Height = 1,
-                Dock = DockStyle.Fill,
-                BackColor = Theme.Hairline,
-                Margin = new(0, S(10), 0, S(10)),
-            };
-            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            table.Controls.Add(line, 0, row);
-            table.SetColumnSpan(line, 2);
-            row++;
-        }
-
-        ComboBox AddChoiceRow(string labelText, string[] items, string accessibleName, string? hint = null)
-        {
-            var lbl = new Label
-            {
-                Text = labelText,
-                AutoSize = true,
-                Anchor = AnchorStyles.Left,
-                Margin = new(0, S(4), S(12), S(4)),
-            };
-            var box = new ComboBox
-            {
-                DropDownStyle = ComboBoxStyle.DropDownList,
-                Width = S(132),
-                Anchor = AnchorStyles.Right,
-                Margin = new(0, S(2), 0, S(2)),
-                AccessibleName = accessibleName,
-                TabStop = true,
-            };
-            box.Items.AddRange(items);
-            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            table.Controls.Add(lbl, 0, row);
-            table.Controls.Add(box, 1, row);
-            row++;
-
-            if (hint is not null)
-            {
-                var hintLbl = new Label
-                {
-                    Text = hint,
-                    Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-                    ForeColor = Theme.Muted,
-                    AutoSize = true,
-                    Margin = new(0, 0, 0, S(6)),
-                };
-                hintLabels.Add(hintLbl);
-                table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-                table.Controls.Add(hintLbl, 0, row);
-                table.SetColumnSpan(hintLbl, 2);
-                row++;
-            }
-            return box;
-        }
-
-        CheckBox AddToggle(string text, string accessibleName, string? hint = null)
-        {
-            var cb = new CheckBox
-            {
-                Text = text,
-                AutoSize = true,
-                ForeColor = Theme.Ink,
-                BackColor = Theme.Ground,
-                Margin = new(0, S(3), 0, hint is null ? S(4) : S(1)),
-                AccessibleName = accessibleName,
-                TabStop = true,
-            };
-            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            table.Controls.Add(cb, 0, row);
-            table.SetColumnSpan(cb, 2);
-            row++;
-
-            if (hint is not null)
-            {
-                var hintLbl = new Label
-                {
-                    Text = hint,
-                    Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-                    ForeColor = Theme.Muted,
-                    AutoSize = true,
-                    Margin = new(S(20), 0, 0, S(4)),
-                };
-                hintLabels.Add(hintLbl);
-                table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-                table.Controls.Add(hintLbl, 0, row);
-                table.SetColumnSpan(hintLbl, 2);
-                row++;
-            }
-            return cb;
-        }
-
-        AddSection("Appearance", first: true);
-        themeBox = AddChoiceRow("Theme", ["System", "Light", "Dark"], "Theme", "Applies on next launch.");
-        layoutBox = AddChoiceRow("Tab layout", ["Sidebar", "Top tabs"], "Tab layout");
-        collapseTabsCheck = AddToggle("Collapse tab bar", "Collapse tab bar");
-
-        AddDivider();
-        AddSection("Privacy & features");
-        blockingCheck = AddToggle("Ad && tracker blocking", "Ad and tracker blocking");
-        cleanLinksCheck = AddToggle("Clean tracking links", "Clean tracking links");
-        sleepingCheck = AddToggle("Sleep idle background tabs", "Sleep idle background tabs");
-        autoUpdateCheck = AddToggle(
-            "Check for updates automatically",
-            "Check for updates automatically",
-            noUpdateCheckFlag ? "Disabled for this session by --no-update-check." : null);
-        if (noUpdateCheckFlag) autoUpdateCheck.Enabled = false;
-        shareCheck = AddToggle("Show Share button in toolbar", "Show Share button");
-
-        AddDivider();
-        AddSection("Filter lists");
-        foreach (var def in FilterListService.BuiltInLists)
-        {
-            var cb = new CheckBox
-            {
-                Text = def.Name.Replace("&", "&&", StringComparison.Ordinal),
-                AutoSize = true,
-                ForeColor = Theme.Ink,
-                BackColor = Theme.Ground,
-                Anchor = AnchorStyles.Left,
-                Margin = new(0, S(2), S(12), S(2)),
-                AccessibleName = def.Name,
-                TabStop = true,
-            };
-            var statusLbl = new Label
-            {
-                Text = "Not downloaded",
-                Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-                ForeColor = Theme.Muted,
-                AutoSize = true,
-                Anchor = AnchorStyles.Right,
-                Margin = new(0, S(3), 0, S(2)),
-                AccessibleName = $"{def.Name} status",
-            };
-            hintLabels.Add(statusLbl);
-            filterListRows[def.Id] = (cb, statusLbl);
-            table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            table.Controls.Add(cb, 0, row);
-            table.Controls.Add(statusLbl, 1, row);
-            row++;
-        }
-
-        customListsPanel = new TableLayoutPanel
-        {
-            Dock = DockStyle.Fill,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            ColumnCount = 2,
-            BackColor = Theme.Ground,
-            Margin = new(0, S(2), 0, S(2)),
-            Padding = Padding.Empty,
-            Visible = false,
-        };
-        customListsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
-        customListsPanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(customListsPanel, 0, row);
-        table.SetColumnSpan(customListsPanel, 2);
-        row++;
-
-        customListUrlBox = new TextBox
-        {
-            Dock = DockStyle.Fill,
-            PlaceholderText = "https://example.com/filters.txt",
-            Margin = new(0, S(4), S(8), S(2)),
-            AccessibleName = "Custom filter list URL",
-            TabStop = true,
-        };
-        addCustomListBtn = new Button
-        {
-            Text = "Add list",
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Padding = new(S(8), S(2), S(8), S(2)),
-            Anchor = AnchorStyles.Right,
-            Margin = new(0, S(3), 0, S(2)),
-            AccessibleName = "Add custom filter list",
-            TabStop = true,
-        };
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(customListUrlBox, 0, row);
-        table.Controls.Add(addCustomListBtn, 1, row);
-        row++;
-
-        customListErrorHint = new Label
-        {
-            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-            ForeColor = Theme.Muted,
-            AutoSize = true,
-            Margin = new(0, 0, 0, S(4)),
-            Visible = false,
-        };
-        hintLabels.Add(customListErrorHint);
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(customListErrorHint, 0, row);
-        table.SetColumnSpan(customListErrorHint, 2);
-        row++;
-
-        filterListsHint = new Label
-        {
-            Text = "HTTPS lists only. Refreshes automatically every 4 days.",
-            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-            ForeColor = Theme.Muted,
-            AutoSize = true,
-            Anchor = AnchorStyles.Left,
-            Margin = new(0, S(4), S(12), S(2)),
-        };
-        hintLabels.Add(filterListsHint);
-        updateListsBtn = new Button
-        {
-            Text = "Update now",
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Padding = new(S(8), S(2), S(8), S(2)),
-            Anchor = AnchorStyles.Right,
-            Margin = new(0, S(2), 0, S(2)),
-            AccessibleName = "Update filter lists now",
-            TabStop = true,
-        };
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(filterListsHint, 0, row);
-        table.Controls.Add(updateListsBtn, 1, row);
-        row++;
-
-        AddDivider();
-        AddSection("Default browser");
-        defaultBrowserHint = new Label
-        {
-            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-            ForeColor = Theme.Muted,
-            AutoSize = true,
-            Margin = new(0, 0, 0, S(6)),
-        };
-        hintLabels.Add(defaultBrowserHint);
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(defaultBrowserHint, 0, row);
-        table.SetColumnSpan(defaultBrowserHint, 2);
-        row++;
-
-        makeDefaultBtn = new Button
-        {
-            Text = "Make browse available as a default browser",
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Padding = new(S(8), S(2), S(8), S(2)),
-            Margin = new(0, 0, S(8), 0),
-            AccessibleName = "Make browse available as a default browser",
-            TabStop = true,
-        };
-        removeDefaultBtn = new Button
-        {
-            Text = "Remove",
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Padding = new(S(8), S(2), S(8), S(2)),
-            Margin = Padding.Empty,
-            AccessibleName = "Remove default browser registration",
-            TabStop = true,
-        };
-        defaultBrowserButtons = new FlowLayoutPanel
-        {
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            WrapContents = false,
-            FlowDirection = FlowDirection.LeftToRight,
-            BackColor = Theme.Ground,
-            Margin = new(0, S(2), 0, S(2)),
-            Padding = Padding.Empty,
-        };
-        defaultBrowserButtons.Controls.Add(makeDefaultBtn);
-        defaultBrowserButtons.Controls.Add(removeDefaultBtn);
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(defaultBrowserButtons, 0, row);
-        table.SetColumnSpan(defaultBrowserButtons, 2);
-        row++;
-
-        AddDivider();
-        AddSection("Data");
-        clearHint = new Label
-        {
-            Text = "Cookies, cache, history, and site data",
-            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-            ForeColor = Theme.Muted,
-            AutoSize = true,
-            Anchor = AnchorStyles.Left,
-            Margin = new(0, S(4), S(12), S(4)),
-        };
-        hintLabels.Add(clearHint);
-        clearBtn = new Button
-        {
-            Text = "Clear browsing data...",
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Padding = new(S(8), S(2), S(8), S(2)),
-            Anchor = AnchorStyles.Right,
-            Margin = new(0, S(2), 0, S(2)),
-            AccessibleName = "Clear browsing data",
-            TabStop = true,
-        };
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(clearHint, 0, row);
-        table.Controls.Add(clearBtn, 1, row);
-        row++;
-
-        clearAppsHint = new Label
-        {
-            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-            ForeColor = Theme.Muted,
-            AutoSize = true,
-            Anchor = AnchorStyles.Left,
-            Margin = new(0, S(4), S(12), S(4)),
-        };
-        hintLabels.Add(clearAppsHint);
-        clearAppsBtn = new Button
-        {
-            Text = "Clear remembered app permissions",
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            Padding = new(S(8), S(2), S(8), S(2)),
-            Anchor = AnchorStyles.Right,
-            Margin = new(0, S(2), 0, S(2)),
-            AccessibleName = "Clear remembered app permissions",
-            TabStop = true,
-        };
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(clearAppsHint, 0, row);
-        table.Controls.Add(clearAppsBtn, 1, row);
-        row++;
-
-        AddDivider();
-        var aboutText = $"browse {Updater.CurrentVersionText}";
-        var aboutLbl = new Label
-        {
-            Text = aboutText,
-            Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-            ForeColor = Theme.Muted,
-            AutoSize = true,
-            Anchor = AnchorStyles.Left,
-            Margin = new(0, S(6), S(12), S(2)),
-            AccessibleName = $"About {aboutText}",
-        };
-        hintLabels.Add(aboutLbl);
-        closeBtn = new Button
-        {
-            Text = "Close",
-            DialogResult = DialogResult.Cancel,
-            AutoSize = true,
-            AutoSizeMode = AutoSizeMode.GrowAndShrink,
-            MinimumSize = new(S(78), 0),
-            Padding = new(S(8), S(2), S(8), S(2)),
-            Anchor = AnchorStyles.Right,
-            Margin = new(0, S(2), 0, 0),
-            AccessibleName = "Close settings",
-            TabStop = true,
-        };
-        closeBtn.Click += (_, _) => Close();
-        CancelButton = closeBtn;
-        table.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        table.Controls.Add(aboutLbl, 0, row);
-        table.Controls.Add(closeBtn, 1, row);
-
-        Controls.Add(table);
-        SyncFrom(initial);
-        RefreshDefaultBrowserState();
-        RefreshFilterListStatuses();
-
-        themeBox.SelectedIndexChanged += (_, _) => Emit();
-        layoutBox.SelectedIndexChanged += (_, _) => Emit();
-        collapseTabsCheck.CheckedChanged += (_, _) => Emit();
-        blockingCheck.CheckedChanged += (_, _) => Emit();
-        cleanLinksCheck.CheckedChanged += (_, _) => Emit();
-        sleepingCheck.CheckedChanged += (_, _) => Emit();
-        autoUpdateCheck.CheckedChanged += (_, _) => Emit();
-        shareCheck.CheckedChanged += (_, _) => Emit();
-        foreach (var (_, pair) in filterListRows)
-            pair.Check.CheckedChanged += (_, _) => Emit();
-        addCustomListBtn.Click += (_, _) => AddCustomListClicked();
-        customListUrlBox.KeyDown += (_, e) =>
-        {
-            if (e.KeyCode != Keys.Enter) return;
-            e.SuppressKeyPress = true;
-            AddCustomListClicked();
-        };
-        updateListsBtn.Click += async (_, _) => await UpdateListsClickedAsync();
-        makeDefaultBtn.Click += (_, _) => RegisterDefaultBrowserClicked();
-        removeDefaultBtn.Click += (_, _) => UnregisterDefaultBrowserClicked();
-        clearBtn.Click += async (_, _) => await ClearDataClickedAsync();
-        clearAppsBtn.Click += (_, _) => ClearExternalAppsClicked();
-
-        FitClientSize();
+        using var stream = typeof(SettingsPage).Assembly.GetManifestResourceStream(ResourceName)
+            ?? throw new InvalidOperationException($"Missing embedded resource: {ResourceName}");
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        return ms.ToArray();
     }
 
-    int S(int px) => dpiOverride is { } dpi
-        ? (int)Math.Round(px * (dpi / 96.0), MidpointRounding.AwayFromZero)
-        : LogicalToDeviceUnits(px);
-
-    void ApplyFonts(int dpi)
+    public static bool IsSettingsAddress(string? raw)
     {
-        Font = Theme.FontForDpi(Theme.UiFont, dpi);
-        var sectionFont = Theme.FontForDpi(Theme.SectionFont, dpi);
-        foreach (var lbl in sectionLabels) lbl.Font = sectionFont;
-        var hintFont = Theme.FontForDpi(Theme.HintFont, dpi);
-        foreach (var lbl in hintLabels) lbl.Font = hintFont;
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        var text = raw.Trim();
+        return text.Equals(DisplayUrl, StringComparison.OrdinalIgnoreCase)
+            || text.Equals(DisplayUrl + "/", StringComparison.OrdinalIgnoreCase);
     }
 
-    void FitClientSize()
+    public static bool IsSettingsHost(string? host) =>
+        !string.IsNullOrWhiteSpace(host)
+        && string.Equals(host.Trim().TrimEnd('.'), InternalHost, StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsSettingsOrigin(string? uri) =>
+        !string.IsNullOrWhiteSpace(uri)
+        && Uri.TryCreate(uri.Trim(), UriKind.Absolute, out var parsed)
+        && IsSettingsHost(parsed.IdnHost);
+
+    public static bool IsSettingsExactUrl(string? uri)
     {
-        var minWidth = S(420);
-        var pref = table.GetPreferredSize(new Size(minWidth - Padding.Horizontal, 0));
-        var width = Math.Max(minWidth, pref.Width + Padding.Horizontal);
-        table.Width = width - Padding.Horizontal;
-        pref = table.GetPreferredSize(new Size(table.Width, 0));
-        ClientSize = new(width, pref.Height + Padding.Vertical);
+        if (string.IsNullOrWhiteSpace(uri)) return false;
+        if (!Uri.TryCreate(uri.Trim(), UriKind.Absolute, out var parsed)) return false;
+        return parsed.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            && parsed.IsDefaultPort
+            && parsed.UserInfo.Length == 0
+            && IsSettingsHost(parsed.IdnHost)
+            && parsed.AbsolutePath == "/"
+            && string.IsNullOrEmpty(parsed.Query);
     }
 
-    protected override void OnHandleCreated(EventArgs e)
+    public static bool IsSettingsFaviconUrl(string? uri)
     {
-        base.OnHandleCreated(e);
-        if (dpiOverride is null && DeviceDpi != currentDpi)
-        {
-            var factor = (float)DeviceDpi / currentDpi;
-            currentDpi = DeviceDpi;
-            Scale(new SizeF(factor, factor));
-            ApplyFonts(currentDpi);
-            FitClientSize();
-        }
+        if (string.IsNullOrWhiteSpace(uri)) return false;
+        if (!Uri.TryCreate(uri.Trim(), UriKind.Absolute, out var parsed)) return false;
+        return parsed.Scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+            && parsed.IsDefaultPort
+            && parsed.UserInfo.Length == 0
+            && IsSettingsHost(parsed.IdnHost)
+            && parsed.AbsolutePath.Equals("/favicon.ico", StringComparison.OrdinalIgnoreCase);
     }
 
-    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    public static bool IsBlockedExternalReference(string? uri)
     {
-        base.OnDpiChanged(e);
-        if (dpiOverride is not null) return;
-        currentDpi = e.DeviceDpiNew;
-        Padding = new(S(20), S(16), S(20), S(16));
-        themeBox.Width = S(132);
-        layoutBox.Width = S(132);
-        makeDefaultBtn.Padding = new(S(8), S(2), S(8), S(2));
-        makeDefaultBtn.Margin = new(0, 0, S(8), 0);
-        removeDefaultBtn.Padding = new(S(8), S(2), S(8), S(2));
-        addCustomListBtn.Padding = new(S(8), S(2), S(8), S(2));
-        updateListsBtn.Padding = new(S(8), S(2), S(8), S(2));
-        clearBtn.Padding = new(S(8), S(2), S(8), S(2));
-        clearAppsBtn.Padding = new(S(8), S(2), S(8), S(2));
-        closeBtn.MinimumSize = new(S(78), 0);
-        closeBtn.Padding = new(S(8), S(2), S(8), S(2));
-        ApplyFonts(currentDpi);
-        FitClientSize();
+        if (string.IsNullOrWhiteSpace(uri)) return false;
+        var text = uri.Trim();
+        if (text.StartsWith("browse:", StringComparison.OrdinalIgnoreCase)) return true;
+        if (IsSettingsOrigin(text)) return true;
+        if (text.StartsWith("blob:", StringComparison.OrdinalIgnoreCase) && text.Length > 5)
+            return IsSettingsOrigin(text[5..]);
+        return false;
     }
+}
 
-    internal bool VerifyLayoutInsideClient()
+enum SettingsActionKind
+{
+    Ready,
+    SetSetting,
+    ToggleFilterList,
+    AddCustomFilterList,
+    RemoveCustomFilterList,
+    UpdateFilterLists,
+    RegisterDefaultBrowser,
+    UnregisterDefaultBrowser,
+    ClearExternalApps,
+    RemoveExternalApp,
+    ClearBrowsingData,
+    ApplyUpdate,
+}
+
+sealed record SettingsBridgeCommand(
+    SettingsActionKind Kind,
+    string? Key = null,
+    bool? BoolValue = null,
+    ThemePreference? ThemeValue = null,
+    string? TextValue = null);
+
+static class SettingsBridge
+{
+    public const int MaxMessageChars = 16_384;
+
+    static readonly JsonSerializerOptions Json = new()
     {
-        CreateControl();
-        PerformLayout();
-        var client = ClientRectangle;
-        if (client.Width <= 0 || client.Height <= 0 || !client.Contains(table.Bounds)) return false;
-        foreach (Control c in table.Controls)
-        {
-            if (!c.Visible) continue;
-            var r = new Rectangle(table.Left + c.Left, table.Top + c.Top, c.Width, c.Height);
-            if (r.Width <= 0 || r.Height <= 0 || !client.Contains(r)) return false;
-            if (c is FlowLayoutPanel or TableLayoutPanel)
-            {
-                foreach (Control child in c.Controls)
-                {
-                    if (!child.Visible) continue;
-                    var cr = new Rectangle(r.Left + child.Left, r.Top + child.Top, child.Width, child.Height);
-                    if (cr.Width <= 0 || cr.Height <= 0 || !client.Contains(cr)) return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    internal void RefreshFilterListStatuses()
-    {
-        if (IsDisposed) return;
-        var statuses = getFilterListStatuses();
-        var anyUpdating = false;
-        foreach (var st in statuses)
-        {
-            if (st.Updating) anyUpdating = true;
-            if (!st.IsCustom && filterListRows.TryGetValue(st.Id, out var pair))
-                pair.Status.Text = FilterListService.FormatLastUpdated(st.LastUpdatedUtc, st.Updating, st.LastError);
-        }
-        updateListsBtn.Enabled = !anyUpdating;
-        updateListsBtn.Text = anyUpdating ? "Updating..." : "Update now";
-        RebuildCustomLists(statuses);
-        FitClientSize();
-    }
-
-    void RebuildCustomLists(IReadOnlyList<FilterListStatus> statuses)
-    {
-        var custom = statuses.Where(s => s.IsCustom).ToArray();
-        customListsPanel.SuspendLayout();
-        while (customListsPanel.Controls.Count > 0)
-        {
-            var ctrl = customListsPanel.Controls[0];
-            customListsPanel.Controls.RemoveAt(0);
-            ctrl.Dispose();
-        }
-        customListsPanel.RowStyles.Clear();
-        customListsPanel.RowCount = 0;
-
-        for (var i = 0; i < custom.Length; i++)
-        {
-            var item = custom[i];
-            var urlText = item.Name.Length > 42 ? item.Name[..39] + "..." : item.Name;
-            var status = FilterListService.FormatLastUpdated(item.LastUpdatedUtc, item.Updating, item.LastError);
-            var lbl = new Label
-            {
-                Text = $"{urlText} ({status})".Replace("&", "&&", StringComparison.Ordinal),
-                Font = Theme.FontForDpi(Theme.HintFont, currentDpi),
-                ForeColor = Theme.InkSoft,
-                AutoSize = true,
-                Anchor = AnchorStyles.Left,
-                Margin = new(0, S(3), S(8), S(2)),
-            };
-            var urlCopy = item.Url;
-            var remBtn = new Button
-            {
-                Text = "Remove",
-                AutoSize = true,
-                AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                Padding = new(S(6), S(1), S(6), S(1)),
-                Anchor = AnchorStyles.Right,
-                Margin = new(0, S(1), 0, S(1)),
-                AccessibleName = $"Remove {item.Url}",
-                TabStop = true,
-            };
-            remBtn.Click += (_, _) => RemoveCustomListClicked(urlCopy);
-            customListsPanel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            customListsPanel.Controls.Add(lbl, 0, i);
-            customListsPanel.Controls.Add(remBtn, 1, i);
-        }
-        customListsPanel.Visible = custom.Length > 0;
-        customListsPanel.ResumeLayout();
-    }
-
-    void AddCustomListClicked()
-    {
-        var raw = customListUrlBox.Text;
-        if (!FilterListService.IsValidCustomListUrl(raw, out var normalized))
-        {
-            customListErrorHint.Text = "Enter a valid https:// filter list URL.";
-            customListErrorHint.Visible = true;
-            FitClientSize();
-            return;
-        }
-        var existing = current.CustomFilterLists ?? [];
-        if (existing.Contains(normalized, StringComparer.OrdinalIgnoreCase))
-        {
-            customListErrorHint.Text = "That filter list URL is already added.";
-            customListErrorHint.Visible = true;
-            FitClientSize();
-            return;
-        }
-        if (existing.Length >= FilterListService.MaxCustomLists)
-        {
-            customListErrorHint.Text = $"You can add up to {FilterListService.MaxCustomLists} custom lists.";
-            customListErrorHint.Visible = true;
-            FitClientSize();
-            return;
-        }
-        customListUrlBox.Text = "";
-        customListErrorHint.Visible = false;
-        current = current with { CustomFilterLists = [.. existing, normalized] };
-        onChanged(current);
-        RefreshFilterListStatuses();
-    }
-
-    void RemoveCustomListClicked(string url)
-    {
-        var nextCustom = (current.CustomFilterLists ?? [])
-            .Where(u => !string.Equals(u, url, StringComparison.OrdinalIgnoreCase))
-            .ToArray();
-        if (nextCustom.Length == (current.CustomFilterLists?.Length ?? 0)) return;
-        current = current with { CustomFilterLists = nextCustom };
-        onChanged(current);
-        RefreshFilterListStatuses();
-    }
-
-    async Task UpdateListsClickedAsync()
-    {
-        updateListsBtn.Enabled = false;
-        updateListsBtn.Text = "Updating...";
-        try
-        {
-            await onUpdateFilterLists();
-        }
-        catch { }
-        finally
-        {
-            if (!IsDisposed) RefreshFilterListStatuses();
-        }
-    }
-
-    static string FormatExternalAppsHint(int count) => count switch
-    {
-        0 => "No remembered app permissions",
-        1 => "1 remembered app permission",
-        _ => $"{count} remembered app permissions",
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase) },
     };
 
-    void RefreshDefaultBrowserState(string? statusOverride = null)
-    {
-        var registered = isDefaultBrowserRegistered();
-        removeDefaultBtn.Enabled = registered;
-        defaultBrowserHint.Text = statusOverride ?? (registered
-            ? "Registered for this user. Choose browse in Windows Default Apps."
-            : "Register browse for this user, then choose it in Windows Default Apps.");
-    }
+    static readonly HashSet<string> BuiltInFilterIds = new(
+        FilterListService.BuiltInLists.Select(l => l.Id),
+        StringComparer.OrdinalIgnoreCase);
 
-    void RegisterDefaultBrowserClicked()
+    static readonly HashSet<string> BoolSettingKeys = new(StringComparer.Ordinal)
     {
+        "verticalTabs",
+        "tabBarCollapsed",
+        "blockingEnabled",
+        "cleanLinksEnabled",
+        "sleepingTabsEnabled",
+        "autoUpdateCheck",
+        "shareEnabled",
+    };
+
+    public static bool TryParse(string? rawJson, out SettingsBridgeCommand? command)
+    {
+        command = null;
+        if (string.IsNullOrWhiteSpace(rawJson) || rawJson.Length > MaxMessageChars) return false;
         try
         {
-            onRegisterDefaultBrowser();
-            RefreshDefaultBrowserState();
-        }
-        catch (Exception ex)
-        {
-            if (!IsDisposed)
-                MessageBox.Show(this, ex.Message, "Could not register browser", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-    }
+            using var doc = JsonDocument.Parse(rawJson);
+            var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) return false;
+            if (!root.TryGetProperty("type", out var typeEl) || typeEl.ValueKind != JsonValueKind.String)
+                return false;
 
-    void UnregisterDefaultBrowserClicked()
-    {
-        try
-        {
-            onUnregisterDefaultBrowser();
-            RefreshDefaultBrowserState("Default browser registration removed.");
-        }
-        catch (Exception ex)
-        {
-            if (!IsDisposed)
-                MessageBox.Show(this, ex.Message, "Could not remove registration", MessageBoxButtons.OK, MessageBoxIcon.Error);
-        }
-    }
-
-    void ClearExternalAppsClicked()
-    {
-        if (current.AllowedExternalApps.Length == 0) return;
-        current = current with { AllowedExternalApps = [] };
-        onChanged(current);
-        clearAppsBtn.Enabled = false;
-        clearAppsHint.Text = "Remembered app permissions cleared.";
-    }
-
-    internal void SyncFrom(AppSettings next)
-    {
-        syncing = true;
-        try
-        {
-            current = next;
-            themeBox.SelectedIndex = next.Theme switch
+            switch (typeEl.GetString())
             {
-                ThemePreference.Light => 1,
-                ThemePreference.Dark => 2,
-                _ => 0,
-            };
-            layoutBox.SelectedIndex = next.VerticalTabs ? 0 : 1;
-            collapseTabsCheck.Checked = next.TabBarCollapsed;
-            blockingCheck.Checked = next.BlockingEnabled;
-            cleanLinksCheck.Checked = next.CleanLinksEnabled;
-            sleepingCheck.Checked = next.SleepingTabsEnabled;
-            autoUpdateCheck.Checked = !noUpdateCheckFlag && next.AutoUpdateCheck;
-            shareCheck.Checked = next.ShareEnabled;
-            var disabledLists = new HashSet<string>(next.DisabledFilterLists ?? [], StringComparer.OrdinalIgnoreCase);
-            foreach (var (id, pair) in filterListRows)
-                pair.Check.Checked = !disabledLists.Contains(id);
-            var appCount = next.AllowedExternalApps?.Length ?? 0;
-            clearAppsHint.Text = FormatExternalAppsHint(appCount);
-            clearAppsBtn.Enabled = appCount > 0;
-        }
-        finally { syncing = false; }
-    }
+                case "ready":
+                    command = new(SettingsActionKind.Ready);
+                    return true;
 
-    void Emit()
-    {
-        if (syncing) return;
-        var disabledLists = filterListRows
-            .Where(kv => !kv.Value.Check.Checked)
-            .Select(kv => kv.Key)
-            .OrderBy(static x => x, StringComparer.Ordinal)
-            .ToArray();
-        var next = current with
-        {
-            Theme = themeBox.SelectedIndex switch
-            {
-                1 => ThemePreference.Light,
-                2 => ThemePreference.Dark,
-                _ => ThemePreference.System,
-            },
-            VerticalTabs = layoutBox.SelectedIndex == 0,
-            TabBarCollapsed = collapseTabsCheck.Checked,
-            BlockingEnabled = blockingCheck.Checked,
-            CleanLinksEnabled = cleanLinksCheck.Checked,
-            SleepingTabsEnabled = sleepingCheck.Checked,
-            AutoUpdateCheck = noUpdateCheckFlag ? current.AutoUpdateCheck : autoUpdateCheck.Checked,
-            ShareEnabled = shareCheck.Checked,
-            DisabledFilterLists = disabledLists,
-        };
-        if (next == current) return;
-        current = next;
-        onChanged(next);
-    }
+                case "setSetting":
+                {
+                    if (!root.TryGetProperty("key", out var keyEl) || keyEl.ValueKind != JsonValueKind.String)
+                        return false;
+                    if (!root.TryGetProperty("value", out var valEl))
+                        return false;
+                    var key = keyEl.GetString();
+                    if (key == "theme")
+                    {
+                        if (valEl.ValueKind != JsonValueKind.String) return false;
+                        ThemePreference? theme = valEl.GetString() switch
+                        {
+                            "system" => ThemePreference.System,
+                            "light" => ThemePreference.Light,
+                            "dark" => ThemePreference.Dark,
+                            _ => null,
+                        };
+                        if (theme is null) return false;
+                        command = new(SettingsActionKind.SetSetting, Key: key, ThemeValue: theme);
+                        return true;
+                    }
+                    if (key is not null && BoolSettingKeys.Contains(key))
+                    {
+                        if (valEl.ValueKind is not (JsonValueKind.True or JsonValueKind.False)) return false;
+                        command = new(SettingsActionKind.SetSetting, Key: key, BoolValue: valEl.GetBoolean());
+                        return true;
+                    }
+                    return false;
+                }
 
-    async Task ClearDataClickedAsync()
-    {
-        if (MessageBox.Show(this,
-            "Clear cookies, cache, browsing history, and site data for this profile?\n\nOpen sites may sign you out.",
-            "Clear browsing data",
-            MessageBoxButtons.OKCancel,
-            MessageBoxIcon.Warning,
-            MessageBoxDefaultButton.Button2) != DialogResult.OK)
-            return;
+                case "toggleFilterList":
+                {
+                    if (!root.TryGetProperty("id", out var idEl) || idEl.ValueKind != JsonValueKind.String)
+                        return false;
+                    if (!root.TryGetProperty("enabled", out var enEl) || enEl.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                        return false;
+                    var id = idEl.GetString()?.Trim().ToLowerInvariant();
+                    if (string.IsNullOrEmpty(id) || !BuiltInFilterIds.Contains(id)) return false;
+                    command = new(SettingsActionKind.ToggleFilterList, Key: id, BoolValue: enEl.GetBoolean());
+                    return true;
+                }
 
-        clearBtn.Enabled = false;
-        var prevText = clearHint.Text;
-        clearHint.Text = "Clearing browsing data...";
-        try
-        {
-            await onClearBrowsingData();
-            if (!IsDisposed) clearHint.Text = "Browsing data cleared.";
-        }
-        catch (Exception ex)
-        {
-            if (!IsDisposed)
-            {
-                clearHint.Text = prevText;
-                MessageBox.Show(this, ex.Message, "Could not clear browsing data", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                case "addCustomFilterList":
+                {
+                    if (!root.TryGetProperty("url", out var urlEl) || urlEl.ValueKind != JsonValueKind.String)
+                        return false;
+                    var url = urlEl.GetString() ?? "";
+                    if (url.Length > 2048) return false;
+                    command = new(SettingsActionKind.AddCustomFilterList, TextValue: url);
+                    return true;
+                }
+
+                case "removeCustomFilterList":
+                {
+                    if (!root.TryGetProperty("url", out var urlEl) || urlEl.ValueKind != JsonValueKind.String)
+                        return false;
+                    var url = urlEl.GetString();
+                    if (string.IsNullOrWhiteSpace(url) || url.Length > 2048) return false;
+                    command = new(SettingsActionKind.RemoveCustomFilterList, TextValue: url);
+                    return true;
+                }
+
+                case "updateFilterLists":
+                    command = new(SettingsActionKind.UpdateFilterLists);
+                    return true;
+
+                case "registerDefaultBrowser":
+                    command = new(SettingsActionKind.RegisterDefaultBrowser);
+                    return true;
+
+                case "unregisterDefaultBrowser":
+                    command = new(SettingsActionKind.UnregisterDefaultBrowser);
+                    return true;
+
+                case "clearExternalApps":
+                    command = new(SettingsActionKind.ClearExternalApps);
+                    return true;
+                case "removeExternalApp":
+                {
+                    if (!root.TryGetProperty("site", out var siteEl) || siteEl.ValueKind != JsonValueKind.String
+                        || !root.TryGetProperty("scheme", out var schemeEl) || schemeEl.ValueKind != JsonValueKind.String)
+                        return false;
+                    var site = siteEl.GetString();
+                    var scheme = schemeEl.GetString();
+                    if (string.IsNullOrWhiteSpace(site) || site.Length > 2048 || string.IsNullOrWhiteSpace(scheme) || scheme.Length > 64)
+                        return false;
+                    command = new(SettingsActionKind.RemoveExternalApp, Key: scheme, TextValue: site);
+                    return true;
+                }
+
+                case "clearBrowsingData":
+                {
+                    if (!root.TryGetProperty("confirmed", out var confEl) || confEl.ValueKind != JsonValueKind.True)
+                        return false;
+                    command = new(SettingsActionKind.ClearBrowsingData, BoolValue: true);
+                    return true;
+                }
+
+                case "applyUpdate":
+                    command = new(SettingsActionKind.ApplyUpdate);
+                    return true;
+
+                default:
+                    return false;
             }
         }
-        finally
+        catch
         {
-            if (!IsDisposed && !clearBtn.IsDisposed) clearBtn.Enabled = true;
+            return false;
         }
+    }
+
+    public static bool TryApply(AppSettings current, SettingsBridgeCommand cmd, bool noUpdateCheckFlag, out AppSettings next)
+    {
+        next = current;
+        if (cmd.Kind == SettingsActionKind.SetSetting)
+        {
+            switch (cmd.Key)
+            {
+                case "theme" when cmd.ThemeValue is { } theme:
+                    next = current with { Theme = theme };
+                    return true;
+                case "verticalTabs" when cmd.BoolValue is { } v:
+                    next = current with { VerticalTabs = v };
+                    return true;
+                case "tabBarCollapsed" when cmd.BoolValue is { } v:
+                    next = current with { TabBarCollapsed = v };
+                    return true;
+                case "blockingEnabled" when cmd.BoolValue is { } v:
+                    next = current with { BlockingEnabled = v };
+                    return true;
+                case "cleanLinksEnabled" when cmd.BoolValue is { } v:
+                    next = current with { CleanLinksEnabled = v };
+                    return true;
+                case "sleepingTabsEnabled" when cmd.BoolValue is { } v:
+                    next = current with { SleepingTabsEnabled = v };
+                    return true;
+                case "autoUpdateCheck" when cmd.BoolValue is { } v:
+                    if (noUpdateCheckFlag) return false;
+                    next = current with { AutoUpdateCheck = v };
+                    return true;
+                case "shareEnabled" when cmd.BoolValue is { } v:
+                    next = current with { ShareEnabled = v };
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        if (cmd.Kind == SettingsActionKind.ToggleFilterList && cmd.Key is { } id && cmd.BoolValue is { } enabled)
+        {
+            var disabled = new HashSet<string>(current.DisabledFilterLists ?? [], StringComparer.OrdinalIgnoreCase);
+            if (enabled) disabled.Remove(id);
+            else disabled.Add(id);
+            next = current with { DisabledFilterLists = FilterListService.NormalizeDisabledLists(disabled) };
+            return true;
+        }
+
+        return false;
+    }
+
+    public static string SerializeState(
+        AppSettings settings,
+        ThemePalette theme,
+        IReadOnlyList<FilterListStatus> filterLists,
+        bool defaultBrowserRegistered,
+        bool noUpdateCheckFlag,
+        string version,
+        string? availableUpdateVersion)
+    {
+        var anyUpdating = filterLists.Any(f => f.Updating);
+        var lists = filterLists.Select(f => new
+        {
+            id = f.Id,
+            name = f.Name,
+            url = f.Url,
+            enabled = f.Enabled,
+            isCustom = f.IsCustom,
+            statusText = FilterListService.FormatLastUpdated(f.LastUpdatedUtc, f.Updating, f.LastError),
+            hasError = !f.Updating && f.LastUpdatedUtc is null && !string.IsNullOrEmpty(f.LastError),
+        }).ToArray();
+
+        return JsonSerializer.Serialize(new
+        {
+            type = "state",
+            settings,
+            theme,
+            filterLists = lists,
+            anyFilterListUpdating = anyUpdating,
+            defaultBrowserRegistered,
+            noUpdateCheckFlag,
+            version,
+            availableUpdateVersion,
+        }, Json);
+    }
+
+    public static string SerializeNotice(string scope, string kind, string message) =>
+        JsonSerializer.Serialize(new { type = "notice", scope, kind, message }, Json);
+
+    public static bool SelfCheck()
+    {
+        if (!SettingsPage.IsSettingsAddress("browse://settings")
+            || !SettingsPage.IsSettingsAddress(" BROWSE://SETTINGS/ ")
+            || SettingsPage.IsSettingsAddress("edge://settings")
+            || SettingsPage.IsSettingsAddress("https://settings.browse.invalid/"))
+            return false;
+
+        if (!SettingsPage.IsSettingsExactUrl("https://settings.browse.invalid/")
+            || !SettingsPage.IsSettingsExactUrl("https://settings.browse.invalid/#privacy")
+            || SettingsPage.IsSettingsExactUrl("https://settings.browse.invalid/other")
+            || SettingsPage.IsSettingsExactUrl("https://settings.browse.invalid/?q=1")
+            || SettingsPage.IsSettingsExactUrl("http://settings.browse.invalid/")
+            || SettingsPage.IsSettingsExactUrl("https://settings.browse.invalid:8443/"))
+            return false;
+
+        if (!SettingsPage.IsBlockedExternalReference("browse://settings")
+            || !SettingsPage.IsBlockedExternalReference("https://settings.browse.invalid/")
+            || !SettingsPage.IsBlockedExternalReference("blob:https://settings.browse.invalid/123")
+            || SettingsPage.IsBlockedExternalReference("https://example.com/"))
+            return false;
+
+        // Valid commands parse cleanly
+        if (!TryParse("""{"type":"ready"}""", out var readyCmd) || readyCmd?.Kind != SettingsActionKind.Ready) return false;
+        if (!TryParse("""{"type":"setSetting","key":"theme","value":"dark"}""", out var themeCmd)
+            || themeCmd?.ThemeValue != ThemePreference.Dark) return false;
+        if (!TryParse("""{"type":"setSetting","key":"verticalTabs","value":false}""", out var vertCmd)
+            || vertCmd?.BoolValue != false) return false;
+        if (!TryParse("""{"type":"toggleFilterList","id":"EasyList","enabled":false}""", out var flCmd)
+            || flCmd?.Key != "easylist" || flCmd.BoolValue != false) return false;
+        if (!TryParse("""{"type":"clearBrowsingData","confirmed":true}""", out var clearCmd)
+            || clearCmd?.Kind != SettingsActionKind.ClearBrowsingData) return false;
+
+        // Invalid/malicious messages must be rejected
+        string[] invalid =
+        [
+            "",
+            "{bad json",
+            "[]",
+            "\"string\"",
+            """{}""",
+            """{"type":"execShell"}""",
+            """{"type":"setSetting","key":"unknownKey","value":true}""",
+            """{"type":"setSetting","key":"theme","value":"neon"}""",
+            """{"type":"setSetting","key":"theme","value":1}""",
+            """{"type":"setSetting","key":"verticalTabs","value":"false"}""",
+            """{"type":"setSetting","key":"blockingEnabled","value":0}""",
+            """{"type":"toggleFilterList","id":"not-a-list","enabled":false}""",
+            """{"type":"toggleFilterList","id":"easylist","enabled":"no"}""",
+            """{"type":"addCustomFilterList","url":123}""",
+            """{"type":"removeCustomFilterList","url":""}""",
+            """{"type":"clearBrowsingData"}""",
+            """{"type":"clearBrowsingData","confirmed":false}""",
+            """{"type":"clearBrowsingData","confirmed":"true"}""",
+            "{\"type\":\"addCustomFilterList\",\"url\":\"" + new string('a', 3000) + "\"}",
+        ];
+        foreach (var bad in invalid)
+            if (TryParse(bad, out _)) return false;
+
+        // Apply check including --no-update-check guard
+        var s0 = new AppSettings();
+        if (!TryApply(s0, themeCmd!, noUpdateCheckFlag: false, out var s1) || s1.Theme != ThemePreference.Dark) return false;
+        if (!TryParse("""{"type":"setSetting","key":"autoUpdateCheck","value":false}""", out var updCmd)) return false;
+        if (TryApply(s0, updCmd!, noUpdateCheckFlag: true, out _)) return false;
+        if (!TryApply(s0, updCmd!, noUpdateCheckFlag: false, out var s2) || s2.AutoUpdateCheck) return false;
+
+        return SettingsPage.HtmlBytes.Length > 1000;
     }
 }

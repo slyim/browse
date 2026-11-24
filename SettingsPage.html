@@ -1,0 +1,1285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Settings</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --ground: #ffffff;
+    --frame: #f4f4f4;
+    --ink: #171717;
+    --ink-soft: #4d4d4d;
+    --muted: #666666;
+    --faint: #d4d4d4;
+    --hairline: #e8e8e8;
+    --surface: #f7f7f7;
+    --surface-hover: #e9e9e9;
+    --surface-active: #e4e4e4;
+    --accent: #2563eb;
+    --accent-fg: #ffffff;
+    --accent-soft: rgba(37, 99, 235, 0.10);
+    --danger: #c42b1c;
+    --danger-soft: rgba(196, 43, 28, 0.09);
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-pill: 999px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #1c1c1c;
+      --frame: #131313;
+      --ink: #ededed;
+      --ink-soft: #c2c2c2;
+      --muted: #949494;
+      --faint: #525252;
+      --hairline: #333333;
+      --surface: #222222;
+      --surface-hover: #282828;
+      --surface-active: #303030;
+      --accent: #6ba4ff;
+      --accent-fg: #0f172a;
+      --accent-soft: rgba(107, 164, 255, 0.16);
+      --danger: #f87171;
+      --danger-soft: rgba(248, 113, 113, 0.14);
+    }
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: 'Segoe UI Variable', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    scrollbar-color: var(--faint) transparent;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: var(--ground);
+    color: var(--ink);
+    caret-color: var(--accent);
+  }
+
+  ::selection {
+    background: var(--accent-soft);
+    color: var(--ink);
+  }
+
+  a {
+    color: var(--accent);
+    text-underline-offset: 3px;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .shell {
+    display: grid;
+    grid-template-columns: 204px minmax(0, 660px);
+    justify-content: center;
+    gap: 36px;
+    padding: 36px 28px 72px;
+    max-width: 980px;
+    margin: 0 auto;
+  }
+
+  .sidebar {
+    position: sticky;
+    top: 36px;
+    align-self: start;
+  }
+
+  .page-title {
+    margin: 0 0 18px 10px;
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    color: var(--ink);
+  }
+
+  .nav-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .nav-link {
+    display: block;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    color: var(--ink-soft);
+    text-decoration: none;
+    font-size: 13.5px;
+    font-weight: 500;
+    transition: background-color 140ms ease, color 140ms ease;
+  }
+
+  .nav-link:hover {
+    background: var(--surface-hover);
+    color: var(--ink);
+  }
+
+  .nav-link[aria-current="location"] {
+    background: var(--surface-active);
+    color: var(--ink);
+  }
+
+  .content {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }
+
+  .section {
+    scroll-margin-top: 24px;
+  }
+
+  .section-heading {
+    margin: 0 0 10px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.01em;
+  }
+
+  .group {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 13px 16px;
+  }
+
+  .row + .row {
+    border-top: 1px solid var(--hairline);
+  }
+
+  .row-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 13px 16px;
+  }
+
+  .row-stack + .row,
+  .row + .row-stack,
+  .row-stack + .row-stack {
+    border-top: 1px solid var(--hairline);
+  }
+
+  .row-text {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .row-label {
+    display: block;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--ink);
+  }
+
+  .row-hint {
+    margin: 2px 0 0;
+    font-size: 12.5px;
+    color: var(--muted);
+    max-width: 58ch;
+  }
+
+  .row-meta {
+    font-size: 12.5px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .row-control {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Segmented radio group */
+  .segmented {
+    border: 0;
+    margin: 0;
+    padding: 2px;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    background: var(--ground);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+  }
+
+  .segmented legend {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+  }
+
+  .segmented label {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .segmented input {
+    position: absolute;
+    opacity: 0;
+    width: 1px;
+    height: 1px;
+    margin: 0;
+  }
+
+  .segmented span {
+    display: inline-block;
+    padding: 4px 11px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--ink-soft);
+    transition: background-color 140ms ease, color 140ms ease;
+  }
+
+  .segmented label:hover span {
+    color: var(--ink);
+    background: var(--surface-hover);
+  }
+
+  .segmented input:checked + span {
+    background: var(--surface-active);
+    color: var(--ink);
+  }
+
+  .segmented input:focus-visible + span {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  /* Toggle switch */
+  .switch {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    cursor: pointer;
+  }
+
+  .switch input {
+    appearance: none;
+    -webkit-appearance: none;
+    margin: 0;
+    width: 38px;
+    height: 22px;
+    border-radius: var(--radius-pill);
+    background: var(--surface-active);
+    border: 1px solid var(--faint);
+    position: relative;
+    cursor: pointer;
+    transition: background-color 150ms ease, border-color 150ms ease;
+  }
+
+  .switch input::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--ink-soft);
+    transition: transform 150ms ease, background-color 150ms ease;
+  }
+
+  .switch input:hover:not(:disabled) {
+    border-color: var(--muted);
+  }
+
+  .switch input:checked {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .switch input:checked::after {
+    transform: translateX(16px);
+    background: var(--accent-fg);
+  }
+
+  .switch input:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  /* Buttons */
+  .btn {
+    appearance: none;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.25;
+    padding: 7px 13px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--hairline);
+    background: var(--ground);
+    color: var(--ink);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease;
+  }
+
+  .btn:hover:not(:disabled) {
+    background: var(--surface-hover);
+    border-color: var(--faint);
+  }
+
+  .btn:active:not(:disabled) {
+    background: var(--surface-active);
+  }
+
+  .btn:disabled {
+    opacity: 0.48;
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.06);
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .btn-danger {
+    color: var(--danger);
+    border-color: var(--hairline);
+    background: var(--ground);
+  }
+
+  .btn-danger:hover:not(:disabled) {
+    background: var(--danger-soft);
+    border-color: var(--danger);
+  }
+
+  .btn-danger-solid {
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #ffffff;
+  }
+
+  .btn-danger-solid:hover:not(:disabled) {
+    filter: brightness(1.06);
+    background: var(--danger);
+    border-color: var(--danger);
+  }
+
+  .btn-sm {
+    padding: 4px 10px;
+    font-size: 12.5px;
+  }
+
+  .btn-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+
+  /* Text input */
+  .url-form {
+    display: flex;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .text-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    font: inherit;
+    font-size: 13px;
+    padding: 7px 10px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--hairline);
+    background: var(--ground);
+    color: var(--ink);
+    transition: border-color 140ms ease;
+  }
+
+  .text-input::placeholder {
+    color: var(--muted);
+  }
+
+  .text-input:hover {
+    border-color: var(--faint);
+  }
+
+  .text-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft);
+  }
+
+  /* Sub-lists */
+  .sub-header {
+    padding: 10px 16px 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--muted);
+    border-top: 1px solid var(--hairline);
+  }
+
+  .filter-list-rows {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .filter-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 16px;
+    border-top: 1px solid var(--hairline);
+  }
+
+  .filter-row:first-child {
+    border-top: 0;
+  }
+
+  .filter-main {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .filter-name {
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .filter-status {
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .filter-status.is-error {
+    color: var(--danger);
+  }
+
+  .custom-list-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 0;
+  }
+
+  .custom-list-item + .custom-list-item {
+    border-top: 1px solid var(--hairline);
+  }
+
+  .custom-list-url {
+    min-width: 0;
+    flex: 1 1 auto;
+  }
+
+  .custom-list-name {
+    font-size: 13px;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .perm-list {
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .perm-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    font-size: 12.5px;
+    color: var(--ink-soft);
+    padding: 5px 10px;
+    border-radius: var(--radius-sm);
+    background: var(--ground);
+    border: 1px solid var(--hairline);
+  }
+
+  .perm-scheme {
+    margin-left: auto;
+    font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  /* Inline confirmation & notices */
+  .notice {
+    margin: 0;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+
+  .notice.is-error {
+    color: var(--danger);
+  }
+
+  .confirm-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 12px 14px;
+    border-radius: var(--radius-sm);
+    background: var(--danger-soft);
+    border: 1px solid var(--danger);
+  }
+
+  .confirm-bar p {
+    margin: 0;
+    font-size: 13px;
+    color: var(--ink);
+    max-width: 50ch;
+  }
+
+  .version-line {
+    font-variant-numeric: tabular-nums;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--ink);
+  }
+
+  [hidden] { display: none !important; }
+
+  @media (max-width: 780px) {
+    .shell {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 20px;
+      padding: 20px 16px 48px;
+    }
+
+    .sidebar {
+      position: static;
+    }
+
+    .page-title {
+      margin: 0 0 12px 2px;
+    }
+
+    .nav-list {
+      flex-direction: row;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .row {
+      flex-wrap: wrap;
+    }
+
+    .confirm-bar {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after { transition-duration: 0.01ms !important; }
+  }
+</style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar" aria-label="Settings sections">
+      <h1 class="page-title">Settings</h1>
+      <nav>
+        <ul class="nav-list" id="section-nav">
+          <li><a class="nav-link" href="#appearance" aria-current="location">Appearance</a></li>
+          <li><a class="nav-link" href="#tabs">Tabs</a></li>
+          <li><a class="nav-link" href="#privacy">Privacy &amp; blocking</a></li>
+          <li><a class="nav-link" href="#downloads-apps">Downloads &amp; apps</a></li>
+          <li><a class="nav-link" href="#system">System</a></li>
+          <li><a class="nav-link" href="#clear-data">Clear data</a></li>
+          <li><a class="nav-link" href="#about">About</a></li>
+        </ul>
+      </nav>
+    </aside>
+
+    <main class="content">
+      <section class="section" id="appearance" aria-labelledby="heading-appearance">
+        <h2 class="section-heading" id="heading-appearance">Appearance</h2>
+        <div class="group">
+          <div class="row">
+            <div class="row-text">
+              <span class="row-label" id="label-theme">Theme</span>
+              <p class="row-hint">Applies immediately to web content; window chrome updates on next launch.</p>
+            </div>
+            <div class="row-control">
+              <fieldset class="segmented" aria-labelledby="label-theme">
+                <legend>Theme</legend>
+                <label><input type="radio" name="theme" value="system"><span>System</span></label>
+                <label><input type="radio" name="theme" value="light"><span>Light</span></label>
+                <label><input type="radio" name="theme" value="dark"><span>Dark</span></label>
+              </fieldset>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-text">
+              <label class="row-label" for="opt-share">Show Share button in toolbar</label>
+              <p class="row-hint">One-time read-only text snapshot handoff for local agents.</p>
+            </div>
+            <span class="switch">
+              <input id="opt-share" type="checkbox" role="switch" aria-label="Show Share button in toolbar">
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="tabs" aria-labelledby="heading-tabs">
+        <h2 class="section-heading" id="heading-tabs">Tabs</h2>
+        <div class="group">
+          <div class="row">
+            <div class="row-text">
+              <span class="row-label" id="label-layout">Tab layout</span>
+              <p class="row-hint">Switch between the vertical sidebar and top tab strip (Ctrl+Shift+S).</p>
+            </div>
+            <div class="row-control">
+              <fieldset class="segmented" aria-labelledby="label-layout">
+                <legend>Tab layout</legend>
+                <label><input type="radio" name="tabLayout" value="sidebar"><span>Sidebar</span></label>
+                <label><input type="radio" name="tabLayout" value="top"><span>Top tabs</span></label>
+              </fieldset>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-text">
+              <label class="row-label" for="opt-collapse">Collapse tab bar</label>
+              <p class="row-hint">Show a narrow icon rail in sidebar mode or compact title in top tabs (Ctrl+Shift+B).</p>
+            </div>
+            <span class="switch">
+              <input id="opt-collapse" type="checkbox" role="switch" aria-label="Collapse tab bar">
+            </span>
+          </div>
+
+          <div class="row">
+            <div class="row-text">
+              <label class="row-label" for="opt-sleep">Sleep idle background tabs</label>
+              <p class="row-hint">Suspend inactive background tabs after 5 minutes to reduce memory use.</p>
+            </div>
+            <span class="switch">
+              <input id="opt-sleep" type="checkbox" role="switch" aria-label="Sleep idle background tabs">
+            </span>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="privacy" aria-labelledby="heading-privacy">
+        <h2 class="section-heading" id="heading-privacy">Privacy &amp; blocking</h2>
+        <div class="group">
+          <div class="row">
+            <div class="row-text">
+              <label class="row-label" for="opt-blocking">Ad &amp; tracker blocking</label>
+              <p class="row-hint">Block third-party ad and tracking requests and hide matching page elements.</p>
+            </div>
+            <span class="switch">
+              <input id="opt-blocking" type="checkbox" role="switch" aria-label="Ad and tracker blocking">
+            </span>
+          </div>
+
+          <div class="row">
+            <div class="row-text">
+              <label class="row-label" for="opt-clean-links">Clean tracking links</label>
+              <p class="row-hint">Strip utm_*, fbclid, and similar tracking parameters before loading pages.</p>
+            </div>
+            <span class="switch">
+              <input id="opt-clean-links" type="checkbox" role="switch" aria-label="Clean tracking links">
+            </span>
+          </div>
+
+          <div class="sub-header">Filter lists</div>
+          <div class="filter-list-rows" id="builtin-filter-lists"></div>
+
+          <div class="row-stack" id="custom-lists-wrap" hidden>
+            <div id="custom-filter-lists"></div>
+          </div>
+
+          <div class="row-stack">
+            <form class="url-form" id="custom-list-form" novalidate>
+              <input class="text-input" id="custom-list-url" type="url" placeholder="https://example.com/filters.txt" aria-label="Custom filter list URL" autocomplete="off" spellcheck="false">
+              <button class="btn" type="submit" id="add-custom-list-btn">Add list</button>
+            </form>
+            <p class="notice is-error" id="custom-list-notice" role="status" hidden></p>
+          </div>
+
+          <div class="row">
+            <div class="row-text">
+              <p class="row-hint" style="margin:0">HTTPS lists only. Refreshes automatically every 4 days.</p>
+            </div>
+            <div class="row-control">
+              <button class="btn" type="button" id="update-lists-btn">Update now</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="downloads-apps" aria-labelledby="heading-downloads-apps">
+        <h2 class="section-heading" id="heading-downloads-apps">Downloads &amp; apps</h2>
+        <div class="group">
+          <div class="row">
+            <div class="row-text">
+              <span class="row-label">Downloads</span>
+              <p class="row-hint">Executable and script downloads always ask before saving. Open recent downloads with Ctrl+J.</p>
+            </div>
+          </div>
+
+          <div class="row-stack">
+            <div class="row" style="padding:0;border:0">
+              <div class="row-text">
+                <span class="row-label">External app permissions</span>
+                <p class="row-hint" id="external-apps-hint">No remembered app permissions</p>
+              </div>
+              <div class="row-control">
+                <button class="btn" type="button" id="clear-apps-btn" disabled>Clear remembered app permissions</button>
+              </div>
+            </div>
+            <ul class="perm-list" id="external-apps-list" hidden></ul>
+            <p class="notice" id="external-apps-notice" role="status" hidden></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="system" aria-labelledby="heading-system">
+        <h2 class="section-heading" id="heading-system">System</h2>
+        <div class="group">
+          <div class="row-stack">
+            <div class="row-text">
+              <span class="row-label">Default browser</span>
+              <p class="row-hint" id="default-browser-hint">Register browse for this user, then choose it in Windows Default Apps.</p>
+            </div>
+            <div class="btn-row">
+              <button class="btn" type="button" id="make-default-btn">Make browse available as a default browser</button>
+              <button class="btn" type="button" id="remove-default-btn" disabled>Remove</button>
+            </div>
+            <p class="notice" id="default-browser-notice" role="status" hidden></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="clear-data" aria-labelledby="heading-clear-data">
+        <h2 class="section-heading" id="heading-clear-data">Clear data</h2>
+        <div class="group">
+          <div class="row-stack">
+            <div class="row" style="padding:0;border:0">
+              <div class="row-text">
+                <span class="row-label">Browsing data</span>
+                <p class="row-hint" id="clear-data-hint">Cookies, cache, history, and site data</p>
+              </div>
+              <div class="row-control">
+                <button class="btn btn-danger" type="button" id="clear-data-btn">Clear browsing data...</button>
+              </div>
+            </div>
+
+            <div class="confirm-bar" id="clear-data-confirm" role="alertdialog" aria-labelledby="clear-confirm-text" hidden>
+              <p id="clear-confirm-text">Clear cookies, cache, browsing history, and site data for this profile? Open sites may sign you out.</p>
+              <div class="btn-row">
+                <button class="btn" type="button" id="clear-cancel-btn">Cancel</button>
+                <button class="btn btn-danger-solid" type="button" id="clear-confirm-btn">Clear data</button>
+              </div>
+            </div>
+
+            <p class="notice" id="clear-data-notice" role="status" hidden></p>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="about" aria-labelledby="heading-about">
+        <h2 class="section-heading" id="heading-about">About</h2>
+        <div class="group">
+          <div class="row">
+            <div class="row-text">
+              <span class="version-line" id="about-version">browse</span>
+              <p class="row-hint" id="about-update-hint">Small Windows web browser.</p>
+            </div>
+            <div class="row-control">
+              <button class="btn btn-primary" type="button" id="apply-update-btn" hidden>Install update</button>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-text">
+              <label class="row-label" for="opt-auto-update">Check for updates automatically</label>
+              <p class="row-hint" id="auto-update-hint">Checks GitHub releases once per day.</p>
+            </div>
+            <span class="switch">
+              <input id="opt-auto-update" type="checkbox" role="switch" aria-label="Check for updates automatically">
+            </span>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+<script>
+(() => {
+  'use strict';
+
+  const bridge = window.chrome && window.chrome.webview;
+  const send = (msg) => {
+    if (bridge && typeof bridge.postMessage === 'function') {
+      bridge.postMessage(msg);
+    }
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  const els = {
+    themeRadios: Array.from(document.querySelectorAll('input[name="theme"]')),
+    layoutRadios: Array.from(document.querySelectorAll('input[name="tabLayout"]')),
+    share: $('opt-share'),
+    collapse: $('opt-collapse'),
+    sleep: $('opt-sleep'),
+    blocking: $('opt-blocking'),
+    cleanLinks: $('opt-clean-links'),
+    autoUpdate: $('opt-auto-update'),
+    autoUpdateHint: $('auto-update-hint'),
+    builtinLists: $('builtin-filter-lists'),
+    customListsWrap: $('custom-lists-wrap'),
+    customLists: $('custom-filter-lists'),
+    customForm: $('custom-list-form'),
+    customInput: $('custom-list-url'),
+    customNotice: $('custom-list-notice'),
+    updateListsBtn: $('update-lists-btn'),
+    appsHint: $('external-apps-hint'),
+    appsList: $('external-apps-list'),
+    appsNotice: $('external-apps-notice'),
+    clearAppsBtn: $('clear-apps-btn'),
+    defaultHint: $('default-browser-hint'),
+    defaultNotice: $('default-browser-notice'),
+    makeDefaultBtn: $('make-default-btn'),
+    removeDefaultBtn: $('remove-default-btn'),
+    clearDataHint: $('clear-data-hint'),
+    clearDataBtn: $('clear-data-btn'),
+    clearConfirmBar: $('clear-data-confirm'),
+    clearCancelBtn: $('clear-cancel-btn'),
+    clearConfirmBtn: $('clear-confirm-btn'),
+    clearDataNotice: $('clear-data-notice'),
+    aboutVersion: $('about-version'),
+    aboutUpdateHint: $('about-update-hint'),
+    applyUpdateBtn: $('apply-update-btn'),
+    navLinks: Array.from(document.querySelectorAll('#section-nav .nav-link')),
+  };
+
+  const builtinRowCache = new Map();
+  let syncing = false;
+  let clearingData = false;
+
+  function applyTheme(theme) {
+    if (!theme || typeof theme !== 'object') return;
+    const root = document.documentElement;
+    const dark = Boolean(theme.dark);
+    root.dataset.theme = dark ? 'dark' : 'light';
+    root.style.colorScheme = dark ? 'dark' : 'light';
+    const map = {
+      '--ground': theme.ground,
+      '--frame': theme.frame,
+      '--ink': theme.ink,
+      '--ink-soft': theme.inkSoft,
+      '--muted': theme.muted,
+      '--faint': theme.faint,
+      '--hairline': theme.hairline,
+      '--surface': theme.surface,
+      '--surface-hover': theme.surfaceHover,
+      '--surface-active': theme.surfaceActive,
+      '--accent': theme.accent,
+      '--accent-fg': theme.accentFg,
+      '--accent-soft': theme.accentSoft,
+      '--danger': theme.danger,
+      '--danger-soft': theme.dangerSoft,
+    };
+    for (const [k, v] of Object.entries(map)) {
+      if (typeof v === 'string' && v.length > 0) root.style.setProperty(k, v);
+    }
+  }
+
+  function showNotice(el, message, isError) {
+    if (!message) {
+      el.textContent = '';
+      el.hidden = true;
+      el.classList.remove('is-error');
+      return;
+    }
+    el.textContent = message;
+    el.classList.toggle('is-error', Boolean(isError));
+    el.hidden = false;
+  }
+
+  function renderBuiltInLists(lists) {
+    const seen = new Set();
+    for (const item of lists) {
+      if (item.isCustom) continue;
+      seen.add(item.id);
+      let entry = builtinRowCache.get(item.id);
+      if (!entry) {
+        const row = document.createElement('div');
+        row.className = 'filter-row';
+
+        const main = document.createElement('div');
+        main.className = 'filter-main';
+
+        const label = document.createElement('label');
+        label.className = 'filter-name';
+        const inputId = 'fl-' + item.id;
+        label.htmlFor = inputId;
+        label.textContent = item.name;
+
+        const status = document.createElement('div');
+        status.className = 'filter-status';
+
+        main.appendChild(label);
+        main.appendChild(status);
+
+        const sw = document.createElement('span');
+        sw.className = 'switch';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.id = inputId;
+        cb.setAttribute('role', 'switch');
+        cb.setAttribute('aria-label', item.name);
+        cb.addEventListener('change', () => {
+          if (syncing) return;
+          send({ type: 'toggleFilterList', id: item.id, enabled: cb.checked });
+        });
+        sw.appendChild(cb);
+
+        row.appendChild(main);
+        row.appendChild(sw);
+        els.builtinLists.appendChild(row);
+        entry = { row, cb, status };
+        builtinRowCache.set(item.id, entry);
+      }
+      entry.cb.checked = Boolean(item.enabled);
+      entry.status.textContent = item.statusText || '';
+      entry.status.classList.toggle('is-error', Boolean(item.hasError));
+    }
+  }
+
+  function renderCustomLists(lists) {
+    const custom = lists.filter((x) => x.isCustom);
+    els.customLists.textContent = '';
+    els.customListsWrap.hidden = custom.length === 0;
+    for (const item of custom) {
+      const row = document.createElement('div');
+      row.className = 'custom-list-item';
+
+      const info = document.createElement('div');
+      info.className = 'custom-list-url';
+
+      const name = document.createElement('div');
+      name.className = 'custom-list-name';
+      name.textContent = item.name;
+      name.title = item.url;
+
+      const status = document.createElement('div');
+      status.className = 'filter-status';
+      status.textContent = item.statusText || '';
+      status.classList.toggle('is-error', Boolean(item.hasError));
+
+      info.appendChild(name);
+      info.appendChild(status);
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-sm';
+      btn.textContent = 'Remove';
+      btn.setAttribute('aria-label', 'Remove ' + item.url);
+      btn.addEventListener('click', () => {
+        send({ type: 'removeCustomFilterList', url: item.url });
+      });
+
+      row.appendChild(info);
+      row.appendChild(btn);
+      els.customLists.appendChild(row);
+    }
+  }
+
+  function renderExternalApps(perms) {
+    const list = Array.isArray(perms) ? perms : [];
+    const count = list.length;
+    els.appsHint.textContent = count === 0
+      ? 'No remembered app permissions'
+      : count === 1
+        ? '1 remembered app permission'
+        : count + ' remembered app permissions';
+    els.clearAppsBtn.disabled = count === 0;
+    els.appsList.textContent = '';
+    els.appsList.hidden = count === 0;
+    for (const perm of list) {
+      const li = document.createElement('li');
+      li.className = 'perm-item';
+      const site = document.createElement('span');
+      site.textContent = perm.site;
+      const scheme = document.createElement('span');
+      scheme.className = 'perm-scheme';
+      scheme.textContent = perm.scheme + ':';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn btn-sm';
+      btn.textContent = 'Remove';
+      btn.setAttribute('aria-label', 'Remove ' + perm.scheme + ' for ' + perm.site);
+      btn.addEventListener('click', () => {
+        send({ type: 'removeExternalApp', site: perm.site, scheme: perm.scheme });
+      });
+      li.appendChild(site);
+      li.appendChild(scheme);
+      li.appendChild(btn);
+      els.appsList.appendChild(li);
+    }
+  }
+
+  function applyState(state) {
+    syncing = true;
+    try {
+      applyTheme(state.theme);
+      const s = state.settings || {};
+
+      for (const r of els.themeRadios) {
+        r.checked = r.value === (s.theme || 'system');
+      }
+      const layoutVal = s.verticalTabs === false ? 'top' : 'sidebar';
+      for (const r of els.layoutRadios) {
+        r.checked = r.value === layoutVal;
+      }
+
+      els.share.checked = Boolean(s.shareEnabled);
+      els.collapse.checked = Boolean(s.tabBarCollapsed);
+      els.sleep.checked = Boolean(s.sleepingTabsEnabled);
+      els.blocking.checked = Boolean(s.blockingEnabled);
+      els.cleanLinks.checked = Boolean(s.cleanLinksEnabled);
+
+      const noUpdateFlag = Boolean(state.noUpdateCheckFlag);
+      els.autoUpdate.disabled = noUpdateFlag;
+      els.autoUpdate.checked = !noUpdateFlag && Boolean(s.autoUpdateCheck);
+      els.autoUpdateHint.textContent = noUpdateFlag
+        ? 'Disabled for this session by --no-update-check.'
+        : 'Checks GitHub releases once per day.';
+
+      const filterLists = Array.isArray(state.filterLists) ? state.filterLists : [];
+      renderBuiltInLists(filterLists);
+      renderCustomLists(filterLists);
+
+      const updating = Boolean(state.anyFilterListUpdating);
+      els.updateListsBtn.disabled = updating;
+      els.updateListsBtn.textContent = updating ? 'Updating...' : 'Update now';
+
+      renderExternalApps(s.allowedExternalApps);
+
+      const registered = Boolean(state.defaultBrowserRegistered);
+      els.removeDefaultBtn.disabled = !registered;
+      els.defaultHint.textContent = registered
+        ? 'Registered for this user. Choose browse in Windows Default Apps.'
+        : 'Register browse for this user, then choose it in Windows Default Apps.';
+
+      els.aboutVersion.textContent = 'browse ' + (state.version || '');
+      if (state.availableUpdateVersion) {
+        els.aboutUpdateHint.textContent = 'Update ' + state.availableUpdateVersion + ' is available.';
+        els.applyUpdateBtn.textContent = 'Update to ' + state.availableUpdateVersion;
+        els.applyUpdateBtn.hidden = false;
+      } else {
+        els.aboutUpdateHint.textContent = 'Small Windows web browser.';
+        els.applyUpdateBtn.hidden = true;
+      }
+
+      document.documentElement.dataset.ready = '1';
+    } finally {
+      syncing = false;
+    }
+  }
+
+  function handleNotice(msg) {
+    const isErr = msg.kind === 'error';
+    switch (msg.scope) {
+      case 'customFilterList':
+        showNotice(els.customNotice, msg.message, isErr);
+        if (!isErr) els.customInput.value = '';
+        break;
+      case 'defaultBrowser':
+        showNotice(els.defaultNotice, msg.message, isErr);
+        break;
+      case 'externalApps':
+        showNotice(els.appsNotice, msg.message, isErr);
+        break;
+      case 'clearData':
+        clearingData = false;
+        els.clearDataBtn.disabled = false;
+        els.clearConfirmBtn.disabled = false;
+        els.clearCancelBtn.disabled = false;
+        els.clearConfirmBar.hidden = true;
+        showNotice(els.clearDataNotice, msg.message, isErr);
+        break;
+    }
+  }
+
+  // Wire controls
+  for (const r of els.themeRadios) {
+    r.addEventListener('change', () => {
+      if (!syncing && r.checked) send({ type: 'setSetting', key: 'theme', value: r.value });
+    });
+  }
+  for (const r of els.layoutRadios) {
+    r.addEventListener('change', () => {
+      if (!syncing && r.checked) send({ type: 'setSetting', key: 'verticalTabs', value: r.value === 'sidebar' });
+    });
+  }
+
+  const bindSwitch = (el, key) => {
+    el.addEventListener('change', () => {
+      if (!syncing) send({ type: 'setSetting', key, value: el.checked });
+    });
+  };
+  bindSwitch(els.share, 'shareEnabled');
+  bindSwitch(els.collapse, 'tabBarCollapsed');
+  bindSwitch(els.sleep, 'sleepingTabsEnabled');
+  bindSwitch(els.blocking, 'blockingEnabled');
+  bindSwitch(els.cleanLinks, 'cleanLinksEnabled');
+  bindSwitch(els.autoUpdate, 'autoUpdateCheck');
+
+  els.customForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    showNotice(els.customNotice, '', false);
+    send({ type: 'addCustomFilterList', url: els.customInput.value });
+  });
+
+  els.updateListsBtn.addEventListener('click', () => {
+    els.updateListsBtn.disabled = true;
+    els.updateListsBtn.textContent = 'Updating...';
+    send({ type: 'updateFilterLists' });
+  });
+
+  els.clearAppsBtn.addEventListener('click', () => {
+    showNotice(els.appsNotice, '', false);
+    send({ type: 'clearExternalApps' });
+  });
+
+  els.makeDefaultBtn.addEventListener('click', () => {
+    showNotice(els.defaultNotice, '', false);
+    send({ type: 'registerDefaultBrowser' });
+  });
+
+  els.removeDefaultBtn.addEventListener('click', () => {
+    showNotice(els.defaultNotice, '', false);
+    send({ type: 'unregisterDefaultBrowser' });
+  });
+
+  els.clearDataBtn.addEventListener('click', () => {
+    if (clearingData) return;
+    showNotice(els.clearDataNotice, '', false);
+    els.clearConfirmBar.hidden = false;
+    els.clearCancelBtn.focus();
+  });
+
+  els.clearCancelBtn.addEventListener('click', () => {
+    els.clearConfirmBar.hidden = true;
+    els.clearDataBtn.focus();
+  });
+
+  els.clearConfirmBtn.addEventListener('click', () => {
+    if (clearingData) return;
+    clearingData = true;
+    els.clearDataBtn.disabled = true;
+    els.clearConfirmBtn.disabled = true;
+    els.clearCancelBtn.disabled = true;
+    showNotice(els.clearDataNotice, 'Clearing browsing data...', false);
+    send({ type: 'clearBrowsingData', confirmed: true });
+  });
+
+  els.applyUpdateBtn.addEventListener('click', () => {
+    send({ type: 'applyUpdate' });
+  });
+
+  // Active nav highlighting
+  function setActiveNav(id) {
+    for (const link of els.navLinks) {
+      const match = link.getAttribute('href') === '#' + id;
+      if (match) link.setAttribute('aria-current', 'location');
+      else link.removeAttribute('aria-current');
+    }
+  }
+
+  for (const link of els.navLinks) {
+    link.addEventListener('click', () => {
+      const target = (link.getAttribute('href') || '').slice(1);
+      if (target) setActiveNav(target);
+    });
+  }
+
+  if (typeof IntersectionObserver === 'function') {
+    const sections = Array.from(document.querySelectorAll('main .section'));
+    const io = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          setActiveNav(entry.target.id);
+          break;
+        }
+      }
+    }, { rootMargin: '-12% 0px -75% 0px' });
+    for (const sec of sections) io.observe(sec);
+  }
+
+  if (bridge && typeof bridge.addEventListener === 'function') {
+    bridge.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (!msg || typeof msg !== 'object') return;
+      if (msg.type === 'state') applyState(msg);
+      else if (msg.type === 'notice') handleNotice(msg);
+    });
+  }
+
+  send({ type: 'ready' });
+})();
+</script>
+</body>
+</html>

@@ -518,6 +518,21 @@ def run_checks():
                 assert 'Segoe' in (report.get('iconFontFamily') or ''), report.get('iconFontFamily')
                 assert 'Segoe' in (report.get('captionFontFamily') or ''), report.get('captionFontFamily')
                 assert report.get('settingsDialogOk') is True, report.get('settingsDialogOk')
+                assert report.get('settingsPage') == {
+                    'opensTab': True,
+                    'switchesNoDuplicate': True,
+                    'controlsDisabled': True,
+                    'themePushed': True,
+                    'toggleFromPage': True,
+                    'filterListRoundTrip': True,
+                    'externalAppsOk': True,
+                    'invalidRejected': True,
+                    'webMessageIgnored': {'webSource': True, 'spoofedSource': True, 'settingsTabWebSource': True, 'livePostIgnored': True},
+                    'webBlocked': {'stayed': True, 'noNewTab': True, 'frameBlocked': True, 'fetchBlocked': True},
+                    'leavesSettings': True,
+                    'settingsRestored': True,
+                    'selfCheck': True,
+                }, report.get('settingsPage')
                 assert report.get('shareToggleWorks') is True, report.get('shareToggleWorks')
                 assert report.get('adStatusWhenBlockingOff') == 200, report.get('adStatusWhenBlockingOff')
                 assert report.get('adVisibleWhenBlockingOff') is True, report.get('adVisibleWhenBlockingOff')
@@ -695,7 +710,6 @@ def run_checks():
                     'liveMinLayoutOk': True,
                     'simulatedDpiOk': True,
                     'shareDialogOk': True,
-                    'settingsDialogDpiOk': True,
                     'externalAppDialogOk': True,
                 }, report.get('highDpi')
                 assert report.get('shareTimeout') == {
@@ -891,6 +905,23 @@ def run_checks():
                 assert vert_restore['collapsedAtStartup'] is True, vert_restore
                 assert vert_restore['sidebarWidth'] == vert_restore['railWidth'], vert_restore
                 settings_path.write_text(json.dumps(saved_settings), encoding='utf-8')
+
+                # A saved settings tab restores as browse://settings (once, even if duplicated) and gets its bridge back.
+                settings_session = {'tabs': [
+                    {'url': base + '/second?a', 'title': 'Second page marker', 'pinned': False},
+                    {'url': 'browse://settings', 'title': 'Spoofed title', 'pinned': False},
+                    {'url': 'BROWSE://SETTINGS/', 'title': 'Settings', 'pinned': False},
+                    {'url': 'https://settings.browse.invalid/', 'title': 'Internal origin', 'pinned': False},
+                ], 'selected': 1, 'vertical': False}
+                session_path.write_text(json.dumps(settings_session), encoding='utf-8')
+                settings_restore = run_phase(exe, path / 'restore-settings.json', base, 'restore')
+                assert [(t['url'], t['title']) for t in settings_restore['tabs']] == [
+                    (base + '/second?a', 'Second page marker'), ('browse://settings', 'Settings')], settings_restore
+                assert settings_restore['settingsTab'] == {
+                    'count': 1, 'selected': True, 'loaded': True, 'exactSource': True, 'ready': True}, settings_restore
+                assert [t['url'] for t in json.loads(session_path.read_text(encoding='utf-8'))['tabs']] == [
+                    base + '/second?a', 'browse://settings'], session_path.read_text(encoding='utf-8')
+                session_path.write_text(json.dumps(expected_session), encoding='utf-8')
 
                 # Second instance while another process holds the profile mutex must restore normally without writing session.json.
                 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)

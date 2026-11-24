@@ -18,6 +18,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.4370.26" GeneratePathProperty="true" />
+    <EmbeddedResource Include="SettingsPage.html" LogicalName="SearchPort.SettingsPage.html" />
     <None Update="read-page.ps1" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <None Include="$(PkgMicrosoft_Web_WebView2)/LICENSE.txt" Link="WebView2-LICENSE.txt" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <None Include="$(PkgMicrosoft_Web_WebView2)/NOTICE.txt" Link="WebView2-NOTICE.txt" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
