@@ -501,6 +501,7 @@ sealed class TabDragCallbacks(Func<Point, bool> start, Action<Point> move, Actio
 abstract class TabChromeControl : ChromeControl, ITabItem
 {
     const int WM_LBUTTONUP = 0x0202;
+    const int WM_MBUTTONUP = 0x0208;
 
     readonly Action onSelect;
     readonly Action onClose;
@@ -509,10 +510,11 @@ abstract class TabChromeControl : ChromeControl, ITabItem
     protected bool dragSource;
     Point? pressPoint;
     bool pressedInClose;
+    bool middlePressed;
     bool dragging;
     bool hadCapture;
     bool suppressClick;
-    bool releasingLeft;
+    bool releasingButton;
 
     protected TabChromeControl(Action onSelect, Action onClose, TabDragCallbacks? drag)
     {
@@ -532,11 +534,11 @@ abstract class TabChromeControl : ChromeControl, ITabItem
 
     protected override void WndProc(ref Message m)
     {
-        if (m.Msg == WM_LBUTTONUP)
+        if (m.Msg is WM_LBUTTONUP or WM_MBUTTONUP)
         {
-            releasingLeft = true;
+            releasingButton = true;
             try { base.WndProc(ref m); }
-            finally { releasingLeft = false; }
+            finally { releasingButton = false; }
             return;
         }
         base.WndProc(ref m);
@@ -550,6 +552,7 @@ abstract class TabChromeControl : ChromeControl, ITabItem
         hadCapture = false;
         pressPoint = null;
         pressedInClose = false;
+        middlePressed = false;
         if (wasDragging) suppressClick = true;
         if (Capture) Capture = false;
         if (wasDragging) Invalidate();
@@ -584,6 +587,11 @@ abstract class TabChromeControl : ChromeControl, ITabItem
         {
             CancelDrag();
             drag?.Cancel();
+            return;
+        }
+        if (e.Button == MouseButtons.Middle)
+        {
+            middlePressed = !dragging && ClientRectangle.Contains(e.Location);
             return;
         }
         if (e.Button != MouseButtons.Left) return;
@@ -637,7 +645,9 @@ abstract class TabChromeControl : ChromeControl, ITabItem
         base.OnMouseUp(e);
         if (e.Button == MouseButtons.Middle)
         {
-            if (!dragging) onClose();
+            var wasMiddle = middlePressed;
+            middlePressed = false;
+            if (!dragging && wasMiddle && ClientRectangle.Contains(e.Location)) onClose();
             return;
         }
         if (e.Button != MouseButtons.Left) return;
@@ -666,9 +676,10 @@ abstract class TabChromeControl : ChromeControl, ITabItem
     protected override void OnMouseCaptureChanged(EventArgs e)
     {
         base.OnMouseCaptureChanged(e);
-        if (releasingLeft || Capture) return;
+        if (releasingButton || Capture) return;
         pressPoint = null;
         pressedInClose = false;
+        middlePressed = false;
         if (dragging && hadCapture)
         {
             dragging = false;
@@ -1054,7 +1065,7 @@ sealed class TabStack : Panel
 
     internal void EnsureVisible(Control item)
     {
-        if (item.Parent != content || contentHeight <= ClientSize.Height) return;
+        if (item.Parent != content || ClientSize.Height <= 0 || contentHeight <= ClientSize.Height) return;
         if (item.Top < scrollOffset) scrollOffset = item.Top;
         else if (item.Bottom > scrollOffset + ClientSize.Height) scrollOffset = item.Bottom - ClientSize.Height;
         else return;
