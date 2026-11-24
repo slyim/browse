@@ -110,6 +110,7 @@ static class Theme
         public static readonly string Share = PhosphorLoaded ? "\uE406" : "\uE72D";      // share
         public static readonly string Update = PhosphorLoaded ? "\uE20C" : "\uE896";     // download-simple
         public static readonly string Settings = PhosphorLoaded ? "\uE272" : "\uE713";   // gear-six
+        public static readonly string Warning = PhosphorLoaded ? "\uE4E0" : "\uE7BA";    // warning
 
         // Window caption buttons stay on Segoe Fluent Icons to match native Windows chrome.
         public const string Minimize = "\uE921";

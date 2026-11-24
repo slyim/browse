@@ -223,6 +223,10 @@ sealed class BrowserWindow : Form
     readonly ChromePanel cardFrame = new() { Dock = DockStyle.Fill, BackColor = Theme.Frame };
     readonly Panel cardBorder = new() { Dock = DockStyle.Fill, BackColor = Theme.Hairline };
     readonly Panel pages = new() { Dock = DockStyle.Fill, BackColor = Theme.Ground };
+    readonly CrashPagePanel crashPage;
+    readonly PageNoticeBanner pageBanner;
+    readonly FullscreenController<BrowserTab> fullscreen = new();
+    const long CrashLoopWindowMs = 10_000;
     readonly Label sessionNotice = new()
     {
         Dock = DockStyle.Bottom,
@@ -253,6 +257,7 @@ sealed class BrowserWindow : Form
     readonly System.Windows.Forms.Timer sleepTimer = new() { Interval = 30_000 };
     readonly System.Windows.Forms.Timer dragScrollTimer = new() { Interval = 30 };
     readonly System.Windows.Forms.Timer loadingTimer = new() { Interval = 60 };
+    readonly System.Windows.Forms.Timer responsiveTimer = new() { Interval = 1500 };
     int loadingPhase;
 
     readonly List<BrowserTab> opened = [];
@@ -315,6 +320,9 @@ sealed class BrowserWindow : Form
     bool CanSaveSession => sessionLock is not null;
     public int ExitCode { get; private set; } = 1;
     public bool ChromeHidden => chromeHidden;
+    public bool IsFullscreen => fullscreen.IsFullscreen;
+    internal bool BrowserFullscreen => fullscreen.BrowserFullscreen;
+    internal bool ElementFullscreen => fullscreen.ElementFullscreen;
 
     const int WM_NCCALCSIZE = 0x0083;
     const int WM_NCHITTEST = 0x0084;
@@ -416,6 +424,12 @@ sealed class BrowserWindow : Form
         public string? LastTitle { get; set; }
         public bool Loaded { get; set; }
         public bool CrashRecovered { get; set; }
+        public TabCrashInfo? Crash { get; set; }
+        public long? LastCrashAt { get; set; }
+        public bool Unresponsive { get; set; }
+        public bool UnresponsiveDismissed { get; set; }
+        public bool ResponsiveProbeInFlight { get; set; }
+        public string? SubframeNotice { get; set; }
         public long? HiddenSince { get; set; }
         public ulong? ActiveNavigationId { get; set; }
         public Uri? PendingPageUri { get; set; }
@@ -526,7 +540,14 @@ sealed class BrowserWindow : Form
         stripTabs.MouseWheel += HandleStripWheel;
         topStrip.Resize += (_, _) => { if (!vertical) LayoutTopStrip(); };
 
+        crashPage = new CrashPagePanel(() => { if (selected is { } t) RecoverCrashedTab(t); });
+        pageBanner = new PageNoticeBanner(
+            onWait: () => { if (selected is { } t) { t.UnresponsiveDismissed = true; SyncPageBanner(); } },
+            onReload: () => { if (selected is { } t) ReloadUnresponsiveTab(t); },
+            onDismiss: () => { if (selected is { } t) { t.SubframeNotice = null; SyncPageBanner(); } });
+        pages.Controls.Add(crashPage);
         cardBorder.Controls.Add(pages);
+        cardBorder.Controls.Add(pageBanner);
         cardFrame.Controls.Add(cardBorder);
         cardFrame.Controls.Add(sessionNotice);
 
@@ -555,11 +576,12 @@ sealed class BrowserWindow : Form
         sleepTimer.Start();
         dragScrollTimer.Tick += (_, _) => HandleDragAutoScroll();
         loadingTimer.Tick += (_, _) => TickLoadingSpinner();
+        responsiveTimer.Tick += (_, _) => ProbeUnresponsiveTabs();
         Activated += (_, _) => SetCaptionWindowActive(true);
         Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); };
         Load += async (_, _) => await Start();
         FormClosing += (_, _) => FlushSession();
-        FormClosed += (_, _) => { closed = true; StopLaunchPipe(); CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); };
+        FormClosed += (_, _) => { closed = true; StopLaunchPipe(); CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); };
     }
 
     int S(int px) => dpiOverride is { } dpi
@@ -591,6 +613,7 @@ sealed class BrowserWindow : Form
             sleepTimer.Dispose();
             dragScrollTimer.Dispose();
             loadingTimer.Dispose();
+            responsiveTimer.Dispose();
             if (!dropLine.IsDisposed) dropLine.Dispose();
             ReleaseSessionLock();
         }
@@ -667,6 +690,7 @@ sealed class BrowserWindow : Form
 
     public void SetChromeHidden(bool hidden)
     {
+        if (IsFullscreen) { fullscreen.UpdateSavedChromeHidden(hidden); return; }
         if (chromeHidden == hidden) return;
         CancelTabDrag();
         chromeHidden = hidden;
@@ -675,16 +699,104 @@ sealed class BrowserWindow : Form
         ResumeLayout(true);
     }
 
+    void SetDwmFrame(bool enabled)
+    {
+        if (!IsHandleCreated) return;
+        var margins = new MARGINS { cyTopHeight = enabled ? 1 : 0 };
+        _ = DwmExtendFrameIntoClientArea(Handle, ref margins);
+        SetWindowPos(Handle, IntPtr.Zero, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    void ApplyFullscreenTransition(FullscreenTransition transition)
+    {
+        if (transition == FullscreenTransition.None || closed || IsDisposed) return;
+        CancelTabDrag();
+        ClearCaptionInteraction();
+        if (transition == FullscreenTransition.Enter)
+        {
+            fullscreen.CapturePlacement(this, chromeHidden);
+            var screenBounds = Screen.FromControl(this).Bounds;
+            chromeHidden = true;
+            SuspendLayout();
+            ApplyChromeVisibility();
+            if (WindowState != FormWindowState.Normal) WindowState = FormWindowState.Normal;
+            FormBorderStyle = FormBorderStyle.None;
+            Bounds = screenBounds;
+            if (IsHandleCreated)
+            {
+                var margins = new MARGINS();
+                _ = DwmExtendFrameIntoClientArea(Handle, ref margins);
+                SetWindowPos(Handle, IntPtr.Zero, screenBounds.X, screenBounds.Y, screenBounds.Width, screenBounds.Height,
+                    SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            ResumeLayout(true);
+            return;
+        }
+
+        if (fullscreen.TakeSavedPlacement() is not { } saved) return;
+        chromeHidden = saved.ChromeHidden;
+        SuspendLayout();
+        FormBorderStyle = saved.BorderStyle;
+        SetDwmFrame(true);
+        if (saved.NormalBounds.Width > 0 && saved.NormalBounds.Height > 0)
+            Bounds = saved.NormalBounds;
+        if (saved.WindowState == FormWindowState.Maximized)
+            WindowState = FormWindowState.Maximized;
+        ApplyChromeVisibility();
+        ResumeLayout(true);
+        UpdateMaximizeButton();
+    }
+
+    void ToggleBrowserFullscreen() =>
+        ApplyFullscreenTransition(fullscreen.ToggleBrowserFullscreen());
+
+    void HandleContainsFullScreenElementChanged(BrowserTab tab, CoreWebView2 core)
+    {
+        if (closed || tab.Closed || IsDisposed || !IsHandleCreated) return;
+        var active = TryCore(() => core.ContainsFullScreenElement);
+        // Defer out of the synchronous WebView2 COM callback so resizing/re-styling the Form cannot re-enter WebView2.
+        BeginInvoke(() => {
+            if (closed || tab.Closed || IsDisposed || !opened.Contains(tab) || tab.View?.CoreWebView2 != core) return;
+            if (active && tab != selected)
+            {
+                TryExitDocumentFullscreen(tab);
+                return;
+            }
+            ApplyFullscreenTransition(fullscreen.SetElementFullscreen(tab, active));
+        });
+    }
+
+    void ExitElementFullscreenForTab(BrowserTab tab, bool exitDocument = true)
+    {
+        if (!ReferenceEquals(fullscreen.ElementFullscreenTab, tab)) return;
+        if (exitDocument) TryExitDocumentFullscreen(tab);
+        ApplyFullscreenTransition(fullscreen.ClearElementFullscreen(tab));
+    }
+
+    static void TryExitDocumentFullscreen(BrowserTab tab)
+    {
+        if (tab.View is { IsDisposed: false, CoreWebView2: { } core })
+            TryCore(() => _ = core.ExecuteScriptAsync("if (document.fullscreenElement) document.exitFullscreen().catch(()=>{})"));
+    }
+
     void ApplyChromeVisibility()
     {
-        BackColor = chromeHidden ? Theme.Ground : (vertical ? Theme.Frame : Theme.Ground);
-        sidebar.Visible = !chromeHidden && vertical;
-        topStrip.Visible = !chromeHidden && !vertical;
-        minBtn.Visible = maxBtn.Visible = closeBtn.Visible = !chromeHidden;
-        sessionNotice.Visible = !chromeHidden && !CanSaveSession;
+        var hideChrome = chromeHidden || IsFullscreen;
+        BackColor = hideChrome ? Theme.Ground : (vertical ? Theme.Frame : Theme.Ground);
+        sidebar.Visible = !hideChrome && vertical;
+        topStrip.Visible = !hideChrome && !vertical;
+        minBtn.Visible = maxBtn.Visible = closeBtn.Visible = !hideChrome;
+        sessionNotice.Visible = !hideChrome && !CanSaveSession;
         sessionNotice.BackColor = vertical ? Theme.Frame : Theme.Ground;
 
-        if (chromeHidden)
+        if (IsFullscreen)
+        {
+            cardFrame.BackColor = Theme.Ground;
+            cardFrame.Padding = Padding.Empty;
+            cardBorder.BackColor = Theme.Ground;
+            cardBorder.Padding = Padding.Empty;
+        }
+        else if (chromeHidden)
         {
             cardFrame.BackColor = Theme.Ground;
             cardFrame.Padding = new(0, S(12), 0, 0);
@@ -751,6 +863,7 @@ sealed class BrowserWindow : Form
 
     int HitTestClient(IntPtr hwnd, Point pt)
     {
+        if (IsFullscreen) return HTCLIENT;
         if (!IsZoomed(hwnd))
         {
             var resize = S(5);
@@ -786,9 +899,7 @@ sealed class BrowserWindow : Form
     protected override void OnHandleCreated(EventArgs e)
     {
         base.OnHandleCreated(e);
-        var margins = new MARGINS { cyTopHeight = 1 };
-        _ = DwmExtendFrameIntoClientArea(Handle, ref margins);
-        SetWindowPos(Handle, IntPtr.Zero, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetDwmFrame(!IsFullscreen);
         LayoutCaptionButtons();
         UpdateMaximizeButton();
     }
@@ -837,6 +948,11 @@ sealed class BrowserWindow : Form
     {
         if (m.Msg == WM_NCCALCSIZE && m.WParam != IntPtr.Zero && m.LParam != IntPtr.Zero && !IsIconic(m.HWnd))
         {
+            if (IsFullscreen)
+            {
+                m.Result = IntPtr.Zero;
+                return;
+            }
             var origTop = Marshal.ReadInt32(m.LParam, 4);
             base.WndProc(ref m);
             Marshal.WriteInt32(m.LParam, 4, IsZoomed(m.HWnd) ? origTop + TopFrameInset(m.HWnd) : origTop);
@@ -845,6 +961,7 @@ sealed class BrowserWindow : Form
         }
         if (m.Msg == WM_NCHITTEST)
         {
+            if (IsFullscreen) { m.Result = (IntPtr)HTCLIENT; return; }
             base.WndProc(ref m);
             if (m.Result == (IntPtr)HTCLIENT && IsHandleCreated)
                 m.Result = (IntPtr)HitTestClient(m.HWnd, PointToClient(LParamPoint(m.LParam)));
@@ -1059,6 +1176,8 @@ sealed class BrowserWindow : Form
     void ReloadTab(BrowserTab tab)
     {
         if (closed || tab.Closed) return;
+        if (tab.Crash is not null) { RecoverCrashedTab(tab); return; }
+        if (tab.Unresponsive) { ReloadUnresponsiveTab(tab); return; }
         if (tab.View is not { IsDisposed: false } view)
         {
             // An unloaded background tab already loads fresh when selected.
@@ -1126,7 +1245,7 @@ sealed class BrowserWindow : Form
         try
         {
             var envWatch = Stopwatch.StartNew();
-            environment = await envTask;
+            AttachEnvironment(await envTask);
             envMs = envWatch.ElapsedMilliseconds;
             if (closed) return;
             if (smokeReport is not null)
@@ -1434,6 +1553,13 @@ sealed class BrowserWindow : Form
                     SetNavigationState(tab, e.NavigationId, Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u : null);
                 }
                 core.NavigationStarting += (_, e) => {
+                    if (tab.SubframeNotice is not null)
+                    {
+                        tab.SubframeNotice = null;
+                        if (selected == tab && !closed && !IsDisposed && IsHandleCreated) BeginInvoke(SyncPageBanner);
+                    }
+                    if (tab.Unresponsive && !closed && !IsDisposed && IsHandleCreated)
+                        BeginInvoke(() => ClearUnresponsive(tab));
                     var isAllowedFile = tab.IsAllowedFileNavigation(e.Uri);
                     if (!IsNavigable(e.Uri) && !isAllowedFile)
                     {
@@ -1478,7 +1604,12 @@ sealed class BrowserWindow : Form
                 core.NavigationCompleted += (_, e) => {
                     if (tab.ActiveNavigationId == e.NavigationId)
                         SetNavigationState(tab, null, null);
-                    if (e.IsSuccess) tab.CrashRecovered = false;
+                    if (e.IsSuccess)
+                    {
+                        tab.CrashRecovered = false;
+                        if (tab.Unresponsive && !closed && !IsDisposed && IsHandleCreated)
+                            BeginInvoke(() => ClearUnresponsive(tab));
+                    }
                 };
                 core.PermissionRequested += (_, e) => {
                     var (state, savesInProfile) = DecidePermission(e.PermissionKind, e.IsUserInitiated);
@@ -1512,7 +1643,8 @@ sealed class BrowserWindow : Form
                         finally { deferral.Complete(); }
                     });
                 };
-                core.ProcessFailed += (_, e) => HandleProcessFailed(tab, view, e.ProcessFailedKind);
+                core.ProcessFailed += (_, e) => HandleProcessFailed(tab, view, e);
+                core.ContainsFullScreenElementChanged += (_, _) => HandleContainsFullScreenElementChanged(tab, core);
                 core.LaunchingExternalUriScheme += (_, e) => HandleLaunchingExternalUriScheme(tab, e);
                 core.NewWindowRequested += (_, e) => {
                     e.Handled = true;
@@ -1526,6 +1658,8 @@ sealed class BrowserWindow : Form
                 };
                 core.SourceChanged += (_, _) => {
                     if (!opened.Contains(tab)) return;
+                    if (tab.Unresponsive && !closed && !IsDisposed && IsHandleCreated)
+                        BeginInvoke(() => ClearUnresponsive(tab));
                     var src = TryCore(() => core.Source);
                     if (src is not null && PageHandoff.Allowed(src))
                     {
@@ -1558,6 +1692,8 @@ sealed class BrowserWindow : Form
                 core.HistoryChanged += (_, _) => { if (selected == tab) UpdateNavButtons(); };
                 core.DocumentTitleChanged += (_, _) => {
                     if (!opened.Contains(tab)) return;
+                    if (tab.Unresponsive && !closed && !IsDisposed && IsHandleCreated)
+                        BeginInvoke(() => ClearUnresponsive(tab));
                     if (tab.Loaded)
                     {
                         tab.SavedTitle = null; // the restored title must not stick to later pages
@@ -1729,8 +1865,156 @@ sealed class BrowserWindow : Form
         TryCore(() => core.OpenDefaultDownloadDialog());
     }
 
+    void AttachEnvironment(CoreWebView2Environment env)
+    {
+        environment = env;
+        env.BrowserProcessExited += (_, e) => {
+            if (closed || IsDisposed || environment != env) return;
+            if (e.BrowserProcessExitKind == CoreWebView2BrowserProcessExitKind.Normal) return;
+            if (recoveringBrowser || !IsHandleCreated) return;
+            recoveringBrowser = true;
+            BeginInvoke(() => _ = RecoverBrowserProcessAsync());
+        };
+    }
+
+    void SyncCrashOverlay()
+    {
+        if (closed || IsDisposed || crashPage.IsDisposed) return;
+        if (selected is { Crash: { } crash })
+        {
+            crashPage.ShowCrash(crash);
+            crashPage.Visible = true;
+            crashPage.BringToFront();
+        }
+        else
+        {
+            crashPage.ClearCrash();
+        }
+    }
+
+    void SyncPageBanner()
+    {
+        if (closed || IsDisposed || pageBanner.IsDisposed) return;
+        if (selected is { Crash: null } tab)
+        {
+            if (tab.Unresponsive && !tab.UnresponsiveDismissed)
+            {
+                pageBanner.ShowUnresponsive();
+                return;
+            }
+            if (!string.IsNullOrEmpty(tab.SubframeNotice))
+            {
+                pageBanner.ShowSubframeCrash(tab.SubframeNotice);
+                return;
+            }
+        }
+        pageBanner.HideBanner();
+    }
+
+    void SyncResponsiveTimer()
+    {
+        if (closed || IsDisposed) { responsiveTimer.Stop(); return; }
+        var any = opened.Any(t => !t.Closed && t.Unresponsive && t.View is { IsDisposed: false });
+        if (any) { if (!responsiveTimer.Enabled) responsiveTimer.Start(); }
+        else if (responsiveTimer.Enabled) responsiveTimer.Stop();
+    }
+
+    void ClearUnresponsive(BrowserTab tab)
+    {
+        if (!tab.Unresponsive && !tab.UnresponsiveDismissed) return;
+        tab.Unresponsive = false;
+        tab.UnresponsiveDismissed = false;
+        tab.ResponsiveProbeInFlight = false;
+        SyncResponsiveTimer();
+        if (selected == tab) SyncPageBanner();
+    }
+
+    void ProbeUnresponsiveTabs()
+    {
+        if (closed || IsDisposed) { responsiveTimer.Stop(); return; }
+        var any = false;
+        foreach (var tab in opened.ToArray())
+        {
+            if (tab.Closed || !tab.Unresponsive || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) continue;
+            any = true;
+            if (!tab.ResponsiveProbeInFlight) _ = ProbeTabResponsiveAsync(tab, core);
+        }
+        if (!any) responsiveTimer.Stop();
+    }
+
+    async Task ProbeTabResponsiveAsync(BrowserTab tab, CoreWebView2 core)
+    {
+        if (tab.ResponsiveProbeInFlight || closed || tab.Closed || IsDisposed) return;
+        tab.ResponsiveProbeInFlight = true;
+        try
+        {
+            var result = await core.ExecuteScriptAsync("1");
+            if (!closed && !tab.Closed && !IsDisposed && tab.Unresponsive && tab.View?.CoreWebView2 == core && result == "1")
+                ClearUnresponsive(tab);
+        }
+        catch { }
+        finally { tab.ResponsiveProbeInFlight = false; }
+    }
+
+    void ShowTabCrash(BrowserTab tab, TabCrashInfo info)
+    {
+        if (closed || tab.Closed || IsDisposed || !opened.Contains(tab)) return;
+        ResetTabForRecovery(tab, preserveCrashFlag: true);
+        tab.Crash = info;
+        if (selected == tab)
+        {
+            UpdateAddress();
+            UpdateNavButtons();
+            UpdateWindowTitle();
+            SyncCrashOverlay();
+            SyncPageBanner();
+        }
+    }
+
+    void RecoverCrashedTab(BrowserTab tab)
+    {
+        if (closed || tab.Closed || IsDisposed || !opened.Contains(tab)) return;
+        tab.Crash = null;
+        tab.CrashRecovered = false;
+        tab.LastCrashAt = null;
+        tab.Unresponsive = false;
+        tab.UnresponsiveDismissed = false;
+        tab.SubframeNotice = null;
+        if (tab.Url is { } url) tab.PendingUrl = url;
+        if (selected == tab)
+        {
+            SyncCrashOverlay();
+            SyncPageBanner();
+            UpdateNavButtons();
+        }
+        if (environment is null)
+        {
+            if (!recoveringBrowser && IsHandleCreated)
+            {
+                recoveringBrowser = true;
+                _ = RecoverBrowserProcessAsync();
+            }
+            return;
+        }
+        if (selected == tab) _ = EnsureViewAndNavigate(tab);
+    }
+
+    void ReloadUnresponsiveTab(BrowserTab tab)
+    {
+        if (closed || tab.Closed || IsDisposed || !opened.Contains(tab)) return;
+        ClearUnresponsive(tab);
+        tab.Crash = null;
+        tab.CrashRecovered = false;
+        tab.LastCrashAt = null;
+        tab.SubframeNotice = null;
+        ResetTabForRecovery(tab);
+        if (selected == tab && environment is not null) _ = EnsureViewAndNavigate(tab);
+        UpdateNavButtons();
+    }
+
     void ResetTabForRecovery(BrowserTab tab, bool preserveCrashFlag = false)
     {
+        ExitElementFullscreenForTab(tab, exitDocument: false);
         var url = tab.Url;
         var title = tab.Title;
         tab.SavedUrl = url;
@@ -1741,7 +2025,16 @@ sealed class BrowserWindow : Form
         tab.ActiveNavigationId = null;
         tab.PendingPageUri = null;
         tab.Suspending = false;
-        if (!preserveCrashFlag) tab.CrashRecovered = false;
+        tab.Unresponsive = false;
+        tab.UnresponsiveDismissed = false;
+        tab.ResponsiveProbeInFlight = false;
+        tab.SubframeNotice = null;
+        tab.Crash = null;
+        if (!preserveCrashFlag)
+        {
+            tab.CrashRecovered = false;
+            tab.LastCrashAt = null;
+        }
         tab.BlockedCount = () => 0;
         tab.SetShieldEnabledAsync = _ => Task.CompletedTask;
         tab.ViewTask = null;
@@ -1751,24 +2044,36 @@ sealed class BrowserWindow : Form
             CleanupView(oldView);
         }
         SyncLoadingTimer();
+        SyncResponsiveTimer();
         if (!closed && !IsDisposed && opened.Contains(tab)) RefreshTab(tab);
     }
 
-    void RecreateTabView(BrowserTab tab)
+    bool RecreateTabView(BrowserTab tab)
     {
-        if (closed || tab.Closed || IsDisposed || !opened.Contains(tab)) return;
+        if (closed || tab.Closed || IsDisposed || !opened.Contains(tab)) return false;
         ResetTabForRecovery(tab, preserveCrashFlag: true);
-        if (selected == tab && environment is not null) _ = EnsureViewAndNavigate(tab);
+        if (environment is null) return false;
+        if (selected == tab) _ = EnsureViewAndNavigate(tab);
         UpdateNavButtons();
+        return true;
     }
 
-    void HandleProcessFailed(BrowserTab tab, WebView2 view, CoreWebView2ProcessFailedKind kind)
+    void HandleProcessFailed(BrowserTab tab, WebView2 view, CoreWebView2ProcessFailedEventArgs e) =>
+        HandleProcessFailedCore(tab, view, e.ProcessFailedKind, e.Reason, e.ExitCode, TryCore(() => e.ProcessDescription));
+
+    void HandleProcessFailedCore(
+        BrowserTab tab,
+        WebView2 view,
+        CoreWebView2ProcessFailedKind kind,
+        CoreWebView2ProcessFailedReason reason,
+        int exitCode,
+        string? processDescription)
     {
-        SetNavigationState(tab, null, null);
         if (closed || IsDisposed) return;
 
         if (kind == CoreWebView2ProcessFailedKind.BrowserProcessExited)
         {
+            SetNavigationState(tab, null, null);
             if (recoveringBrowser || !IsHandleCreated) return;
             recoveringBrowser = true;
             BeginInvoke(() => _ = RecoverBrowserProcessAsync());
@@ -1776,21 +2081,65 @@ sealed class BrowserWindow : Form
         }
 
         if (tab.Closed || tab.View != view) return;
-        if (kind is not (CoreWebView2ProcessFailedKind.RenderProcessExited or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive))
+
+        if (kind == CoreWebView2ProcessFailedKind.FrameRenderProcessExited)
+        {
+            tab.SubframeNotice = "A frame on this page crashed";
+            if (IsHandleCreated)
+                BeginInvoke(() => { if (!closed && !tab.Closed && !IsDisposed && selected == tab) SyncPageBanner(); });
             return;
-        if (tab.CrashRecovered || !IsHandleCreated) return;
+        }
+
+        if (kind == CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)
+        {
+            tab.Unresponsive = true;
+            tab.UnresponsiveDismissed = false;
+            if (IsHandleCreated)
+            {
+                BeginInvoke(() => {
+                    if (closed || tab.Closed || IsDisposed || tab.View != view) return;
+                    if (selected == tab) SyncPageBanner();
+                    SyncResponsiveTimer();
+                    if (view.CoreWebView2 is { } core && !tab.ResponsiveProbeInFlight)
+                        _ = ProbeTabResponsiveAsync(tab, core);
+                });
+            }
+            return;
+        }
+
+        if (kind != CoreWebView2ProcessFailedKind.RenderProcessExited) return;
+
+        SetNavigationState(tab, null, null);
+        ClearUnresponsive(tab);
+        tab.SubframeNotice = null;
+        if (!IsHandleCreated) return;
+
+        var now = Environment.TickCount64;
+        var repeatedWithinWindow = tab.LastCrashAt is { } lastAt && now - lastAt < CrashLoopWindowMs;
+        var showPanel = tab.CrashRecovered || repeatedWithinWindow;
+        tab.LastCrashAt = now;
         tab.CrashRecovered = true;
+        var info = TabCrashInfo.FromProcessFailed(tab.Url, reason, exitCode, processDescription);
+
+        if (showPanel)
+        {
+            BeginInvoke(() => {
+                if (closed || tab.Closed || IsDisposed || !opened.Contains(tab)) return;
+                ShowTabCrash(tab, info);
+            });
+            return;
+        }
 
         BeginInvoke(() => {
             if (closed || tab.Closed || IsDisposed || tab.View != view) return;
-            if (kind == CoreWebView2ProcessFailedKind.RenderProcessExited
-                && !view.IsDisposed && view.CoreWebView2 is { } c
+            if (!view.IsDisposed && view.CoreWebView2 is { } c
                 && TryCore(() => {
                     if (!tab.Loaded && tab.SavedUrl is { } saved) c.Navigate(saved);
                     else c.Reload();
                 }))
                 return;
-            RecreateTabView(tab);
+            if (!RecreateTabView(tab))
+                ShowTabCrash(tab, info);
         });
     }
 
@@ -1803,6 +2152,8 @@ sealed class BrowserWindow : Form
             UpdateNavButtons();
             UpdateAddress();
             UpdateWindowTitle();
+            SyncCrashOverlay();
+            SyncPageBanner();
 
             CoreWebView2Environment? recreated = null;
             for (var attempt = 0; attempt < 3 && !closed && !IsDisposed; attempt++)
@@ -1817,12 +2168,22 @@ sealed class BrowserWindow : Form
                     await Task.Delay(250);
                 }
             }
-            if (closed || IsDisposed || recreated is null) return;
-            environment = recreated;
+            if (closed || IsDisposed) return;
+            if (recreated is null)
+            {
+                if (selected is { Closed: false } failedActive)
+                    ShowTabCrash(failedActive, new TabCrashInfo(failedActive.Url, "Browser process exited and could not be restarted", 0, null));
+                return;
+            }
+            AttachEnvironment(recreated);
             if (selected is { Closed: false, View: null } active)
                 await EnsureViewAndNavigate(active);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            if (!closed && !IsDisposed && selected is { Closed: false } active)
+                ShowTabCrash(active, new TabCrashInfo(active.Url, ex.Message, 0, null));
+        }
         finally { recoveringBrowser = false; }
     }
 
@@ -1901,6 +2262,16 @@ sealed class BrowserWindow : Form
             if (address.InputFocused) ActiveControl = null;
             return OpenInteractive(target);
         }
+        if (tab.Crash is not null)
+        {
+            tab.Crash = null;
+            tab.CrashRecovered = false;
+            tab.LastCrashAt = null;
+            SyncCrashOverlay();
+        }
+        if (tab.Unresponsive) ClearUnresponsive(tab);
+        tab.SubframeNotice = null;
+        if (selected == tab) SyncPageBanner();
         if (tab.View is { IsDisposed: false, CoreWebView2: { } core })
         {
             tab.PendingUrl = null;
@@ -1949,9 +2320,14 @@ sealed class BrowserWindow : Form
     void SelectTab(BrowserTab tab, bool focusView = true)
     {
         var prev = selected;
+        if (prev is not null && prev != tab) ExitElementFullscreenForTab(prev);
         selected = tab;
         tab.HiddenSince = null;
-        if (tab.View is { IsDisposed: false } view)
+        if (tab.Crash is not null)
+        {
+            if (focusView) ActiveControl = null;
+        }
+        else if (tab.View is { IsDisposed: false } view)
         {
             view.Visible = true;
             view.BringToFront();
@@ -1986,6 +2362,8 @@ sealed class BrowserWindow : Form
                     TryCore(() => prevCore.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low);
             }
         }
+        SyncCrashOverlay();
+        SyncPageBanner();
         if (focusView || !address.InputFocused) UpdateAddress();
         UpdateNavButtons();
         UpdateWindowTitle();
@@ -2028,7 +2406,8 @@ sealed class BrowserWindow : Form
         }
         catch (Exception ex)
         {
-            if (!closed && smokeReport is null) MessageBox.Show(this, ex.Message, "Could not open tab");
+            if (!closed && !tab.Closed && !IsDisposed && opened.Contains(tab))
+                ShowTabCrash(tab, new TabCrashInfo(tab.Url, ex.Message, 0, null));
         }
     }
 
@@ -2059,9 +2438,14 @@ sealed class BrowserWindow : Form
     void DetachTab(BrowserTab tab, bool recordClosed)
     {
         if (tab == dragTab) CancelTabDrag();
+        ExitElementFullscreenForTab(tab, exitDocument: false);
         tab.Closed = true;
         tab.ActiveNavigationId = null;
         tab.PendingPageUri = null;
+        tab.Unresponsive = false;
+        tab.UnresponsiveDismissed = false;
+        tab.SubframeNotice = null;
+        tab.Crash = null;
         if (recordClosed && tab.Url is { } url && PageHandoff.Allowed(url)) closedUrls.Push(url);
         opened.Remove(tab);
         foreach (var t in opened) if (t.Opener == tab) t.Opener = null;
@@ -2070,6 +2454,7 @@ sealed class BrowserWindow : Form
             tab.View = null;
             CleanupView(view);
         }
+        SyncResponsiveTimer();
     }
 
     List<BrowserTab> TabsBelow(BrowserTab tab)
@@ -2796,7 +3181,7 @@ sealed class BrowserWindow : Form
     bool IsHandledShortcut(Keys keyData)
     {
         if (keyData == Keys.Escape)
-            return dragTab is not null || address.InputFocused || selected is { Navigating: true };
+            return !ElementFullscreen && (dragTab is not null || address.InputFocused || selected is { Navigating: true });
         switch (keyData)
         {
             case Keys.Control | Keys.L:
@@ -2816,6 +3201,7 @@ sealed class BrowserWindow : Form
             case Keys.Alt | Keys.Right:
             case Keys.Control | Keys.R:
             case Keys.F5:
+            case Keys.F11:
             case Keys.Control | Keys.J:
                 return true;
         }
@@ -2825,6 +3211,8 @@ sealed class BrowserWindow : Form
 
     bool HandleShortcut(Keys keyData)
     {
+        if (keyData == Keys.Escape && ElementFullscreen)
+            return false;
         if (keyData == Keys.Escape && dragTab is not null)
         {
             CancelTabDrag();
@@ -2861,6 +3249,7 @@ sealed class BrowserWindow : Form
             case Keys.Alt | Keys.Right: GoForward(); return true;
             case Keys.Control | Keys.R:
             case Keys.F5: ReloadCurrent(); return true;
+            case Keys.F11: if (!restoring) ToggleBrowserFullscreen(); return true;
             case Keys.Control | Keys.J: OpenDownloads(); return true;
         }
         if ((keyData & Keys.Modifiers) == Keys.Control)
@@ -5045,6 +5434,292 @@ sealed class BrowserWindow : Form
             newWindowArgsOk,
         };
 
+        // #11: Crash recovery UI (second crash -> crash panel, Reload clears guard, unresponsive banner Wait/Reload/auto-clear, subframe notice).
+        var crashUiTab = await Open(fixture + "/third");
+        await WaitForLoad(crashUiTab);
+        var crashUiCore = crashUiTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Crash UI tab view is not ready.");
+        var crash1SawExit = false;
+        var crash1Reloaded = false;
+        crashUiCore.ProcessFailed += (_, e) => {
+            if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessExited) crash1SawExit = true;
+        };
+        crashUiCore.NavigationCompleted += (_, e) => {
+            if (crash1SawExit && e.IsSuccess) crash1Reloaded = true;
+        };
+        try { await crashUiCore.CallDevToolsProtocolMethodAsync("Page.crash", "{}"); }
+        catch { }
+        var crashUiWait = Stopwatch.StartNew();
+        while (crashUiWait.Elapsed < TimeSpan.FromSeconds(8) && !(crash1SawExit && crash1Reloaded && !crashUiTab.CrashRecovered))
+            await Task.Delay(50);
+        var firstCrashSilent = crash1SawExit && crash1Reloaded && !crashPage.Visible && crashUiTab.LastCrashAt is not null;
+
+        // Second crash within 10s hits the loop guard and displays the themed crash panel.
+        var crashUiCore2 = crashUiTab.View?.CoreWebView2;
+        if (crashUiCore2 is not null)
+        {
+            // Disposing the crashed WebView2 can leave the CDP Page.crash call unresolved, so bound the await.
+            try { await crashUiCore2.CallDevToolsProtocolMethodAsync("Page.crash", "{}").WaitAsync(TimeSpan.FromSeconds(2)); }
+            catch { }
+        }
+        crashUiWait.Restart();
+        while (crashUiWait.Elapsed < TimeSpan.FromSeconds(8) && !(crashPage.Visible && crashUiTab.Crash is not null && crashUiTab.View is null))
+            await Task.Delay(50);
+        var panelShownOnSecondCrash = crashPage.Visible
+            && crashUiTab.View is null
+            && crashUiTab.Crash is not null
+            && crashPage.DisplayedHeading == "This page crashed"
+            && crashPage.DisplayedUrl == fixture + "/third"
+            && !string.IsNullOrEmpty(crashPage.DisplayedDetail)
+            && crashPage.VerifyLayoutInsideClient();
+
+        // Switching tabs hides the crash panel for healthy tabs and restores it on switch-back without auto-recreating.
+        SelectTab(first);
+        var hiddenOnHealthyTab = !crashPage.Visible && (first.View?.Visible ?? false);
+        SelectTab(crashUiTab);
+        var preservedOnSwitchBack = hiddenOnHealthyTab && crashPage.Visible && crashUiTab.View is null;
+
+        // Clicking Reload hides the crash panel, clears the guard, recreates the view, and loads the page.
+        crashPage.ReloadButton.PerformClick();
+        crashUiWait.Restart();
+        while (crashUiWait.Elapsed < TimeSpan.FromSeconds(10)
+            && (crashPage.Visible || !crashUiTab.Loaded || crashUiTab.Navigating || crashUiTab.Title != "Third page marker"))
+            await Task.Delay(50);
+        var reloadRecovered = !crashPage.Visible
+            && crashUiTab.Crash is null
+            && crashUiTab.LastCrashAt is null
+            && !crashUiTab.CrashRecovered
+            && crashUiTab.Loaded
+            && crashUiTab.Title == "Third page marker";
+
+        // Subframe crash shows a quiet notice without destroying the tab.
+        var viewBeforeSubframe = crashUiTab.View!;
+        HandleProcessFailedCore(crashUiTab, viewBeforeSubframe, CoreWebView2ProcessFailedKind.FrameRenderProcessExited, CoreWebView2ProcessFailedReason.Crashed, 1, "Subframe");
+        crashUiWait.Restart();
+        while (crashUiWait.Elapsed < TimeSpan.FromSeconds(2) && !pageBanner.Visible)
+            await Task.Delay(25);
+        var subframeShown = pageBanner.Visible && pageBanner.Kind == PageNoticeKind.SubframeCrash
+            && ReferenceEquals(crashUiTab.View, viewBeforeSubframe) && crashUiTab.Loaded;
+        var dismissPt = new Point(pageBanner.DismissButton.Width / 2, pageBanner.DismissButton.Height / 2);
+        SendMessage(pageBanner.DismissButton.Handle, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, MakeLParam(dismissPt.X, dismissPt.Y));
+        SendMessage(pageBanner.DismissButton.Handle, WM_LBUTTONUP, IntPtr.Zero, MakeLParam(dismissPt.X, dismissPt.Y));
+        var subframeNoticeOk = subframeShown && !pageBanner.Visible;
+
+        // Unresponsive on a responsive page auto-clears via the non-blocking probe.
+        HandleProcessFailedCore(crashUiTab, crashUiTab.View!, CoreWebView2ProcessFailedKind.RenderProcessUnresponsive, CoreWebView2ProcessFailedReason.Unresponsive, 0, null);
+        crashUiWait.Restart();
+        while (crashUiWait.Elapsed < TimeSpan.FromSeconds(4) && (crashUiTab.Unresponsive || pageBanner.Visible))
+            await Task.Delay(25);
+        var unresponsiveAutoCleared = !crashUiTab.Unresponsive && !pageBanner.Visible;
+
+        // Unresponsive on a hung page displays Wait / Reload without blocking UI; Wait hides banner; Reload recreates view.
+        var hangBannerTab = await Open(fixture + "/hang");
+        await WaitForLoad(hangBannerTab);
+        await Task.Delay(250);
+        var hangViewBefore = hangBannerTab.View!;
+        HandleProcessFailedCore(hangBannerTab, hangViewBefore, CoreWebView2ProcessFailedKind.RenderProcessUnresponsive, CoreWebView2ProcessFailedReason.Unresponsive, 0, null);
+        crashUiWait.Restart();
+        while (crashUiWait.Elapsed < TimeSpan.FromSeconds(2) && !(pageBanner.Visible && pageBanner.Kind == PageNoticeKind.Unresponsive))
+            await Task.Delay(25);
+        var unresponsiveShown = pageBanner.Visible
+            && pageBanner.Kind == PageNoticeKind.Unresponsive
+            && pageBanner.Message == "Page isn't responding"
+            && pageBanner.WaitButton.Visible
+            && pageBanner.ReloadButton.Visible;
+        pageBanner.WaitButton.PerformClick();
+        var waitDismissed = unresponsiveShown && !pageBanner.Visible && hangBannerTab.Unresponsive && hangBannerTab.UnresponsiveDismissed;
+        HandleProcessFailedCore(hangBannerTab, hangViewBefore, CoreWebView2ProcessFailedKind.RenderProcessUnresponsive, CoreWebView2ProcessFailedReason.Unresponsive, 0, null);
+        crashUiWait.Restart();
+        while (crashUiWait.Elapsed < TimeSpan.FromSeconds(2) && !pageBanner.Visible)
+            await Task.Delay(25);
+        var hangUrlBeforeReload = hangBannerTab.Url;
+        pageBanner.ReloadButton.PerformClick();
+        crashUiWait.Restart();
+        while (crashUiWait.Elapsed < TimeSpan.FromSeconds(8)
+            && (pageBanner.Visible || hangBannerTab.Unresponsive || hangBannerTab.View is not { IsDisposed: false } || ReferenceEquals(hangBannerTab.View, hangViewBefore)))
+            await Task.Delay(50);
+        var unresponsiveReloaded = waitDismissed
+            && !pageBanner.Visible
+            && !hangBannerTab.Unresponsive
+            && hangBannerTab.View is { IsDisposed: false }
+            && !ReferenceEquals(hangBannerTab.View, hangViewBefore)
+            && hangBannerTab.Url == hangUrlBeforeReload;
+        CloseTab(hangBannerTab, recordClosed: false);
+        CloseTab(crashUiTab, recordClosed: false);
+        SelectTab(first);
+
+        var crashUi = new
+        {
+            firstCrashSilent,
+            panelShownOnSecondCrash,
+            preservedOnSwitchBack,
+            reloadRecovered,
+            subframeNoticeOk,
+            unresponsiveAutoCleared,
+            unresponsiveReloaded,
+        };
+
+        // #12: HTML5 element fullscreen and F11 browser fullscreen.
+        if (WindowState != FormWindowState.Normal) WindowState = FormWindowState.Normal;
+        SetOrientation(true, persistSettings: false);
+        PerformLayout();
+        var fsPrevBounds = Bounds;
+        var fsPrevState = WindowState;
+        var fsPrevBorder = FormBorderStyle;
+        var fsPrevChrome = ChromeHidden;
+        var fsExpectedScreen = Screen.FromControl(this).Bounds;
+
+        bool elementCoversScreen = false;
+        bool elementChromeHidden = false;
+        bool elementNoResizeBorder = false;
+        bool elementExitRestores = false;
+        bool maximizedRestores = false;
+        bool switchTabExits = false;
+        bool closeTabExits = false;
+        bool f11OffRestores = false;
+        bool elementInF11ReturnsToF11 = false;
+        bool f11FinalRestores = false;
+
+        try
+        {
+            var fsTab = await Open(fixture + "/fullscreen");
+            await WaitForLoad(fsTab);
+            var fsCore = fsTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Fullscreen tab view is not ready.");
+            await Task.Delay(150);
+            await DispatchClick(fsCore, 80, 24);
+            var fsWait = Stopwatch.StartNew();
+            while (fsWait.Elapsed < TimeSpan.FromSeconds(5) && !(IsFullscreen && ElementFullscreen && Bounds == fsExpectedScreen))
+                await Task.Delay(50);
+            PerformLayout();
+            elementCoversScreen = IsFullscreen && ElementFullscreen && !BrowserFullscreen
+                && Bounds == fsExpectedScreen
+                && FormBorderStyle == FormBorderStyle.None;
+            elementChromeHidden = ChromeHidden
+                && !sidebar.Visible && !topStrip.Visible
+                && !minBtn.Visible && !maxBtn.Visible && !closeBtn.Visible
+                && cardFrame.Padding == Padding.Empty
+                && cardBorder.Padding == Padding.Empty;
+            elementNoResizeBorder = HitTestAt(PointToScreen(new Point(ClientSize.Width / 2, 2))) == HTCLIENT
+                && !IsHandledShortcut(Keys.Escape);
+
+            await fsCore.ExecuteScriptAsync("document.exitFullscreen()");
+            fsWait.Restart();
+            while (fsWait.Elapsed < TimeSpan.FromSeconds(5) && IsFullscreen)
+                await Task.Delay(50);
+            PerformLayout();
+            elementExitRestores = !IsFullscreen && !ElementFullscreen
+                && Bounds == fsPrevBounds
+                && WindowState == fsPrevState
+                && FormBorderStyle == fsPrevBorder
+                && ChromeHidden == fsPrevChrome
+                && sidebar.Visible;
+
+            // Maximized -> element fullscreen -> restores Maximized.
+            WindowState = FormWindowState.Maximized;
+            PerformLayout();
+            var maxScreen = Screen.FromControl(this).Bounds;
+            await Task.Delay(100);
+            await DispatchClick(fsCore, 80, 24);
+            fsWait.Restart();
+            while (fsWait.Elapsed < TimeSpan.FromSeconds(5) && !(IsFullscreen && ElementFullscreen && Bounds == maxScreen))
+                await Task.Delay(50);
+            var maxEnteredOk = IsFullscreen && Bounds == maxScreen && !IsZoomed(Handle) && cardFrame.Padding == Padding.Empty;
+            await fsCore.ExecuteScriptAsync("document.exitFullscreen()");
+            fsWait.Restart();
+            while (fsWait.Elapsed < TimeSpan.FromSeconds(5) && IsFullscreen)
+                await Task.Delay(50);
+            maximizedRestores = maxEnteredOk && !IsFullscreen && WindowState == FormWindowState.Maximized && FormBorderStyle == FormBorderStyle.Sizable;
+            WindowState = FormWindowState.Normal;
+            Bounds = fsPrevBounds;
+            PerformLayout();
+
+            // Switching away from element-fullscreen tab restores window.
+            await Task.Delay(100);
+            await DispatchClick(fsCore, 80, 24);
+            fsWait.Restart();
+            while (fsWait.Elapsed < TimeSpan.FromSeconds(5) && !ElementFullscreen)
+                await Task.Delay(50);
+            var enteredForSwitch = ElementFullscreen;
+            SelectTab(first);
+            PerformLayout();
+            switchTabExits = enteredForSwitch && !IsFullscreen && !ElementFullscreen
+                && Bounds == fsPrevBounds && WindowState == fsPrevState && !ChromeHidden;
+            await Task.Delay(150);
+
+            // Closing element-fullscreen tab restores window.
+            SelectTab(fsTab);
+            await Task.Delay(150);
+            await DispatchClick(fsCore, 80, 24);
+            fsWait.Restart();
+            while (fsWait.Elapsed < TimeSpan.FromSeconds(5) && !ElementFullscreen)
+                await Task.Delay(50);
+            var enteredForClose = ElementFullscreen;
+            CloseTab(fsTab, recordClosed: false);
+            PerformLayout();
+            closeTabExits = enteredForClose && !IsFullscreen && !ElementFullscreen
+                && Bounds == fsPrevBounds && WindowState == fsPrevState && !ChromeHidden;
+
+            // F11 on/off restores exact bounds and chrome.
+            SelectTab(first);
+            PressKey(Keys.F11);
+            PerformLayout();
+            var f11On = IsFullscreen && BrowserFullscreen && !ElementFullscreen
+                && Bounds == fsExpectedScreen
+                && FormBorderStyle == FormBorderStyle.None
+                && ChromeHidden
+                && cardFrame.Padding == Padding.Empty
+                && HitTestAt(PointToScreen(new Point(ClientSize.Width / 2, 2))) == HTCLIENT;
+            PressKey(Keys.F11);
+            PerformLayout();
+            f11OffRestores = f11On && !IsFullscreen && !BrowserFullscreen
+                && Bounds == fsPrevBounds && WindowState == fsPrevState && FormBorderStyle == fsPrevBorder && !ChromeHidden && sidebar.Visible;
+
+            // Element fullscreen inside F11 exits back to F11 mode; then F11 restores windowed.
+            var fsTab2 = await Open(fixture + "/fullscreen");
+            await WaitForLoad(fsTab2);
+            var fsCore2 = fsTab2.View?.CoreWebView2 ?? throw new InvalidOperationException("Fullscreen tab 2 view is not ready.");
+            PressKey(Keys.F11);
+            await Task.Delay(150);
+            await DispatchClick(fsCore2, 80, 24);
+            fsWait.Restart();
+            while (fsWait.Elapsed < TimeSpan.FromSeconds(5) && !ElementFullscreen)
+                await Task.Delay(50);
+            var bothActive = BrowserFullscreen && ElementFullscreen && IsFullscreen;
+            await fsCore2.ExecuteScriptAsync("document.exitFullscreen()");
+            fsWait.Restart();
+            while (fsWait.Elapsed < TimeSpan.FromSeconds(5) && ElementFullscreen)
+                await Task.Delay(50);
+            elementInF11ReturnsToF11 = bothActive && BrowserFullscreen && !ElementFullscreen && IsFullscreen
+                && Bounds == fsExpectedScreen && ChromeHidden;
+            PressKey(Keys.F11);
+            PerformLayout();
+            f11FinalRestores = !IsFullscreen && !BrowserFullscreen
+                && Bounds == fsPrevBounds && WindowState == fsPrevState && !ChromeHidden && sidebar.Visible;
+            CloseTab(fsTab2, recordClosed: false);
+            SelectTab(first);
+        }
+        finally
+        {
+            if (BrowserFullscreen) ToggleBrowserFullscreen();
+            if (WindowState != FormWindowState.Normal) WindowState = FormWindowState.Normal;
+            if (FormBorderStyle != fsPrevBorder) FormBorderStyle = fsPrevBorder;
+            Bounds = fsPrevBounds;
+            PerformLayout();
+        }
+
+        var fullscreenReport = new
+        {
+            elementCoversScreen,
+            elementChromeHidden,
+            elementNoResizeBorder,
+            elementExitRestores,
+            maximizedRestores,
+            switchTabExits,
+            closeTabExits,
+            f11OffRestores,
+            elementInF11ReturnsToF11,
+            f11FinalRestores,
+        };
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -5057,6 +5732,7 @@ sealed class BrowserWindow : Form
             faviconCached, addressDisplayOk, tabDrag, tabFixes, highDpi, shareTimeout,
             tabCycle, loadingStop, tabMenuAndNewWindow,
             postClean, blobUrl, permissions, downloads, processCrash,
+            crashUi, fullscreen = fullscreenReport,
             sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
             rejectsLocalFiles = Resolve("file:///C:/Windows/win.ini") == null && !PageHandoff.Allowed("file:///C:/Windows/win.ini"),
