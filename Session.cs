@@ -101,10 +101,26 @@ static class Session
         }
     }
 
-    static SessionTab[] Filter(SessionTab[]? tabs) => tabs is null
-        ? []
-        : [.. tabs.Where(t => t is not null && t.Url is not null && PageHandoff.Allowed(t.Url))
-                  .Select(t => t with { Url = new Uri(t.Url).AbsoluteUri, Title = t.Title ?? "" })]; // normalized: Navigate rejects padded URLs
+    static SessionTab[] Filter(SessionTab[]? tabs)
+    {
+        if (tabs is null) return [];
+        var list = new List<SessionTab>(tabs.Length);
+        var hasSettings = false;
+        foreach (var t in tabs)
+        {
+            if (t is null || t.Url is null) continue;
+            if (SettingsPage.IsSettingsAddress(t.Url))
+            {
+                if (hasSettings) continue;
+                hasSettings = true;
+                list.Add(t with { Url = SettingsPage.DisplayUrl, Title = "Settings" });
+                continue;
+            }
+            if (PageHandoff.Allowed(t.Url))
+                list.Add(t with { Url = new Uri(t.Url).AbsoluteUri, Title = t.Title ?? "" }); // normalized: Navigate rejects padded URLs
+        }
+        return [.. list];
+    }
 }
 
 sealed class FaviconCache : IDisposable

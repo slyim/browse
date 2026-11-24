@@ -315,7 +315,7 @@ static class ExternalSchemes
     static readonly HashSet<string> DangerousSchemes = new(StringComparer.OrdinalIgnoreCase)
     {
         // Script, local file, and browser/internal schemes
-        "javascript", "vbscript", "jscript", "data", "blob", "file", "about",
+        "javascript", "vbscript", "jscript", "data", "blob", "file", "about", "browse",
         "edge", "chrome", "chrome-extension", "chrome-search", "chrome-untrusted",
         "devtools", "extension", "ms-browser-extension", "view-source", "filesystem",
         "ftp", "ftps", "gopher", "ws", "wss", "res", "mk", "mhtml", "its", "ms-its",
@@ -354,6 +354,8 @@ static class ExternalSchemes
         var text = origin.Trim();
         if (!Uri.TryCreate(text, UriKind.Absolute, out var uri)) return null;
         if (uri.Scheme is not ("http" or "https") || uri.UserInfo.Length > 0 || uri.IdnHost.Length == 0)
+            return null;
+        if (SettingsPage.IsSettingsHost(uri.IdnHost))
             return null;
         var host = uri.IdnHost.ToLowerInvariant();
         return uri.IsDefaultPort ? $"{uri.Scheme}://{host}" : $"{uri.Scheme}://{host}:{uri.Port}";

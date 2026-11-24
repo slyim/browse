@@ -3,8 +3,27 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Drawing.Imaging;
+using Microsoft.Win32;
 
 namespace SearchPort;
+
+sealed record ThemePalette(
+    bool Dark,
+    string Ground,
+    string Frame,
+    string Ink,
+    string InkSoft,
+    string Muted,
+    string Faint,
+    string Hairline,
+    string Surface,
+    string SurfaceHover,
+    string SurfaceActive,
+    string Accent,
+    string AccentFg,
+    string AccentSoft,
+    string Danger,
+    string DangerSoft);
 
 static class Theme
 {
@@ -40,6 +59,63 @@ static class Theme
     public static readonly Color CloseHoverFill = Dark ? Color.FromArgb(0x22, 0xFF, 0xFF, 0xFF) : Color.FromArgb(0x18, 0x00, 0x00, 0x00);
     public static readonly Color DropLine = Dark ? Color.FromArgb(0x6B, 0xA4, 0xFF) : Color.FromArgb(0x25, 0x63, 0xEB);
     public static readonly Color DropSlotFill = Dark ? Color.FromArgb(0x28, 0x6B, 0xA4, 0xFF) : Color.FromArgb(0x1C, 0x25, 0x63, 0xEB);
+
+    static readonly ThemePalette DarkPalette = new(
+        Dark: true,
+        Ground: "#1c1c1c",
+        Frame: "#131313",
+        Ink: "#ededed",
+        InkSoft: "#c2c2c2",
+        Muted: "#949494",
+        Faint: "#525252",
+        Hairline: "#333333",
+        Surface: "#222222",
+        SurfaceHover: "#282828",
+        SurfaceActive: "#303030",
+        Accent: "#6ba4ff",
+        AccentFg: "#0f172a",
+        AccentSoft: "rgba(107, 164, 255, 0.16)",
+        Danger: "#f87171",
+        DangerSoft: "rgba(248, 113, 113, 0.14)");
+
+    static readonly ThemePalette LightPalette = new(
+        Dark: false,
+        Ground: "#ffffff",
+        Frame: "#f4f4f4",
+        Ink: "#171717",
+        InkSoft: "#4d4d4d",
+        Muted: "#666666",
+        Faint: "#d4d4d4",
+        Hairline: "#e8e8e8",
+        Surface: "#f7f7f7",
+        SurfaceHover: "#e9e9e9",
+        SurfaceActive: "#e4e4e4",
+        Accent: "#2563eb",
+        AccentFg: "#ffffff",
+        AccentSoft: "rgba(37, 99, 235, 0.10)",
+        Danger: "#c42b1c",
+        DangerSoft: "rgba(196, 43, 28, 0.09)");
+
+    public static ThemePalette PaletteFor(bool dark) => dark ? DarkPalette : LightPalette;
+
+    public static bool IsSystemDark()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize", writable: false);
+            if (key?.GetValue("AppsUseLightTheme") is int value)
+                return value == 0;
+        }
+        catch { }
+        return Dark;
+    }
+
+    public static bool EffectiveDark(ThemePreference preference) => preference switch
+    {
+        ThemePreference.Dark => true,
+        ThemePreference.Light => false,
+        _ => IsSystemDark(),
+    };
 
     static readonly string CaptionIconFamily = FontFamily.Families.Any(f => f.Name.Equals("Segoe Fluent Icons", StringComparison.OrdinalIgnoreCase))
         ? "Segoe Fluent Icons" : "Segoe MDL2 Assets";

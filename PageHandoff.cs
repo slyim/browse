@@ -10,7 +10,9 @@ static class PageHandoff
 {
     static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
     public static bool Allowed(string address) => Uri.TryCreate(address, UriKind.Absolute, out var url)
-        && (url.Scheme == "https" || url.Scheme == "http") && url.UserInfo.Length == 0;
+        && (url.Scheme == "https" || url.Scheme == "http")
+        && url.UserInfo.Length == 0
+        && !SettingsPage.IsSettingsHost(url.IdnHost);
 
     // Extraction is deliberately narrow. This is not a complete secret or PII filter.
     const string Script = """

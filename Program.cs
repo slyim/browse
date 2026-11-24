@@ -290,7 +290,6 @@ sealed class BrowserWindow : Form
     readonly string sessionFile;
     readonly string settingsFile;
     readonly string sitePrefsFile;
-    readonly ThemePreference startupTheme;
     readonly FaviconCache favicons;
     SitePrefs sitePrefs;
     readonly FilterListService filterLists;
@@ -313,7 +312,7 @@ sealed class BrowserWindow : Form
     IDisposable? sessionLock;
     AppSettings settings;
     bool settingsExisted;
-    SettingsDialog? settingsDialog;
+    BrowserTab? openingSettingsTab;
     CancellationTokenSource? updateCts = new();
     CoreWebView2Environment? environment;
     BrowserTab? selected;
@@ -475,11 +474,12 @@ sealed class BrowserWindow : Form
         public WebView2? View { get; set; }
         public Task? ViewTask { get; set; }
         public bool Closed { get; set; }
+        public bool IsSettings { get; set; } = saved is not null && SettingsPage.IsSettingsAddress(saved.Url);
         public bool Pinned { get; set; } = saved?.Pinned ?? false;
-        public string? PendingUrl { get; set; } = saved?.Url;
-        public string? SavedUrl { get; set; } = saved?.Url;
+        public string? PendingUrl { get; set; } = saved is not null && !SettingsPage.IsSettingsAddress(saved.Url) ? saved.Url : null;
+        public string? SavedUrl { get; set; } = saved is not null && !SettingsPage.IsSettingsAddress(saved.Url) ? saved.Url : null;
         public string? AllowedFileUri { get; set; }
-        public string? SavedTitle { get; set; } = saved?.Title;
+        public string? SavedTitle { get; set; } = saved is not null && SettingsPage.IsSettingsAddress(saved.Url) ? "Settings" : saved?.Title;
         public string? LastUrl { get; set; }
         public string? LastTitle { get; set; }
         public bool Loaded { get; set; }
@@ -517,6 +517,7 @@ sealed class BrowserWindow : Form
         {
             get
             {
+                if (IsSettings) return SettingsPage.DisplayUrl;
                 try { if (View is { IsDisposed: false, CoreWebView2.Source: { } s } && (PageHandoff.Allowed(s) || IsAllowedFileNavigation(s))) return s; }
                 catch (Exception ex) when (ex is COMException or InvalidOperationException) { }
                 return SavedUrl ?? LastUrl;
@@ -526,6 +527,7 @@ sealed class BrowserWindow : Form
         {
             get
             {
+                if (IsSettings) return "Settings";
                 if (Loaded)
                 {
                     try
@@ -551,7 +553,6 @@ sealed class BrowserWindow : Form
             : new SitePrefs();
         settings = initialSettings;
         this.settingsExisted = settingsExisted;
-        startupTheme = initialSettings.Theme;
         favicons = new FaviconCache(sessionFile);
         filterLists = new FilterListService(
             Path.GetDirectoryName(settingsFile)!,
@@ -695,7 +696,7 @@ sealed class BrowserWindow : Form
         SizeChanged += (_, _) => { CloseDownloadsFlyout(); CloseShieldFlyout(); };
         Load += async (_, _) => await Start();
         FormClosing += HandleFormClosing;
-        FormClosed += (_, _) => { closed = true; Application.RemoveMessageFilter(peekFilter); StopLaunchPipe(); CancelTabDrag(animate: false); CancelPeek(animate: false); CloseDownloadsFlyout(); CloseShieldFlyout(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); peekDelayTimer.Stop(); peekDelayTimer.Dispose(); peekWatchTimer.Stop(); peekWatchTimer.Dispose(); layoutMotion.Dispose(); motion.Dispose(); };
+        FormClosed += (_, _) => { closed = true; Application.RemoveMessageFilter(peekFilter); StopLaunchPipe(); CancelTabDrag(animate: false); CancelPeek(animate: false); CloseDownloadsFlyout(); CloseShieldFlyout(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); peekDelayTimer.Stop(); peekDelayTimer.Dispose(); peekWatchTimer.Stop(); peekWatchTimer.Dispose(); layoutMotion.Dispose(); motion.Dispose(); };
     }
 
     int S(int px) => dpiOverride is { } dpi
@@ -827,7 +828,7 @@ sealed class BrowserWindow : Form
                 settings = settings with { TabBarCollapsed = collapsed };
                 settingsExisted = true;
                 SaveSettings();
-                settingsDialog?.SyncFrom(settings);
+                PushSettingsStateToOpenTabs();
             }
             return;
         }
@@ -860,7 +861,7 @@ sealed class BrowserWindow : Form
             settings = settings with { TabBarCollapsed = collapsed };
             settingsExisted = true;
             SaveSettings();
-            settingsDialog?.SyncFrom(settings);
+            PushSettingsStateToOpenTabs();
         }
     }
 
@@ -1500,7 +1501,11 @@ sealed class BrowserWindow : Form
             SyncCaptionInteraction();
         }
         if (m.Msg == WM_SETTINGCHANGE)
+        {
             motion.RefreshSystemPreference();
+            if (settings.Theme == ThemePreference.System)
+                PushSettingsStateToOpenTabs();
+        }
         base.WndProc(ref m);
     }
 
@@ -1736,12 +1741,14 @@ sealed class BrowserWindow : Form
         if (tab.View is not { IsDisposed: false } view)
         {
             // An unloaded background tab already loads fresh when selected.
+            if (tab.IsSettings) { if (tab == selected) _ = EnsureViewAndNavigate(tab); return; }
             if (tab.Url is { } pendingUrl) { tab.PendingUrl ??= pendingUrl; if (tab == selected) _ = EnsureViewAndNavigate(tab); }
             return;
         }
         TryCore(() => {
             if (view.CoreWebView2 is { } c && c.IsSuspended) c.Resume();
-            if (!tab.Loaded && tab.SavedUrl is { } url) view.CoreWebView2?.Navigate(url); // first load never committed
+            if (tab.IsSettings) view.CoreWebView2?.Navigate(SettingsPage.InternalUrl);
+            else if (!tab.Loaded && tab.SavedUrl is { } url) view.CoreWebView2?.Navigate(url); // first load never committed
             else if (tab.Url is not null) view.Reload();
         });
     }
@@ -1782,15 +1789,24 @@ sealed class BrowserWindow : Form
         if (!any) loadingTimer.Stop();
     }
 
+    void UpdateShareButton()
+    {
+        if (closed || IsDisposed || shareBtn.IsDisposed) return;
+        shareBtn.Enabled = !busy && selected is not { IsSettings: true };
+    }
+
     void UpdateNavButtons()
     {
-        backBtn.Enabled = TryCore(() => selected is { View: { IsDisposed: false, CanGoBack: true } });
-        forwardBtn.Enabled = TryCore(() => selected is { View: { IsDisposed: false, CanGoForward: true } });
+        var isSettings = selected is { IsSettings: true };
+        backBtn.Enabled = !isSettings && TryCore(() => selected is { View: { IsDisposed: false, CanGoBack: true } });
+        forwardBtn.Enabled = !isSettings && TryCore(() => selected is { View: { IsDisposed: false, CanGoForward: true } });
         var loading = selected is { Navigating: true };
         var tip = loading ? "Stop" : "Reload";
         reloadBtn.SetGlyph(loading ? Theme.Glyphs.Stop : Theme.Glyphs.Reload, tip);
         if (tips.GetToolTip(reloadBtn) != tip) tips.SetToolTip(reloadBtn, tip);
         reloadBtn.Enabled = loading || selected is { Url: not null };
+        settingsBtn.SetActive(isSettings);
+        UpdateShareButton();
     }
 
     async Task Start()
@@ -1838,7 +1854,7 @@ sealed class BrowserWindow : Form
 
     static readonly HashSet<string> RefusedSchemes = new(StringComparer.OrdinalIgnoreCase)
     {
-        "javascript", "vbscript", "data", "blob", "file", "about", "edge", "chrome",
+        "javascript", "vbscript", "data", "blob", "file", "about", "browse", "edge", "chrome",
         "mailto", "tel", "sms", "ftp", "ftps", "ws", "wss", "view-source", "filesystem",
         "ms-settings", "ms-windows-store", "intent", "urn", "magnet", "http", "https",
     };
@@ -2092,13 +2108,37 @@ sealed class BrowserWindow : Form
                 await view.EnsureCoreWebView2Async(environment);
                 if (closed || tab.Closed || view.IsDisposed) { CleanupView(view); return; }
                 var core = view.CoreWebView2;
-                core.Settings.IsWebMessageEnabled = false;
+                core.Settings.IsWebMessageEnabled = tab.IsSettings;
                 core.Settings.AreHostObjectsAllowed = false;
                 core.Settings.IsPasswordAutosaveEnabled = false;
                 core.Settings.IsGeneralAutofillEnabled = false;
                 core.Settings.AreBrowserAcceleratorKeysEnabled = true;
                 if (core.Profile is not null)
-                    core.Profile.PreferredColorScheme = SettingsStore.ToWebViewColorScheme(startupTheme);
+                    core.Profile.PreferredColorScheme = SettingsStore.ToWebViewColorScheme(settings.Theme);
+                // Register settings resource gate before Shield so settings.browse.invalid is served only on host-opened settings tabs and blocked elsewhere.
+                core.AddWebResourceRequestedFilter(SettingsPage.InternalOrigin + "/*", CoreWebView2WebResourceContext.All);
+                core.WebResourceRequested += (_, e) => {
+                    if (e.Response is not null || !SettingsPage.IsSettingsOrigin(e.Request.Uri)) return;
+                    if (!tab.IsSettings)
+                    {
+                        e.Response = environment!.CreateWebResourceResponse(null, 403, "Forbidden", "Cache-Control: no-store");
+                        return;
+                    }
+                    if (SettingsPage.IsSettingsExactUrl(e.Request.Uri))
+                        e.Response = environment!.CreateWebResourceResponse(
+                            new MemoryStream(SettingsPage.HtmlBytes, writable: false), 200, "OK", SettingsPage.ResponseHeaders);
+                    else if (SettingsPage.IsSettingsFaviconUrl(e.Request.Uri))
+                        e.Response = environment!.CreateWebResourceResponse(null, 204, "No Content", "Cache-Control: no-store");
+                    else
+                        e.Response = environment!.CreateWebResourceResponse(null, 404, "Not Found", "Cache-Control: no-store");
+                };
+                core.WebMessageReceived += (_, e) => {
+                    _ = TryHandleSettingsWebMessage(tab, e.Source, e.WebMessageAsJson);
+                };
+                core.FrameNavigationStarting += (_, e) => {
+                    if (tab.IsSettings || SettingsPage.IsBlockedExternalReference(e.Uri))
+                        e.Cancel = true;
+                };
                 var shield = await Shield.AttachAsync(
                     core,
                     environment!,
@@ -2144,6 +2184,22 @@ sealed class BrowserWindow : Form
                     }
                     if (tab.Unresponsive && !closed && !IsDisposed && IsHandleCreated)
                         BeginInvoke(() => ClearUnresponsive(tab));
+                    if (tab.IsSettings)
+                    {
+                        if (!SettingsPage.IsSettingsExactUrl(e.Uri))
+                        {
+                            e.Cancel = true;
+                            return;
+                        }
+                        findBar.StopIfBoundTo(core);
+                        SetNavigationState(tab, e.NavigationId, null);
+                        return;
+                    }
+                    if (SettingsPage.IsBlockedExternalReference(e.Uri))
+                    {
+                        e.Cancel = true;
+                        return;
+                    }
                     var isAllowedFile = tab.IsAllowedFileNavigation(e.Uri);
                     if (!IsNavigable(e.Uri) && !isAllowedFile)
                     {
@@ -2194,6 +2250,8 @@ sealed class BrowserWindow : Form
                         tab.CrashRecovered = false;
                         if (tab.Unresponsive && !closed && !IsDisposed && IsHandleCreated)
                             BeginInvoke(() => ClearUnresponsive(tab));
+                        if (tab.IsSettings)
+                            PushSettingsState(tab);
                     }
                 };
                 core.PermissionRequested += (_, e) => {
@@ -2240,7 +2298,8 @@ sealed class BrowserWindow : Form
                 core.LaunchingExternalUriScheme += (_, e) => HandleLaunchingExternalUriScheme(tab, e);
                 core.NewWindowRequested += (_, e) => {
                     e.Handled = true;
-                    if (!e.IsUserInitiated || !IsPopupAllowed(e.Uri) || environment is null || closed || restoring || IsDisposed || !IsHandleCreated)
+                    if (tab.IsSettings || SettingsPage.IsBlockedExternalReference(e.Uri)
+                        || !e.IsUserInitiated || !IsPopupAllowed(e.Uri) || environment is null || closed || restoring || IsDisposed || !IsHandleCreated)
                         return;
                     _ = OpenPopup(tab, e);
                 };
@@ -2253,30 +2312,50 @@ sealed class BrowserWindow : Form
                     if (tab.Unresponsive && !closed && !IsDisposed && IsHandleCreated)
                         BeginInvoke(() => ClearUnresponsive(tab));
                     var src = TryCore(() => core.Source);
-                    if (src is not null && PageHandoff.Allowed(src))
+                    if (tab.IsSettings)
                     {
-                        tab.AllowedFileUri = null;
-                        tab.Loaded = true;
-                        tab.SavedUrl = null;
-                        tab.LastUrl = src;
+                        if (src is not null && SettingsPage.IsSettingsExactUrl(src))
+                        {
+                            tab.Loaded = true;
+                            tab.SavedUrl = null;
+                            tab.LastUrl = null;
+                        }
+                        else if (src is not null && !string.Equals(src, "about:blank", StringComparison.OrdinalIgnoreCase))
+                        {
+                            LeaveSettingsMode(tab);
+                        }
                     }
-                    else if (src is not null && tab.IsAllowedFileNavigation(src))
+                    if (!tab.IsSettings)
                     {
-                        tab.Loaded = true;
-                        tab.SavedUrl = null;
-                        tab.LastUrl = src;
+                        if (src is not null && PageHandoff.Allowed(src))
+                        {
+                            tab.AllowedFileUri = null;
+                            tab.Loaded = true;
+                            tab.SavedUrl = null;
+                            tab.LastUrl = src;
+                        }
+                        else if (src is not null && tab.IsAllowedFileNavigation(src))
+                        {
+                            tab.Loaded = true;
+                            tab.SavedUrl = null;
+                            tab.LastUrl = src;
+                        }
+                        else if (src is not null && src.StartsWith("blob:", StringComparison.OrdinalIgnoreCase) && IsNavigable(src))
+                        {
+                            tab.Loaded = true;
+                            tab.SavedUrl = null;
+                            tab.LastUrl = null;
+                        }
+                        else if (src is not null)
+                        {
+                            tab.LastUrl = null;
+                        }
+                        ApplyOriginZoomForTab(tab, view, src);
                     }
-                    else if (src is not null && src.StartsWith("blob:", StringComparison.OrdinalIgnoreCase) && IsNavigable(src))
+                    else
                     {
-                        tab.Loaded = true;
-                        tab.SavedUrl = null;
-                        tab.LastUrl = null;
+                        ApplyZoomFactor(tab, view, ZoomLevels.Default);
                     }
-                    else if (src is not null)
-                    {
-                        tab.LastUrl = null;
-                    }
-                    ApplyOriginZoomForTab(tab, view, src);
                     if (selected == tab && !address.InputFocused) UpdateAddress();
                     if (selected == tab) { UpdateShieldIndicator(); UpdateNavButtons(); UpdateWindowTitle(); }
                     RefreshTab(tab);
@@ -2337,7 +2416,7 @@ sealed class BrowserWindow : Form
 
     internal static bool IsNavigable(string? uri)
     {
-        if (string.IsNullOrEmpty(uri)) return false;
+        if (string.IsNullOrEmpty(uri) || SettingsPage.IsBlockedExternalReference(uri)) return false;
         if (PageHandoff.Allowed(uri)) return true;
         if (string.Equals(uri, "about:blank", StringComparison.OrdinalIgnoreCase)) return true;
         return uri.StartsWith("blob:", StringComparison.OrdinalIgnoreCase)
@@ -2450,7 +2529,6 @@ sealed class BrowserWindow : Form
         var updated = ExternalSchemes.NormalizePermissions([.. settings.AllowedExternalApps, new ExternalAppPermission(site, scheme)]);
         if (updated.SequenceEqual(settings.AllowedExternalApps)) return;
         ApplySettings(settings with { AllowedExternalApps = updated });
-        settingsDialog?.SyncFrom(settings);
     }
 
     Control DownloadsAnchor()
@@ -2712,9 +2790,9 @@ sealed class BrowserWindow : Form
         ExitElementFullscreenForTab(tab, exitDocument: false);
         var url = tab.Url;
         var title = tab.Title;
-        tab.SavedUrl = url;
-        tab.PendingUrl = url;
-        tab.SavedTitle = string.IsNullOrWhiteSpace(title) || title == "New tab" ? tab.LastTitle : title;
+        tab.SavedUrl = tab.IsSettings ? null : url;
+        tab.PendingUrl = tab.IsSettings ? null : url;
+        tab.SavedTitle = tab.IsSettings ? "Settings" : (string.IsNullOrWhiteSpace(title) || title == "New tab" ? tab.LastTitle : title);
         tab.Loaded = false;
         tab.PlayingAudio = false;
         tab.ActiveNavigationId = null;
@@ -2951,6 +3029,12 @@ sealed class BrowserWindow : Form
     // With no ready tab (startup, or the last tab just closed) open one instead of touching a missing CoreWebView2.
     Task Go(string text)
     {
+        if (SettingsPage.IsSettingsAddress(text))
+        {
+            if (address.InputFocused) ActiveControl = null;
+            OpenSettings();
+            return Task.CompletedTask;
+        }
         var target = Resolve(text);
         if (target is null) return Task.CompletedTask;
         if (settings.CleanLinksEnabled) target = CleanLink.Clean(target);
@@ -2959,6 +3043,8 @@ sealed class BrowserWindow : Form
             if (address.InputFocused) ActiveControl = null;
             return OpenInteractive(target);
         }
+        if (tab.IsSettings)
+            LeaveSettingsMode(tab);
         if (tab.Crash is not null)
         {
             tab.Crash = null;
@@ -3039,7 +3125,13 @@ sealed class BrowserWindow : Form
                 TryCore(() => core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal);
             }
             if (focusView) FocusView(view);
-            if (tab.PendingUrl is { } url)
+            if (tab.IsSettings)
+            {
+                tab.PendingUrl = null;
+                if (!tab.Loaded) TryCore(() => view.CoreWebView2?.Navigate(SettingsPage.InternalUrl));
+                else PushSettingsState(tab);
+            }
+            else if (tab.PendingUrl is { } url)
             {
                 tab.PendingUrl = null;
                 TryCore(() => view.CoreWebView2?.Navigate(url));
@@ -3094,7 +3186,13 @@ sealed class BrowserWindow : Form
             tab.View.BringToFront();
             if (TryCore(() => core.IsSuspended)) TryCore(() => core.Resume());
             TryCore(() => core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal);
-            if (tab.PendingUrl is { } url)
+            if (tab.IsSettings)
+            {
+                tab.PendingUrl = null;
+                if (!tab.Loaded) TryCore(() => core.Navigate(SettingsPage.InternalUrl));
+                else PushSettingsState(tab);
+            }
+            else if (tab.PendingUrl is { } url)
             {
                 tab.PendingUrl = null;
                 TryCore(() => core.Navigate(url));
@@ -3947,7 +4045,7 @@ sealed class BrowserWindow : Form
             settings = settings with { VerticalTabs = sidebarMode };
             settingsExisted = true;
             SaveSettings();
-            settingsDialog?.SyncFrom(settings);
+            PushSettingsStateToOpenTabs();
         }
         SaveSession();
     }
@@ -3975,11 +4073,12 @@ sealed class BrowserWindow : Form
         void SyncMenu()
         {
             reloadItem.Enabled = tab.Url is not null;
-            dupItem.Enabled = !restoring;
+            dupItem.Enabled = !restoring && !tab.IsSettings;
             copyLinkItem.Enabled = tab.Url is not null;
             pinItem.Text = tab.Pinned ? "Unpin tab" : "Pin tab";
             muteItem.Text = tab.Muted ? "Unmute tab" : "Mute tab";
-            var pageReady = tab.View is { IsDisposed: false, CoreWebView2: not null } && tab.Url is not null;
+            muteItem.Enabled = !tab.IsSettings;
+            var pageReady = !tab.IsSettings && tab.View is { IsDisposed: false, CoreWebView2: not null } && tab.Url is not null;
             printItem.Enabled = pageReady;
             saveItem.Enabled = pageReady;
             closeItem.Enabled = !tab.Pinned;
@@ -4243,7 +4342,7 @@ sealed class BrowserWindow : Form
 
     void OpenFindBar()
     {
-        if (closed || IsDisposed || environment is null || selected is not { View: { IsDisposed: false, CoreWebView2: { } core } }) return;
+        if (closed || IsDisposed || environment is null || selected is not { IsSettings: false, View: { IsDisposed: false, CoreWebView2: { } core } }) return;
         findBar.PositionIn(pages);
         findBar.Open(core, environment);
     }
@@ -4268,6 +4367,11 @@ sealed class BrowserWindow : Form
 
     void UpdateZoomIndicator()
     {
+        if (selected is { IsSettings: true })
+        {
+            address.SetZoom(ZoomLevels.Default);
+            return;
+        }
         var factor = selected is { View: { IsDisposed: false } view }
             ? TryCore(() => view.ZoomFactor, ZoomLevels.Default)
             : ZoomLevels.Default;
@@ -4283,7 +4387,7 @@ sealed class BrowserWindow : Form
             try { TryCore(() => view.ZoomFactor = target); }
             finally { tab.ApplyingZoom = false; }
         }
-        if (tab == selected) address.SetZoom(TryCore(() => view.ZoomFactor, target));
+        if (tab == selected) address.SetZoom(tab.IsSettings ? ZoomLevels.Default : TryCore(() => view.ZoomFactor, target));
     }
 
     void ApplyOriginZoomForTab(BrowserTab tab, WebView2 view, string? url)
@@ -4303,6 +4407,11 @@ sealed class BrowserWindow : Form
     void HandleZoomFactorChanged(BrowserTab tab, WebView2 view)
     {
         if (closed || tab.Closed || view.IsDisposed || !opened.Contains(tab)) return;
+        if (tab.IsSettings)
+        {
+            if (!tab.ApplyingZoom) ApplyZoomFactor(tab, view, ZoomLevels.Default);
+            return;
+        }
         var actual = TryCore(() => view.ZoomFactor, ZoomLevels.Default);
         if (!tab.ApplyingZoom && SitePrefsStore.OriginOf(tab.Url) is { } origin)
         {
@@ -4315,7 +4424,7 @@ sealed class BrowserWindow : Form
 
     void SetSelectedZoom(double target)
     {
-        if (selected is not { Closed: false, View: { IsDisposed: false } view } tab) return;
+        if (selected is not { Closed: false, IsSettings: false, View: { IsDisposed: false } view } tab) return;
         var normalized = ZoomLevels.Normalize(target);
         if (SitePrefsStore.OriginOf(tab.Url) is { } origin)
         {
@@ -4328,13 +4437,13 @@ sealed class BrowserWindow : Form
 
     void ZoomIn()
     {
-        if (selected is not { Closed: false, View: { IsDisposed: false } view }) return;
+        if (selected is not { Closed: false, IsSettings: false, View: { IsDisposed: false } view }) return;
         SetSelectedZoom(ZoomLevels.StepIn(TryCore(() => view.ZoomFactor, ZoomLevels.Default)));
     }
 
     void ZoomOut()
     {
-        if (selected is not { Closed: false, View: { IsDisposed: false } view }) return;
+        if (selected is not { Closed: false, IsSettings: false, View: { IsDisposed: false } view }) return;
         SetSelectedZoom(ZoomLevels.StepOut(TryCore(() => view.ZoomFactor, ZoomLevels.Default)));
     }
 
@@ -4342,13 +4451,13 @@ sealed class BrowserWindow : Form
 
     void PrintTab(BrowserTab tab, CoreWebView2PrintDialogKind kind = CoreWebView2PrintDialogKind.Browser)
     {
-        if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return;
+        if (closed || tab.Closed || tab.IsSettings || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return;
         TryCore(() => core.ShowPrintUI(kind));
     }
 
     async Task SaveTabAsync(BrowserTab tab)
     {
-        if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return;
+        if (closed || tab.Closed || tab.IsSettings || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return;
         try { await core.ShowSaveAsUIAsync(); }
         catch (Exception ex) when (ex is COMException or InvalidOperationException or ObjectDisposedException) { }
     }
@@ -4482,7 +4591,7 @@ sealed class BrowserWindow : Form
             case Keys.Control | Keys.Shift | Keys.T: if (!restoring) ReopenClosedTab(); return true;
             case Keys.Control | Keys.Shift | Keys.S: if (!restoring) SetOrientation(!vertical); return true;
             case Keys.Control | Keys.Shift | Keys.B: if (!restoring) ToggleTabBarCollapsed(); return true;
-            case Keys.Control | Keys.Oemcomma: OpenSettings(); return true;
+            case Keys.Control | Keys.Oemcomma: if (!restoring) OpenSettings(); return true;
             case Keys.Control | Keys.Tab:
             case Keys.Control | Keys.PageDown: if (!restoring) CycleTab(1); return true;
             case Keys.Control | Keys.Shift | Keys.Tab:
@@ -4526,28 +4635,246 @@ sealed class BrowserWindow : Form
         catch { }
     }
 
+    BrowserTab? FindSettingsTab() =>
+        opened.FirstOrDefault(t => !t.Closed && t.IsSettings) ?? openingSettingsTab;
+
     void OpenSettings()
     {
-        if (closed || IsDisposed) return;
-        if (settingsDialog is { IsDisposed: false })
+        if (closed || IsDisposed || restoring || environment is null) return;
+        if (FindSettingsTab() is { } existing)
         {
-            if (settingsDialog.WindowState == FormWindowState.Minimized)
-                settingsDialog.WindowState = FormWindowState.Normal;
-            settingsDialog.Activate();
+            if (opened.Contains(existing))
+            {
+                SelectTab(existing);
+                PushSettingsState(existing);
+            }
             return;
         }
-        settingsDialog = new SettingsDialog(
+        _ = OpenSettingsTabAsync();
+    }
+
+    async Task<BrowserTab?> OpenSettingsTabAsync()
+    {
+        if (closed || IsDisposed || environment is null) return null;
+        if (FindSettingsTab() is { } existing)
+        {
+            if (opened.Contains(existing))
+            {
+                SelectTab(existing);
+                PushSettingsState(existing);
+            }
+            return existing;
+        }
+        var tab = new BrowserTab { IsSettings = true, SavedTitle = "Settings" };
+        openingSettingsTab = tab;
+        try
+        {
+            await EnsureView(tab);
+        }
+        finally
+        {
+            if (ReferenceEquals(openingSettingsTab, tab)) openingSettingsTab = null;
+        }
+        if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return null;
+        opened.Add(tab);
+        SelectTab(tab, focusView: true);
+        AnimateNewTabOpen(tab);
+        TryCore(() => core.Navigate(SettingsPage.InternalUrl));
+        SaveSession();
+        return tab;
+    }
+
+    void LeaveSettingsMode(BrowserTab tab)
+    {
+        if (!tab.IsSettings) return;
+        tab.IsSettings = false;
+        tab.SavedTitle = null;
+        tab.Loaded = false;
+        if (tab.View is { IsDisposed: false, CoreWebView2: { } core })
+            TryCore(() => core.Settings.IsWebMessageEnabled = false);
+        if (selected == tab)
+        {
+            UpdateNavButtons();
+            UpdateShieldIndicator();
+            UpdateZoomIndicator();
+            UpdateWindowTitle();
+        }
+        RefreshTab(tab);
+    }
+
+    void PushSettingsState(BrowserTab tab)
+    {
+        if (closed || IsDisposed || tab.Closed || !tab.IsSettings) return;
+        if (tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return;
+        var src = TryCore(() => core.Source);
+        if (!SettingsPage.IsSettingsExactUrl(src)) return;
+        var palette = Theme.PaletteFor(Theme.EffectiveDark(settings.Theme));
+        var json = SettingsBridge.SerializeState(
             settings,
+            palette,
+            filterLists.GetStatuses(settings),
+            BrowserRegistration.IsRegistered(),
             noUpdateCheck,
-            ApplySettings,
-            ClearBrowsingDataAsync,
-            () => BrowserRegistration.IsRegistered(),
-            RegisterDefaultBrowser,
-            UnregisterDefaultBrowser,
-            () => filterLists.GetStatuses(settings),
-            () => filterLists.UpdateNowAsync(settings));
-        settingsDialog.FormClosed += (_, _) => { settingsDialog = null; };
-        settingsDialog.Show(this);
+            Updater.CurrentVersionText,
+            availableUpdate?.VersionText);
+        TryCore(() => core.PostWebMessageAsJson(json));
+    }
+
+    void PushSettingsNotice(BrowserTab tab, string scope, string kind, string message)
+    {
+        if (closed || IsDisposed || tab.Closed || !tab.IsSettings) return;
+        if (tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return;
+        var src = TryCore(() => core.Source);
+        if (!SettingsPage.IsSettingsExactUrl(src)) return;
+        TryCore(() => core.PostWebMessageAsJson(SettingsBridge.SerializeNotice(scope, kind, message)));
+    }
+
+    void PushSettingsStateToOpenTabs()
+    {
+        if (closed || IsDisposed) return;
+        foreach (var tab in opened)
+            if (!tab.Closed && tab.IsSettings)
+                PushSettingsState(tab);
+    }
+
+    bool TryHandleSettingsWebMessage(BrowserTab tab, string? source, string? rawJson)
+    {
+        if (closed || IsDisposed || tab.Closed || !tab.IsSettings) return false;
+        if (!SettingsPage.IsSettingsExactUrl(source)) return false;
+        if (tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return false;
+        if (!SettingsPage.IsSettingsExactUrl(TryCore(() => core.Source))) return false;
+        if (!SettingsBridge.TryParse(rawJson, out var cmd) || cmd is null) return false;
+
+        switch (cmd.Kind)
+        {
+            case SettingsActionKind.Ready:
+                PushSettingsState(tab);
+                return true;
+
+            case SettingsActionKind.SetSetting:
+            case SettingsActionKind.ToggleFilterList:
+                if (!SettingsBridge.TryApply(settings, cmd, noUpdateCheck, out var next))
+                    return false;
+                if (next != settings) ApplySettings(next);
+                else PushSettingsState(tab);
+                return true;
+
+            case SettingsActionKind.AddCustomFilterList:
+            {
+                var rawUrl = cmd.TextValue;
+                if (!FilterListService.IsValidCustomListUrl(rawUrl, out var normalized))
+                {
+                    PushSettingsNotice(tab, "customFilterList", "error", "Enter a valid https:// filter list URL.");
+                    return false;
+                }
+                var existing = settings.CustomFilterLists ?? [];
+                if (existing.Contains(normalized, StringComparer.OrdinalIgnoreCase))
+                {
+                    PushSettingsNotice(tab, "customFilterList", "error", "That filter list URL is already added.");
+                    return false;
+                }
+                if (existing.Length >= FilterListService.MaxCustomLists)
+                {
+                    PushSettingsNotice(tab, "customFilterList", "error", $"You can add up to {FilterListService.MaxCustomLists} custom lists.");
+                    return false;
+                }
+                ApplySettings(settings with { CustomFilterLists = [.. existing, normalized] });
+                PushSettingsNotice(tab, "customFilterList", "info", "");
+                return true;
+            }
+
+            case SettingsActionKind.RemoveCustomFilterList:
+            {
+                var target = cmd.TextValue;
+                var prev = settings.CustomFilterLists ?? [];
+                var nextCustom = prev.Where(u => !string.Equals(u, target, StringComparison.OrdinalIgnoreCase)).ToArray();
+                if (nextCustom.Length == prev.Length) return false;
+                ApplySettings(settings with { CustomFilterLists = nextCustom });
+                return true;
+            }
+
+            case SettingsActionKind.UpdateFilterLists:
+                _ = UpdateFilterListsFromSettingsAsync(tab);
+                return true;
+
+            case SettingsActionKind.RegisterDefaultBrowser:
+                try
+                {
+                    RegisterDefaultBrowser();
+                    PushSettingsState(tab);
+                    PushSettingsNotice(tab, "defaultBrowser", "info", "");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    PushSettingsNotice(tab, "defaultBrowser", "error", ex.Message);
+                    return false;
+                }
+
+            case SettingsActionKind.UnregisterDefaultBrowser:
+                try
+                {
+                    UnregisterDefaultBrowser();
+                    PushSettingsState(tab);
+                    PushSettingsNotice(tab, "defaultBrowser", "info", "Default browser registration removed.");
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    PushSettingsNotice(tab, "defaultBrowser", "error", ex.Message);
+                    return false;
+                }
+
+            case SettingsActionKind.ClearExternalApps:
+                if (settings.AllowedExternalApps.Length == 0) return true;
+                ApplySettings(settings with { AllowedExternalApps = [] });
+                PushSettingsNotice(tab, "externalApps", "info", "Remembered app permissions cleared.");
+                return true;
+
+            case SettingsActionKind.RemoveExternalApp:
+            {
+                var kept = settings.AllowedExternalApps
+                    .Where(p => !(string.Equals(p.Site, cmd.TextValue, StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(p.Scheme, cmd.Key, StringComparison.OrdinalIgnoreCase)))
+                    .ToArray();
+                if (kept.Length == settings.AllowedExternalApps.Length) return false;
+                ApplySettings(settings with { AllowedExternalApps = kept });
+                return true;
+            }
+
+            case SettingsActionKind.ClearBrowsingData:
+                _ = ClearBrowsingDataFromSettingsAsync(tab);
+                return true;
+
+            case SettingsActionKind.ApplyUpdate:
+                _ = ApplyUpdate();
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    async Task UpdateFilterListsFromSettingsAsync(BrowserTab tab)
+    {
+        try { await filterLists.UpdateNowAsync(settings); }
+        catch { }
+        finally { if (!closed && !IsDisposed && !tab.Closed) PushSettingsState(tab); }
+    }
+
+    async Task ClearBrowsingDataFromSettingsAsync(BrowserTab tab)
+    {
+        try
+        {
+            await ClearBrowsingDataAsync();
+            if (!closed && !IsDisposed && !tab.Closed)
+                PushSettingsNotice(tab, "clearData", "info", "Browsing data cleared.");
+        }
+        catch (Exception ex)
+        {
+            if (!closed && !IsDisposed && !tab.Closed)
+                PushSettingsNotice(tab, "clearData", "error", ex.Message);
+        }
     }
 
     static IReadOnlyDictionary<string, string>? BuildSmokeFilterListOverrides(string? smokeReport, string? fixture)
@@ -4640,7 +4967,7 @@ sealed class BrowserWindow : Form
             {
                 if (closed || IsDisposed) return;
                 _ = ApplyBlockingAsync(settings.BlockingEnabled);
-                settingsDialog?.RefreshFilterListStatuses();
+                PushSettingsStateToOpenTabs();
             });
         }
         catch { }
@@ -4653,7 +4980,7 @@ sealed class BrowserWindow : Form
         {
             BeginInvoke(() =>
             {
-                if (!closed && !IsDisposed) settingsDialog?.RefreshFilterListStatuses();
+                if (!closed && !IsDisposed) PushSettingsStateToOpenTabs();
             });
         }
         catch { }
@@ -4662,6 +4989,11 @@ sealed class BrowserWindow : Form
     void UpdateShieldIndicator()
     {
         if (closed || IsDisposed || address.IsDisposed) return;
+        if (selected is { IsSettings: true })
+        {
+            address.SetShield(visible: false, enabled: false, blockedCount: 0);
+            return;
+        }
         var site = SitePrefsStore.HostOf(selected?.Url);
         var enabled = settings.BlockingEnabled && !sitePrefs.IsShieldDisabled(site);
         var count = selected?.BlockedCount() ?? 0;
@@ -4704,7 +5036,7 @@ sealed class BrowserWindow : Form
         }
         if (fromButtonClick && Environment.TickCount64 - shieldFlyoutClosedAt < 250)
             return;
-        if (selected is not { Closed: false } tab) return;
+        if (selected is not { Closed: false, IsSettings: false } tab) return;
         var site = SitePrefsStore.HostOf(tab.Url);
         if (site is null) return;
 
@@ -4798,8 +5130,21 @@ sealed class BrowserWindow : Form
                     TryCore(() => c.Resume());
         }
 
+        if (next.Theme != prev.Theme)
+        {
+            var scheme = SettingsStore.ToWebViewColorScheme(next.Theme);
+            foreach (var tab in opened)
+                if (!tab.Closed && tab.View is { IsDisposed: false, CoreWebView2.Profile: { } profile })
+                {
+                    TryCore(() => profile.PreferredColorScheme = scheme);
+                    break; // Profile is shared across all tabs in this window.
+                }
+        }
+
         if (!next.AutoUpdateCheck && prev.AutoUpdateCheck && !updating)
             updateCts?.Cancel();
+
+        PushSettingsStateToOpenTabs();
     }
 
     async Task ClearBrowsingDataAsync()
@@ -4819,7 +5164,7 @@ sealed class BrowserWindow : Form
 
     async Task SharePage()
     {
-        if (!settings.ShareEnabled || selected is null || busy) return;
+        if (!settings.ShareEnabled || selected is null || selected.IsSettings || busy) return;
         var tab = selected;
         if (tab.View is not { IsDisposed: false, CoreWebView2: { } core } || !PageHandoff.Allowed(core.Source))
         {
@@ -4870,7 +5215,7 @@ sealed class BrowserWindow : Form
             busy = false;
             if (!closed && !IsDisposed && !shareBtn.IsDisposed)
             {
-                shareBtn.Enabled = true;
+                UpdateShareButton();
                 shareBtn.SetActive(false);
                 tips.SetToolTip(shareBtn, "Share page text once with a local agent");
             }
@@ -4889,6 +5234,7 @@ sealed class BrowserWindow : Form
         updateBtn.Visible = true;
         if (vertical) LayoutSideTopBand();
         else LayoutTopStrip();
+        PushSettingsStateToOpenTabs();
     }
 
     async Task ApplyUpdate()
@@ -5049,7 +5395,7 @@ sealed class BrowserWindow : Form
         foreach (var tab in opened.ToArray())
         {
             if (closed) return;
-            if (tab == selected || tab.Closed || tab.Pinned || tab.Navigating || tab.Suspending) continue;
+            if (tab == selected || tab.Closed || tab.Pinned || tab.IsSettings || tab.Navigating || tab.Suspending) continue;
             if (tab.HiddenSince is not { } hiddenSince || now - hiddenSince < minAgeMs) continue;
             if (tab.View is not { IsDisposed: false, Visible: false, CoreWebView2: { } core }) continue;
             if (TryCore(() => core.IsSuspended || core.IsDocumentPlayingAudio, true)) continue;
@@ -5068,6 +5414,181 @@ sealed class BrowserWindow : Form
     int HitTestAt(Point screenPt) => unchecked((int)SendMessage(Handle, WM_NCHITTEST, IntPtr.Zero, MakeLParam(screenPt.X, screenPt.Y)).ToInt64());
 
     static Point CenterOnScreen(Control c) => c.PointToScreen(new Point(c.Width / 2, c.Height / 2));
+
+    // #57: browse://settings tab, its message bridge, and the guards that keep web pages away from it.
+    async Task<object> SettingsPageSmoke(string fixture)
+    {
+        async Task<bool> Until(Func<bool> cond, int ms = 8000)
+        {
+            var w = Stopwatch.StartNew();
+            while (!cond()) { if (w.ElapsedMilliseconds > ms) return false; await Task.Delay(25); }
+            return true;
+        }
+        async Task<string> Js(BrowserTab t, string script) =>
+            t.View?.CoreWebView2 is { } c ? await c.ExecuteScriptAsync(script) : "null";
+        async Task<bool> JsUntil(BrowserTab t, string script, string expected, int ms = 8000)
+        {
+            var w = Stopwatch.StartNew();
+            while (w.ElapsedMilliseconds < ms) { if (await Js(t, script) == expected) return true; await Task.Delay(50); }
+            return false;
+        }
+        string Post(object msg) => "chrome.webview.postMessage(" + JsonSerializer.Serialize(msg) + ")";
+        string SavedJson() { try { return File.ReadAllText(settingsFile); } catch { return ""; } }
+
+        var start = settings;
+        var countBefore = opened.Count;
+        var origin = selected;
+        HandleShortcut(Keys.Control | Keys.Oemcomma);
+        await Until(() => opened.Any(t => t.IsSettings && t.Loaded));
+        var st = opened.FirstOrDefault(t => t.IsSettings);
+        if (st is null) return new { opensTab = false };
+        var ready = await JsUntil(st, "document.documentElement.dataset.ready === '1'", "true");
+        var opensTab = ready && selected == st && opened.Count == countBefore + 1
+            && address.Input.Text == SettingsPage.DisplayUrl && st.Url == SettingsPage.DisplayUrl && st.Title == "Settings";
+
+        if (origin is not null) SelectTab(origin);
+        HandleShortcut(Keys.Control | Keys.Oemcomma);
+        await Until(() => selected == st, 3000);
+        var switchesNoDuplicate = selected == st && opened.Count == countBefore + 1 && opened.Count(t => t.IsSettings) == 1;
+
+        // Chrome controls that make no sense for the settings page.
+        OpenFindBar();
+        ZoomIn();
+        var controlsDisabled = !shareBtn.Enabled && !findBar.Visible && !address.ShieldButtonVisible
+            && ZoomLevels.IsDefault(TryCore(() => st.View!.ZoomFactor, 0)) && !backBtn.Enabled;
+
+        // Theme pushed on load and on change.
+        var palette = Theme.PaletteFor(Theme.EffectiveDark(settings.Theme));
+        var themeOnLoad = await Js(st, "document.documentElement.dataset.theme + '|' + getComputedStyle(document.documentElement).getPropertyValue('--ground').trim()")
+            == JsonSerializer.Serialize((palette.Dark ? "dark" : "light") + "|" + palette.Ground);
+        await Js(st, Post(new { type = "setSetting", key = "theme", value = "dark" }));
+        var themeDark = await Until(() => settings.Theme == ThemePreference.Dark)
+            && await JsUntil(st, "document.documentElement.dataset.theme", "\"dark\"")
+            && await Js(st, "document.querySelector('input[name=theme][value=dark]').checked") == "true";
+        await Js(st, Post(new { type = "setSetting", key = "theme", value = "light" }));
+        var themeLight = await Until(() => settings.Theme == ThemePreference.Light)
+            && await JsUntil(st, "document.documentElement.dataset.theme", "\"light\"")
+            && SavedJson().Contains("\"theme\": \"light\"", StringComparison.Ordinal);
+        await Js(st, Post(new { type = "setSetting", key = "theme", value = "system" }));
+        await Until(() => settings.Theme == ThemePreference.System);
+        var themePushed = themeOnLoad && themeDark && themeLight;
+
+        // A real UI click posts the message; the host applies it, saves it, and the toolbar reacts.
+        await Js(st, "document.getElementById('opt-share').click()");
+        var shareOff = await Until(() => !settings.ShareEnabled) && !shareBtn.Visible
+            && SavedJson().Contains("\"shareEnabled\": false", StringComparison.Ordinal);
+        await Js(st, Post(new { type = "setSetting", key = "shareEnabled", value = true }));
+        var shareOn = await Until(() => settings.ShareEnabled) && shareBtn.Visible
+            && await JsUntil(st, "document.getElementById('opt-share').checked", "true");
+        var toggleFromPage = shareOff && shareOn;
+
+        // Filter list toggle round-trips through settings and back to the page.
+        await Js(st, Post(new { type = "toggleFilterList", id = "easylist", enabled = false }));
+        var listOff = await Until(() => (settings.DisabledFilterLists ?? []).Contains("easylist"))
+            && await JsUntil(st, "document.getElementById('fl-easylist').checked", "false")
+            && SavedJson().Contains("easylist", StringComparison.Ordinal);
+        await Js(st, Post(new { type = "toggleFilterList", id = "easylist", enabled = true }));
+        var listOn = await Until(() => (settings.DisabledFilterLists ?? []).Length == 0)
+            && await JsUntil(st, "document.getElementById('fl-easylist').checked", "true");
+        await Js(st, Post(new { type = "addCustomFilterList", url = "https://filters.example.com/smoke.txt" }));
+        var customAdded = await Until(() => (settings.CustomFilterLists ?? []).Contains("https://filters.example.com/smoke.txt"));
+        await Js(st, Post(new { type = "addCustomFilterList", url = "http://filters.example.com/insecure.txt" }));
+        var customRejected = await JsUntil(st, "document.getElementById('custom-list-notice').hidden", "false")
+            && (settings.CustomFilterLists ?? []).Length == 1;
+        await Js(st, Post(new { type = "removeCustomFilterList", url = "https://filters.example.com/smoke.txt" }));
+        var customRemoved = await Until(() => (settings.CustomFilterLists ?? []).Length == 0);
+        var filterListRoundTrip = listOff && listOn && customAdded && customRejected && customRemoved;
+
+        // External app permissions: listed on the page, removable one at a time.
+        ApplySettings(settings with { AllowedExternalApps = [new("https://example.com", "vscode"), new("https://example.com", "mailto")] });
+        var listed = await JsUntil(st, "document.querySelectorAll('#external-apps-list li').length", "2");
+        await Js(st, "document.querySelector('#external-apps-list li button').click()");
+        var removedOne = await Until(() => settings.AllowedExternalApps.Length == 1);
+        await Js(st, Post(new { type = "clearExternalApps" }));
+        var externalAppsOk = listed && removedOne && await Until(() => settings.AllowedExternalApps.Length == 0);
+
+        // Malformed and unknown messages change nothing, whether they come from the page or straight to the handler.
+        string[] invalid =
+        [
+            "{\"type\":\"execShell\"}", "{\"type\":\"setSetting\",\"key\":\"blockingEnabled\",\"value\":\"false\"}",
+            "{\"type\":\"setSetting\",\"key\":\"theme\",\"value\":\"neon\"}", "{\"type\":\"setSetting\",\"key\":\"settingsFile\",\"value\":true}",
+            "{\"type\":\"toggleFilterList\",\"id\":\"../../x\",\"enabled\":false}", "{\"type\":\"clearBrowsingData\"}",
+            "{\"type\":\"removeExternalApp\",\"site\":\"https://example.com\"}", "[1,2]", "\"not an object\"",
+        ];
+        var snapshot = settings;
+        foreach (var bad in invalid)
+            await Js(st, "chrome.webview.postMessage(" + bad + ")");
+        await Js(st, Post(new { type = "setSetting", key = "sleepingTabsEnabled", value = false })); // sentinel: queued after the bad ones
+        var sentinel = await Until(() => !settings.SleepingTabsEnabled);
+        var invalidRejected = sentinel && settings == snapshot with { SleepingTabsEnabled = false }
+            && invalid.All(bad => !TryHandleSettingsWebMessage(st, SettingsPage.InternalUrl, bad));
+        await Js(st, Post(new { type = "setSetting", key = "sleepingTabsEnabled", value = true }));
+        await Until(() => settings.SleepingTabsEnabled);
+
+        // A normal web tab has no bridge, and spoofed sources/tabs are refused.
+        var web = await Open(fixture + "/first");
+        await WaitForLoad(web);
+        var valid = "{\"type\":\"setSetting\",\"key\":\"shareEnabled\",\"value\":false}";
+        await Js(web, "try { window.chrome.webview.postMessage(" + valid + "); } catch {}"); // stub exists, IsWebMessageEnabled=false drops it
+        await Task.Delay(500);
+        var webMessageIgnored = new
+        {
+            webSource = !TryHandleSettingsWebMessage(web, fixture + "/first", valid),
+            spoofedSource = !TryHandleSettingsWebMessage(web, SettingsPage.InternalUrl, valid),
+            settingsTabWebSource = !TryHandleSettingsWebMessage(st, fixture + "/first", valid),
+            livePostIgnored = settings.ShareEnabled,
+        };
+
+        // Web pages cannot navigate to, open, frame, or fetch the settings page.
+        var webUrl = web.Url;
+        var openedCount = opened.Count;
+        await Js(web, "location.href = 'https://settings.browse.invalid/'");
+        await Task.Delay(600);
+        await Js(web, "location.href = 'browse://settings'");
+        await Task.Delay(600);
+        await Js(web, "window.open('https://settings.browse.invalid/'); window.open('browse://settings')");
+        await Js(web, "window.__f = document.createElement('iframe'); window.__f.src = 'https://settings.browse.invalid/'; document.body.appendChild(window.__f);"
+            + "window.__fetch = 'pending'; fetch('https://settings.browse.invalid/').then(r => window.__fetch = 'status:' + r.status).catch(() => window.__fetch = 'error')");
+        await Task.Delay(1200);
+        var frameBlocked = await Js(web, "(() => { try { return window.__f.contentWindow.location.href; } catch { return 'cross-origin'; } })()") == "\"about:blank\"";
+        var fetchBlocked = await JsUntil(web, "window.__fetch === 'error' || window.__fetch === 'status:403'", "true", 3000);
+        var webBlocked = new
+        {
+            stayed = web.Url == webUrl && !web.IsSettings,
+            noNewTab = opened.Count == openedCount && opened.Count(t => t.IsSettings) == 1,
+            frameBlocked,
+            fetchBlocked,
+        };
+        CloseTab(web);
+
+        // Typing a web address in the settings tab turns it into a normal tab without the bridge.
+        SelectTab(st);
+        await Go(fixture + "/second?a");
+        await Until(() => !st.IsSettings && st.Loaded && st.Url?.StartsWith(fixture, StringComparison.Ordinal) == true);
+        var leavesSettings = !st.IsSettings && st.Url?.StartsWith(fixture + "/second", StringComparison.Ordinal) == true
+            && !TryHandleSettingsWebMessage(st, fixture + "/second?a", valid)
+            && !TryHandleSettingsWebMessage(st, SettingsPage.InternalUrl, valid)
+            && address.Input.Text != SettingsPage.DisplayUrl;
+        CloseTab(st, recordClosed: false);
+        if (origin is not null && opened.Contains(origin)) SelectTab(origin);
+
+        return new
+        {
+            opensTab,
+            switchesNoDuplicate,
+            controlsDisabled,
+            themePushed,
+            toggleFromPage,
+            filterListRoundTrip,
+            externalAppsOk,
+            invalidRejected,
+            webMessageIgnored,
+            webBlocked,
+            leavesSettings,
+            settingsRestored = settings == start,
+            selfCheck = SettingsBridge.SelfCheck(),
+        };
+    }
 
     async Task SmokeTest()
     {
@@ -5209,6 +5730,12 @@ sealed class BrowserWindow : Form
             var firstPinned = opened.FirstOrDefault(t => t.Pinned);
             if (firstPinned is not null) CloseTab(firstPinned);
             PerformLayout();
+            var restoredSettingsReady = false;
+            for (var i = 0; i < 100 && !restoredSettingsReady && opened.FirstOrDefault(t => t.IsSettings)?.View?.CoreWebView2 is { } sc; i++)
+            {
+                restoredSettingsReady = await sc.ExecuteScriptAsync("document.documentElement.dataset.ready === '1'") == "true";
+                if (!restoredSettingsReady) await Task.Delay(50);
+            }
             var noCosmeticAfterRestore = selected?.View?.CoreWebView2 is { } rCore
                 && await rCore.ExecuteScriptAsync("document.getElementById('search-shield-css') === null") == "true";
             File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new
@@ -5241,6 +5768,11 @@ sealed class BrowserWindow : Form
                 shieldUiOffRestored = !address.ShieldEnabledForSite,
                 noCosmeticAfterRestore,
                 cachedListsLoaded = !Shield.CurrentEngine.IsFallback && Shield.CurrentEngine.NetworkRuleCount > 0,
+                settingsTab = opened.FirstOrDefault(t => t.IsSettings) is { } rs
+                    ? new { count = opened.Count(t => t.IsSettings), selected = selected == rs, loaded = rs.Loaded,
+                        exactSource = SettingsPage.IsSettingsExactUrl(TryCore(() => rs.View?.CoreWebView2?.Source)),
+                        ready = restoredSettingsReady }
+                    : null,
             }));
             ExitCode = 0;
             Close();
@@ -5514,15 +6046,8 @@ sealed class BrowserWindow : Form
         var iconFontFamily = Theme.IconFont.FontFamily.Name;
         var captionFontFamily = Theme.CaptionIconFont.FontFamily.Name;
 
-        OpenSettings();
-        var dlg1 = settingsDialog;
-        OpenSettings();
-        var dlg2 = settingsDialog;
-        var settingsDialogOk = dlg1 is { IsDisposed: false, Visible: true }
-            && ReferenceEquals(dlg1, dlg2)
-            && dlg1.AccessibleName == "Settings"
-            && settingsBtn.AccessibleName == "Settings";
-        dlg1?.Close();
+        var settingsPage = await SettingsPageSmoke(fixture!);
+        var settingsDialogOk = settingsBtn.AccessibleName == "Settings";
 
         ApplySettings(settings with { ShareEnabled = false });
         var shareHiddenWhenOff = !shareBtn.Visible;
@@ -6676,13 +7201,6 @@ sealed class BrowserWindow : Form
             shareDialogOk &= simShare.VerifyLayoutInsideClient();
         }
 
-        var settingsDialogDpiOk = true;
-        foreach (var dpi in new[] { 96, 144, 192 })
-        {
-            using var simSettings = new SettingsDialog(settings, noUpdateCheck, _ => { }, () => Task.CompletedTask, dpiOverride: dpi);
-            settingsDialogDpiOk &= simSettings.VerifyLayoutInsideClient();
-        }
-
         var externalAppDialogOk = true;
         foreach (var dpi in new[] { 96, 144, 192 })
         {
@@ -6699,7 +7217,6 @@ sealed class BrowserWindow : Form
             liveMinLayoutOk,
             simulatedDpiOk,
             shareDialogOk,
-            settingsDialogDpiOk,
             externalAppDialogOk,
         };
 
@@ -8075,7 +8592,7 @@ sealed class BrowserWindow : Form
             verticalAndHorizontal = orientations, orientationDetail, captionHidden, hitTests, maximizeToggles, chromeHiddenWorks,
             stripOverflowSafe, stripWheelScrolled, sideWheelStep, menuDeferredDispose, ncTrackedOnDown, captionNoTooltips,
             updaterSelfCheck, settingsRoundTrip, iconFontFamily, captionFontFamily,
-            settingsDialogOk, shareToggleWorks,
+            settingsDialogOk, settingsPage, shareToggleWorks,
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
             urlWhenCleanOff, cliFlags, cliUrl, browserRegistration, externalSchemes,
             faviconCached, addressDisplayOk, tabDrag, tabAnim, tabFixes, highDpi, shareTimeout,

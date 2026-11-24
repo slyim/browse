@@ -109,7 +109,7 @@ static class SitePrefsStore
             if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) return null;
             var h = uri.HostNameType is UriHostNameType.IPv4 or UriHostNameType.IPv6 ? uri.Host : uri.IdnHost;
             h = h.TrimEnd('.').ToLowerInvariant();
-            return h.Length > 0 ? h : null;
+            return h.Length > 0 && !SettingsPage.IsSettingsHost(h) ? h : null;
         }
         if (trimmed.Any(c => char.IsWhiteSpace(c) || c < 0x20 || c is '/' or '?' or '#' or '@'))
             return null;
