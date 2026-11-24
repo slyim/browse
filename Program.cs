@@ -195,6 +195,8 @@ sealed class BrowserWindow : Form
     readonly System.Windows.Forms.Timer saveTimer = new() { Interval = 500 };
     readonly System.Windows.Forms.Timer sleepTimer = new() { Interval = 30_000 };
     readonly System.Windows.Forms.Timer dragScrollTimer = new() { Interval = 30 };
+    readonly System.Windows.Forms.Timer loadingTimer = new() { Interval = 60 };
+    int loadingPhase;
 
     readonly List<BrowserTab> opened = [];
     readonly Dictionary<BrowserTab, Control> tabControls = [];
@@ -243,6 +245,7 @@ sealed class BrowserWindow : Form
     Func<string, string, bool>? confirmDownloadOverride;
     Func<string, bool>? confirmShareOverride;
     Action<string>? shareErrorOverride;
+    Action<string, string[]>? launchWindowOverride;
     int? dpiOverride;
     long envMs;
     long drawTabsTicks;
@@ -352,6 +355,8 @@ sealed class BrowserWindow : Form
         public bool Suspending { get; set; }
         public BrowserTab? Opener { get; set; }
         public bool IsPopup { get; init; }
+        public bool PlayingAudio { get; set; }
+        public bool Muted { get; set; }
         public bool Navigating => ActiveNavigationId is not null;
         public Func<int> BlockedCount { get; set; } = () => 0;
         public Func<bool, Task> SetShieldEnabledAsync { get; set; } = _ => Task.CompletedTask;
@@ -414,7 +419,7 @@ sealed class BrowserWindow : Form
 
         backBtn = MakeIcon(Theme.Glyphs.Back, "Back", GoBack);
         forwardBtn = MakeIcon(Theme.Glyphs.Forward, "Forward", GoForward);
-        reloadBtn = MakeIcon(Theme.Glyphs.Reload, "Reload", ReloadCurrent);
+        reloadBtn = MakeIcon(Theme.Glyphs.Reload, "Reload", ReloadOrStopCurrent);
         shareBtn = MakeIcon(Theme.Glyphs.Share, "Share page text once with a local agent", () => _ = SharePage());
         shareBtn.Visible = settings.ShareEnabled;
         updateBtn = MakeIcon(Theme.Glyphs.Update, "Update available", () => _ = ApplyUpdate());
@@ -472,11 +477,12 @@ sealed class BrowserWindow : Form
         sleepTimer.Tick += (_, _) => { if (settings.SleepingTabsEnabled) _ = SleepIdleTabs(IdleSleepThreshold); };
         sleepTimer.Start();
         dragScrollTimer.Tick += (_, _) => HandleDragAutoScroll();
+        loadingTimer.Tick += (_, _) => TickLoadingSpinner();
         Activated += (_, _) => SetCaptionWindowActive(true);
         Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); };
         Load += async (_, _) => await Start();
         FormClosing += (_, _) => FlushSession();
-        FormClosed += (_, _) => { closed = true; CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); };
+        FormClosed += (_, _) => { closed = true; CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); };
     }
 
     int S(int px) => dpiOverride is { } dpi
@@ -506,6 +512,7 @@ sealed class BrowserWindow : Form
             saveTimer.Dispose();
             sleepTimer.Dispose();
             dragScrollTimer.Dispose();
+            loadingTimer.Dispose();
             if (!dropLine.IsDisposed) dropLine.Dispose();
             ReleaseSessionLock();
         }
@@ -957,25 +964,79 @@ sealed class BrowserWindow : Form
 
     void GoBack() => TryCore(() => { if (selected is { View: { IsDisposed: false, CanGoBack: true } view }) view.GoBack(); });
     void GoForward() => TryCore(() => { if (selected is { View: { IsDisposed: false, CanGoForward: true } view }) view.GoForward(); });
-    void ReloadCurrent()
+    void ReloadCurrent() { if (selected is { } tab) ReloadTab(tab); }
+    void ReloadOrStopCurrent()
     {
-        if (selected is not { } tab) return;
+        if (selected is { Navigating: true }) StopCurrent();
+        else ReloadCurrent();
+    }
+
+    void StopCurrent()
+    {
+        if (selected is not { Navigating: true } tab) return;
+        var stopped = tab.View is { IsDisposed: false, CoreWebView2: { } core } && TryCore(() => core.Stop());
+        if (!stopped) SetNavigationState(tab, null, null);
+    }
+
+    void ReloadTab(BrowserTab tab)
+    {
+        if (closed || tab.Closed) return;
         if (tab.View is not { IsDisposed: false } view)
         {
-            if (tab.Url is { } pendingUrl) { tab.PendingUrl ??= pendingUrl; _ = EnsureViewAndNavigate(tab); }
+            // An unloaded background tab already loads fresh when selected.
+            if (tab.Url is { } pendingUrl) { tab.PendingUrl ??= pendingUrl; if (tab == selected) _ = EnsureViewAndNavigate(tab); }
             return;
         }
         TryCore(() => {
+            if (view.CoreWebView2 is { } c && c.IsSuspended) c.Resume();
             if (!tab.Loaded && tab.SavedUrl is { } url) view.CoreWebView2?.Navigate(url); // first load never committed
             else if (tab.Url is not null) view.Reload();
         });
+    }
+
+    void SetNavigationState(BrowserTab tab, ulong? navId, Uri? pendingUri)
+    {
+        var wasNavigating = tab.Navigating;
+        tab.ActiveNavigationId = navId;
+        tab.PendingPageUri = pendingUri;
+        if (tab.Navigating == wasNavigating || closed || IsDisposed) return;
+        if (selected == tab) UpdateNavButtons();
+        if (opened.Contains(tab)) RefreshTab(tab);
+        SyncLoadingTimer();
+    }
+
+    void SyncLoadingTimer()
+    {
+        if (closed || IsDisposed) { loadingTimer.Stop(); return; }
+        var any = opened.Any(t => !t.Closed && t.Navigating);
+        if (any) { if (!loadingTimer.Enabled) loadingTimer.Start(); }
+        else if (loadingTimer.Enabled) loadingTimer.Stop();
+    }
+
+    void TickLoadingSpinner()
+    {
+        if (closed || IsDisposed) { loadingTimer.Stop(); return; }
+        loadingPhase = (loadingPhase + 30) % 360;
+        var any = false;
+        foreach (var tab in opened)
+        {
+            if (tab.Closed || !tab.Navigating) continue;
+            any = true;
+            if (tabControls.TryGetValue(tab, out var ctrl) && !ctrl.IsDisposed && ctrl is ITabItem item)
+                item.SetLoadingPhase(loadingPhase);
+        }
+        if (!any) loadingTimer.Stop();
     }
 
     void UpdateNavButtons()
     {
         backBtn.Enabled = TryCore(() => selected is { View: { IsDisposed: false, CanGoBack: true } });
         forwardBtn.Enabled = TryCore(() => selected is { View: { IsDisposed: false, CanGoForward: true } });
-        reloadBtn.Enabled = selected is { Url: not null };
+        var loading = selected is { Navigating: true };
+        var tip = loading ? "Stop" : "Reload";
+        reloadBtn.SetGlyph(loading ? Theme.Glyphs.Stop : Theme.Glyphs.Reload, tip);
+        if (tips.GetToolTip(reloadBtn) != tip) tips.SetToolTip(reloadBtn, tip);
+        reloadBtn.Enabled = loading || selected is { Url: not null };
     }
 
     async Task Start()
@@ -1181,6 +1242,14 @@ sealed class BrowserWindow : Form
         async Task Create()
         {
             var view = new WebView2 { Dock = DockStyle.Fill, Visible = false, DefaultBackgroundColor = Theme.Ground };
+            // WebView2 routes focused accelerator keys through Control.OnKeyDown rather than ProcessCmdKey; defer out of the sync COM callback.
+            view.KeyDown += (_, e) => {
+                if (!IsHandledShortcut(e.KeyData)) return;
+                e.Handled = true;
+                var keyData = e.KeyData;
+                if (!closed && !IsDisposed && IsHandleCreated)
+                    BeginInvoke(() => { if (!closed && !IsDisposed) HandleShortcut(keyData); });
+            };
             pages.Controls.Add(view);
             try
             {
@@ -1206,8 +1275,7 @@ sealed class BrowserWindow : Form
                 var recentCleaned = new List<(string Url, long At)>(8);
                 void TrackNavigation(CoreWebView2NavigationStartingEventArgs e)
                 {
-                    tab.ActiveNavigationId = e.NavigationId;
-                    tab.PendingPageUri = Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u : null;
+                    SetNavigationState(tab, e.NavigationId, Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u : null);
                 }
                 core.NavigationStarting += (_, e) => {
                     if (!IsNavigable(e.Uri))
@@ -1217,11 +1285,11 @@ sealed class BrowserWindow : Form
                     }
                     if (!PageHandoff.Allowed(e.Uri))
                     {
-                        tab.ActiveNavigationId = e.NavigationId;
-                        tab.PendingPageUri = e.Uri.StartsWith("blob:", StringComparison.OrdinalIgnoreCase)
-                            && Uri.TryCreate(e.Uri[5..], UriKind.Absolute, out var blobOrigin)
-                                ? blobOrigin
+                        var blobOrigin = e.Uri.StartsWith("blob:", StringComparison.OrdinalIgnoreCase)
+                            && Uri.TryCreate(e.Uri[5..], UriKind.Absolute, out var bo)
+                                ? bo
                                 : null;
+                        SetNavigationState(tab, e.NavigationId, blobOrigin);
                         return;
                     }
                     // Re-navigating a popup can sever window.opener mid-OAuth, and Navigate() would turn a POST into a bodyless GET.
@@ -1251,10 +1319,7 @@ sealed class BrowserWindow : Form
                 };
                 core.NavigationCompleted += (_, e) => {
                     if (tab.ActiveNavigationId == e.NavigationId)
-                    {
-                        tab.ActiveNavigationId = null;
-                        tab.PendingPageUri = null;
-                    }
+                        SetNavigationState(tab, null, null);
                     if (e.IsSuccess) tab.CrashRecovered = false;
                 };
                 core.PermissionRequested += (_, e) => {
@@ -1338,6 +1403,18 @@ sealed class BrowserWindow : Form
                     SaveSession();
                 };
                 core.FaviconChanged += (_, _) => _ = UpdateFaviconAsync(tab, core);
+                if (tab.Muted) TryCore(() => core.IsMuted = true);
+                tab.PlayingAudio = TryCore(() => core.IsDocumentPlayingAudio);
+                core.IsDocumentPlayingAudioChanged += (_, _) => {
+                    if (closed || tab.Closed || !opened.Contains(tab)) return;
+                    tab.PlayingAudio = TryCore(() => core.IsDocumentPlayingAudio);
+                    RefreshTab(tab);
+                };
+                core.IsMutedChanged += (_, _) => {
+                    if (closed || tab.Closed || !opened.Contains(tab)) return;
+                    tab.Muted = TryCore(() => core.IsMuted);
+                    RefreshTab(tab);
+                };
                 tab.View = view;
             }
             catch
@@ -1433,6 +1510,7 @@ sealed class BrowserWindow : Form
         tab.PendingUrl = url;
         tab.SavedTitle = string.IsNullOrWhiteSpace(title) || title == "New tab" ? tab.LastTitle : title;
         tab.Loaded = false;
+        tab.PlayingAudio = false;
         tab.ActiveNavigationId = null;
         tab.PendingPageUri = null;
         tab.Suspending = false;
@@ -1445,6 +1523,8 @@ sealed class BrowserWindow : Form
             tab.View = null;
             CleanupView(oldView);
         }
+        SyncLoadingTimer();
+        if (!closed && !IsDisposed && opened.Contains(tab)) RefreshTab(tab);
     }
 
     void RecreateTabView(BrowserTab tab)
@@ -1457,8 +1537,7 @@ sealed class BrowserWindow : Form
 
     void HandleProcessFailed(BrowserTab tab, WebView2 view, CoreWebView2ProcessFailedKind kind)
     {
-        tab.ActiveNavigationId = null;
-        tab.PendingPageUri = null;
+        SetNavigationState(tab, null, null);
         if (closed || IsDisposed) return;
 
         if (kind == CoreWebView2ProcessFailedKind.BrowserProcessExited)
@@ -1731,18 +1810,10 @@ sealed class BrowserWindow : Form
         if (tab.Pinned) return;
         var index = opened.IndexOf(tab);
         if (index < 0) return;
-        if (tab == dragTab) CancelTabDrag();
         var display = DisplayTabs();
         var displayIndex = display.IndexOf(tab);
-        tab.Closed = true;
-        if (recordClosed && tab.Url is { } url && PageHandoff.Allowed(url)) closedUrls.Push(url);
-        opened.RemoveAt(index);
-        foreach (var t in opened) if (t.Opener == tab) t.Opener = null;
-        if (tab.View is { } view)
-        {
-            tab.View = null;
-            CleanupView(view);
-        }
+        DetachTab(tab, recordClosed);
+        SyncLoadingTimer();
         if (selected != tab) { SyncTabs(); SaveSession(); return; }
         selected = null;
         if (opened.Count == 0) { UpdateAddress(); UpdateNavButtons(); UpdateWindowTitle(); SyncTabs(); SaveSession(); NewTab(); }
@@ -1754,6 +1825,142 @@ sealed class BrowserWindow : Form
                 : display[displayIndex - 1];
             SyncTabs();
             SelectTab(next);
+        }
+    }
+
+    void DetachTab(BrowserTab tab, bool recordClosed)
+    {
+        if (tab == dragTab) CancelTabDrag();
+        tab.Closed = true;
+        tab.ActiveNavigationId = null;
+        tab.PendingPageUri = null;
+        if (recordClosed && tab.Url is { } url && PageHandoff.Allowed(url)) closedUrls.Push(url);
+        opened.Remove(tab);
+        foreach (var t in opened) if (t.Opener == tab) t.Opener = null;
+        if (tab.View is { } view)
+        {
+            tab.View = null;
+            CleanupView(view);
+        }
+    }
+
+    List<BrowserTab> TabsBelow(BrowserTab tab)
+    {
+        var display = DisplayTabs();
+        return [.. display.Skip(display.IndexOf(tab) + 1).Where(t => !t.Pinned)];
+    }
+
+    // Closes unpinned tabs in bulk; keep is never among them and takes over if the selected tab goes.
+    void CloseTabs(List<BrowserTab> targets, BrowserTab keep)
+    {
+        if (targets.Count == 0) return;
+        var closingSelected = selected is { } sel && targets.Contains(sel);
+        foreach (var tab in targets) DetachTab(tab, recordClosed: true);
+        SyncLoadingTimer();
+        if (closingSelected) selected = null;
+        SyncTabs();
+        if (closingSelected) SelectTab(keep);
+        else SaveSession();
+    }
+
+    void CloseOtherTabs(BrowserTab tab)
+    {
+        if (closed || tab.Closed || !opened.Contains(tab)) return;
+        CloseTabs([.. DisplayTabs().Where(t => t != tab && !t.Pinned)], tab);
+    }
+
+    void CloseTabsBelow(BrowserTab tab)
+    {
+        if (closed || tab.Closed || !opened.Contains(tab)) return;
+        CloseTabs(TabsBelow(tab), tab);
+    }
+
+    async Task DuplicateTab(BrowserTab tab)
+    {
+        if (environment is null || closed || restoring || tab.Closed) return;
+        var url = tab.Url;
+        try
+        {
+            var dup = await Open(url);
+            if (closed || dup.Closed || !opened.Contains(dup)) return;
+            if (!tab.Pinned && opened.Contains(tab))
+            {
+                var loose = opened.Where(t => !t.Pinned).ToList();
+                var tabIdx = loose.IndexOf(tab);
+                if (tabIdx >= 0) MoveTab(dup, false, tabIdx + 1);
+            }
+            if (url is null) address.FocusInput();
+        }
+        catch (Exception ex)
+        {
+            if (!closed && smokeReport is null) MessageBox.Show(this, ex.Message, "Could not duplicate tab");
+        }
+    }
+
+    static void CopyTabLink(BrowserTab tab)
+    {
+        if (tab.Url is not { } url) return;
+        try { Clipboard.SetText(url); }
+        catch { }
+    }
+
+    void ToggleMuteTab(BrowserTab tab)
+    {
+        if (closed || tab.Closed) return;
+        if (tab.View is { IsDisposed: false, CoreWebView2: { } core })
+        {
+            var next = !TryCore(() => core.IsMuted, tab.Muted);
+            if (TryCore(() => core.IsMuted = next))
+                tab.Muted = next;
+        }
+        else
+        {
+            tab.Muted = !tab.Muted;
+        }
+        RefreshTab(tab);
+    }
+
+    void CycleTab(int delta)
+    {
+        if (restoring || dragTab is not null) return;
+        var display = DisplayTabs();
+        if (display.Count <= 1) return;
+        var idx = selected is null ? -1 : display.IndexOf(selected);
+        var next = idx < 0
+            ? (delta > 0 ? 0 : display.Count - 1)
+            : (idx + delta % display.Count + display.Count) % display.Count;
+        if (display[next] != selected) SelectTab(display[next]);
+    }
+
+    internal static string[] NewWindowArgs(string[] args)
+    {
+        var result = new List<string>(3);
+        for (var i = 0; i < args.Length; i++)
+        {
+            if (args[i] == "--no-update-check")
+                result.Add("--no-update-check");
+            else if (args[i] == "--profile" && i + 1 < args.Length)
+            {
+                result.Add("--profile");
+                result.Add(args[++i]);
+            }
+        }
+        return [.. result];
+    }
+
+    void OpenNewWindow()
+    {
+        if (closed || restoring) return;
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exePath)) return;
+        var args = NewWindowArgs(launchArgs);
+        if (launchWindowOverride is not null) { launchWindowOverride(exePath, args); return; }
+        if (smokeReport is not null) return; // smoke runs have no --profile: a real launch would open the user's profile
+        try { Updater.Launch(exePath, args); }
+        catch (Exception ex)
+        {
+            if (!closed && smokeReport is null)
+                MessageBox.Show(this, ex.Message, "Could not open new window", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -2158,18 +2365,36 @@ sealed class BrowserWindow : Form
         SaveSession();
     }
 
+    static TabAudioState AudioStateOf(BrowserTab tab) =>
+        tab.Muted ? TabAudioState.Muted : tab.PlayingAudio ? TabAudioState.Playing : TabAudioState.None;
+
     void AttachTabMenu(Control c, BrowserTab tab, string title)
     {
         tips.SetToolTip(c, title);
         var menu = new ContextMenuStrip();
+        var reloadItem = menu.Items.Add("Reload", null, (_, _) => ReloadTab(tab));
+        var dupItem = menu.Items.Add("Duplicate", null, (_, _) => _ = DuplicateTab(tab));
+        var copyLinkItem = menu.Items.Add("Copy link", null, (_, _) => CopyTabLink(tab));
         var pinItem = menu.Items.Add(tab.Pinned ? "Unpin tab" : "Pin tab", null, (_, _) =>
             MoveTab(tab, !tab.Pinned, tab.Pinned ? 0 : int.MaxValue));
+        var muteItem = menu.Items.Add(tab.Muted ? "Unmute tab" : "Mute tab", null, (_, _) => ToggleMuteTab(tab));
+        menu.Items.Add(new ToolStripSeparator());
         var closeItem = menu.Items.Add("Close tab", null, (_, _) => CloseTab(tab));
-        closeItem.Enabled = !tab.Pinned;
-        menu.Opening += (_, _) => {
+        var closeOthersItem = menu.Items.Add("Close other tabs", null, (_, _) => CloseOtherTabs(tab));
+        var closeBelowItem = menu.Items.Add("Close tabs below", null, (_, _) => CloseTabsBelow(tab));
+        void SyncMenu()
+        {
+            reloadItem.Enabled = tab.Url is not null;
+            dupItem.Enabled = !restoring;
+            copyLinkItem.Enabled = tab.Url is not null;
             pinItem.Text = tab.Pinned ? "Unpin tab" : "Pin tab";
+            muteItem.Text = tab.Muted ? "Unmute tab" : "Mute tab";
             closeItem.Enabled = !tab.Pinned;
-        };
+            closeOthersItem.Enabled = opened.Any(t => t != tab && !t.Pinned);
+            closeBelowItem.Enabled = TabsBelow(tab).Count > 0;
+        }
+        SyncMenu();
+        menu.Opening += (_, _) => SyncMenu();
         c.ContextMenuStrip = menu;
         c.Disposed += (_, _) => {
             if (!closed && !IsDisposed) tips.SetToolTip(c, null);
@@ -2192,18 +2417,20 @@ sealed class BrowserWindow : Form
         var title = ClipTitle(tab.Title);
         var active = tab == selected;
         var icon = favicons.Get(tab.Url);
+        var loading = tab.Navigating;
+        var audio = AudioStateOf(tab);
         if (tabControls.TryGetValue(tab, out var existing) && !existing.IsDisposed && MatchesControlKind(existing, tab))
         {
-            ((ITabItem)existing).UpdateTab(title, tab.Url, active, icon);
+            ((ITabItem)existing).UpdateTab(title, tab.Url, active, icon, loading, audio, loadingPhase);
             if (tips.GetToolTip(existing) != title) tips.SetToolTip(existing, title);
             return existing;
         }
         var drag = new TabDragCallbacks(pt => StartTabDrag(tab, pt), UpdateTabDrag, DropTabDrag, CancelTabDrag);
         Control created = tab.Pinned
-            ? new PinSquare(title, tab.Url, active, icon, onFrame: vertical, () => SelectTab(tab), () => CloseTab(tab), drag)
+            ? new PinSquare(title, tab.Url, active, icon, onFrame: vertical, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase)
             : vertical
-                ? new TabRow(title, tab.Url, active, icon, () => SelectTab(tab), () => CloseTab(tab), drag)
-                : new TabPill(title, tab.Url, active, icon, () => SelectTab(tab), () => CloseTab(tab), drag);
+                ? new TabRow(title, tab.Url, active, icon, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase)
+                : new TabPill(title, tab.Url, active, icon, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase);
         AttachTabMenu(created, tab, title);
         tabControls[tab] = created;
         return created;
@@ -2220,7 +2447,7 @@ sealed class BrowserWindow : Form
         try
         {
             var title = ClipTitle(tab.Title);
-            ((ITabItem)c).UpdateTab(title, tab.Url, tab == selected, favicons.Get(tab.Url));
+            ((ITabItem)c).UpdateTab(title, tab.Url, tab == selected, favicons.Get(tab.Url), tab.Navigating, AudioStateOf(tab), loadingPhase);
             if (tips.GetToolTip(c) != title) tips.SetToolTip(c, title);
         }
         finally { drawTabsTicks += Stopwatch.GetTimestamp() - t0; }
@@ -2338,7 +2565,37 @@ sealed class BrowserWindow : Form
         finally { drawTabsTicks += Stopwatch.GetTimestamp() - t0; }
     }
 
-    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    bool IsHandledShortcut(Keys keyData)
+    {
+        if (keyData == Keys.Escape)
+            return dragTab is not null || address.InputFocused || selected is { Navigating: true };
+        switch (keyData)
+        {
+            case Keys.Control | Keys.L:
+            case Keys.Control | Keys.N:
+            case Keys.Control | Keys.T:
+            case Keys.Control | Keys.W:
+            case Keys.Control | Keys.Shift | Keys.T:
+            case Keys.Control | Keys.Shift | Keys.S:
+            case Keys.Control | Keys.Oemcomma:
+            case Keys.Control | Keys.Tab:
+            case Keys.Control | Keys.Shift | Keys.Tab:
+            case Keys.Control | Keys.PageUp:
+            case Keys.Control | Keys.PageDown:
+            case Keys.Control | Keys.Shift | Keys.PageUp:
+            case Keys.Control | Keys.Shift | Keys.PageDown:
+            case Keys.Alt | Keys.Left:
+            case Keys.Alt | Keys.Right:
+            case Keys.Control | Keys.R:
+            case Keys.F5:
+            case Keys.Control | Keys.J:
+                return true;
+        }
+        return (keyData & Keys.Modifiers) == Keys.Control
+            && (keyData & Keys.KeyCode) is >= Keys.D1 and <= Keys.D9;
+    }
+
+    bool HandleShortcut(Keys keyData)
     {
         if (keyData == Keys.Escape && dragTab is not null)
         {
@@ -2352,14 +2609,24 @@ sealed class BrowserWindow : Form
             else ActiveControl = null;
             return true;
         }
+        if (keyData == Keys.Escape && selected is { Navigating: true })
+        {
+            StopCurrent();
+            return true;
+        }
         switch (keyData)
         {
             case Keys.Control | Keys.L: address.FocusInput(); return true;
+            case Keys.Control | Keys.N: if (!restoring) OpenNewWindow(); return true;
             case Keys.Control | Keys.T: if (!restoring) NewTab(); return true;
             case Keys.Control | Keys.W: if (!restoring) CloseCurrent(); return true;
             case Keys.Control | Keys.Shift | Keys.T: if (!restoring) ReopenClosedTab(); return true;
             case Keys.Control | Keys.Shift | Keys.S: if (!restoring) SetOrientation(!vertical); return true;
             case Keys.Control | Keys.Oemcomma: OpenSettings(); return true;
+            case Keys.Control | Keys.Tab:
+            case Keys.Control | Keys.PageDown: if (!restoring) CycleTab(1); return true;
+            case Keys.Control | Keys.Shift | Keys.Tab:
+            case Keys.Control | Keys.PageUp: if (!restoring) CycleTab(-1); return true;
             case Keys.Control | Keys.Shift | Keys.PageUp: if (!restoring) MoveSelectedTab(-1); return true;
             case Keys.Control | Keys.Shift | Keys.PageDown: if (!restoring) MoveSelectedTab(1); return true;
             case Keys.Alt | Keys.Left: GoBack(); return true;
@@ -2385,8 +2652,11 @@ sealed class BrowserWindow : Form
                 return true;
             }
         }
-        return base.ProcessCmdKey(ref msg, keyData);
+        return false;
     }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData) =>
+        HandleShortcut(keyData) || base.ProcessCmdKey(ref msg, keyData);
 
     void SaveSettings()
     {
@@ -2963,7 +3233,7 @@ sealed class BrowserWindow : Form
         var menuTab = tempTabs[^1];
         var menuCtrl = tabControls[menuTab];
         var tabMenu = menuCtrl.ContextMenuStrip!;
-        tabMenu.Items[1]!.PerformClick();
+        tabMenu.Items.OfType<ToolStripMenuItem>().First(i => i.Text == "Close tab").PerformClick();
         var menuAliveDuringClick = !tabMenu.IsDisposed;
         await Task.Delay(50);
         var menuDeferredDispose = menuAliveDuringClick && tabMenu.IsDisposed;
@@ -3689,21 +3959,29 @@ sealed class BrowserWindow : Form
         var guardVerticalBefore = vertical;
         closedUrls.Push(fixture + "/closed-during-restore");
         var closedCountBefore = closedUrls.Count;
+        var restoreLaunchCalled = false;
+        launchWindowOverride = (_, _) => restoreLaunchCalled = true;
         restoring = true;
         try
         {
+            PressKey(Keys.Control | Keys.N);
             PressKey(Keys.Control | Keys.T);
             PressKey(Keys.Control | Keys.W);
             PressKey(Keys.Control | Keys.Shift | Keys.T);
             PressKey(Keys.Control | Keys.Shift | Keys.S);
+            PressKey(Keys.Control | Keys.Tab);
+            PressKey(Keys.Control | Keys.Shift | Keys.Tab);
+            PressKey(Keys.Control | Keys.PageUp);
+            PressKey(Keys.Control | Keys.PageDown);
             PressKey(Keys.Control | Keys.Shift | Keys.PageUp);
             PressKey(Keys.Control | Keys.Shift | Keys.PageDown);
             PressKey(Keys.Control | Keys.D1);
             PressKey(Keys.Control | Keys.D2);
             PressKey(Keys.Control | Keys.D9);
         }
-        finally { restoring = false; }
-        var shortcutsIgnored = opened.Count == guardCountBefore
+        finally { restoring = false; launchWindowOverride = null; }
+        var shortcutsIgnored = !restoreLaunchCalled
+            && opened.Count == guardCountBefore
             && selected == guardSelectedBefore
             && vertical == guardVerticalBefore
             && closedUrls.Count == closedCountBefore;
@@ -4028,6 +4306,210 @@ sealed class BrowserWindow : Form
             shareWorksAfterTimeout = recoveredShare.Text == "First page marker",
         };
 
+        // #47: Ctrl+Tab / Ctrl+Shift+Tab and Ctrl+PageDown / Ctrl+PageUp cycle in display order (pinned first) and wrap around.
+        var cycU1 = new BrowserTab { SavedUrl = fixture + "/c1", SavedTitle = "Cycle U1" };
+        var cycP2 = new BrowserTab { SavedUrl = fixture + "/c2", SavedTitle = "Cycle P2", Pinned = true };
+        var cycU2 = new BrowserTab { SavedUrl = fixture + "/c3", SavedTitle = "Cycle U2" };
+        opened.AddRange([cycU1, cycP2, cycU2]);
+        SyncTabs();
+        var cycOrder = DisplayTabs();
+        SelectTab(first);
+        var ctrlTabSeq = new List<BrowserTab?>();
+        for (var i = 0; i < 4; i++) { PressKey(Keys.Control | Keys.Tab); ctrlTabSeq.Add(selected); }
+        var ctrlTabOrderAndWrap = cycOrder.SequenceEqual([first, cycP2, cycU1, cycU2])
+            && ctrlTabSeq.SequenceEqual([cycP2, cycU1, cycU2, first]);
+
+        var ctrlShiftTabSeq = new List<BrowserTab?>();
+        for (var i = 0; i < 4; i++) { PressKey(Keys.Control | Keys.Shift | Keys.Tab); ctrlShiftTabSeq.Add(selected); }
+        var ctrlShiftTabOrderAndWrap = ctrlShiftTabSeq.SequenceEqual([cycU2, cycU1, cycP2, first]);
+
+        var ctrlPgDnSeq = new List<BrowserTab?>();
+        for (var i = 0; i < 4; i++) { PressKey(Keys.Control | Keys.PageDown); ctrlPgDnSeq.Add(selected); }
+        var ctrlPageDownOrderAndWrap = ctrlPgDnSeq.SequenceEqual([cycP2, cycU1, cycU2, first]);
+
+        var ctrlPgUpSeq = new List<BrowserTab?>();
+        for (var i = 0; i < 4; i++) { PressKey(Keys.Control | Keys.PageUp); ctrlPgUpSeq.Add(selected); }
+        var ctrlPageUpOrderAndWrap = ctrlPgUpSeq.SequenceEqual([cycU2, cycU1, cycP2, first]);
+
+        // Keys pressed in the page reach the app only through the WebView2 control's OnKeyDown, so drive that path.
+        var onKeyDown = typeof(Control).GetMethod("OnKeyDown", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        bool PageKey(Keys k) { var e = new KeyEventArgs(k); onKeyDown.Invoke(first.View, [e]); return e.Handled; }
+        var pageCtrlTabHandled = first.View is not null && selected == first && PageKey(Keys.Control | Keys.Tab);
+        var pageCopyPassedThrough = first.View is not null && !PageKey(Keys.Control | Keys.C);
+        await Task.Delay(50);
+        var pageCtrlTabCycles = pageCtrlTabHandled && pageCopyPassedThrough && selected == cycP2;
+        cycP2.Pinned = false;
+        foreach (var t in new[] { cycU1, cycP2, cycU2 })
+        {
+            t.Closed = true;
+            if (t.View is { } v) { t.View = null; CleanupView(v); }
+            opened.Remove(t);
+        }
+        SelectTab(first);
+        SyncTabs();
+        var tabCycle = new
+        {
+            ctrlTabOrderAndWrap,
+            ctrlShiftTabOrderAndWrap,
+            ctrlPageDownOrderAndWrap,
+            ctrlPageUpOrderAndWrap,
+            pageCtrlTabCycles,
+        };
+
+        // #48: Loading indicator, reload->stop button swap, Stop button cancel, and Esc while loading.
+        var slowTab = await Open(fixture + "/first");
+        await WaitForLoad(slowTab);
+        var slowCore = slowTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Slow tab view is not ready.");
+        slowCore.Navigate(fixture + "/slow?btn=1");
+        var slowWait = Stopwatch.StartNew();
+        while (slowWait.Elapsed < TimeSpan.FromSeconds(5) && !slowTab.Navigating)
+            await Task.Delay(20);
+        var buttonSwappedToStop = slowTab.Navigating
+            && reloadBtn.Glyph == Theme.Glyphs.Stop
+            && reloadBtn.AccessibleName == "Stop"
+            && reloadBtn.Enabled;
+        var tabShowsLoading = tabControls.TryGetValue(slowTab, out var slowCtrl) && ((ITabItem)slowCtrl).Loading;
+        var timerActiveWhileLoading = loadingTimer.Enabled;
+        var reloadPt = new Point(reloadBtn.Width / 2, reloadBtn.Height / 2);
+        SendMessage(reloadBtn.Handle, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, MakeLParam(reloadPt.X, reloadPt.Y));
+        SendMessage(reloadBtn.Handle, WM_LBUTTONUP, IntPtr.Zero, MakeLParam(reloadPt.X, reloadPt.Y));
+        slowWait.Restart();
+        while (slowWait.Elapsed < TimeSpan.FromSeconds(4) && slowTab.Navigating)
+            await Task.Delay(20);
+        var stopReturnedToReload = !slowTab.Navigating
+            && reloadBtn.Glyph == Theme.Glyphs.Reload
+            && reloadBtn.AccessibleName == "Reload"
+            && !((ITabItem)tabControls[slowTab]).Loading
+            && !loadingTimer.Enabled;
+
+        slowCore.Navigate(fixture + "/slow?esc=1");
+        slowWait.Restart();
+        while (slowWait.Elapsed < TimeSpan.FromSeconds(5) && !slowTab.Navigating)
+            await Task.Delay(20);
+        var escLoadingSawNav = slowTab.Navigating && !address.InputFocused;
+        PressKey(Keys.Escape);
+        slowWait.Restart();
+        while (slowWait.Elapsed < TimeSpan.FromSeconds(4) && slowTab.Navigating)
+            await Task.Delay(20);
+        var escStoppedLoading = escLoadingSawNav
+            && !slowTab.Navigating
+            && reloadBtn.Glyph == Theme.Glyphs.Reload
+            && !loadingTimer.Enabled;
+        var escIdleNotConsumed = !address.InputFocused && dragTab is null && !IsHandledShortcut(Keys.Escape);
+        CloseTab(slowTab, recordClosed: false);
+        SelectTab(first);
+        var loadingStop = new
+        {
+            buttonSwappedToStop,
+            tabShowsLoading,
+            timerActiveWhileLoading,
+            stopReturnedToReload,
+            escStoppedLoading,
+            escIdleNotConsumed,
+        };
+
+        // #51: Richer tab context menu (Reload, Duplicate, Copy link, Mute/Unmute + indicator, Close other tabs, Close tabs below) + Ctrl+N.
+        ToolStripMenuItem OpenAndGetMenuItem(BrowserTab tab, string text)
+        {
+            var ctrl = tabControls[tab];
+            var menu = ctrl.ContextMenuStrip!;
+            menu.Show(ctrl, Point.Empty);
+            var item = menu.Items.OfType<ToolStripMenuItem>().First(i => i.Text == text);
+            menu.Close();
+            return item;
+        }
+        var m1 = await Open(fixture + "/first");
+        await WaitForLoad(m1);
+        var m2 = await Open(fixture + "/second");
+        await WaitForLoad(m2);
+        var m3 = await Open(fixture + "/third");
+        await WaitForLoad(m3);
+
+        string? prevClip = null;
+        try { if (Clipboard.ContainsText()) prevClip = Clipboard.GetText(); } catch { }
+        OpenAndGetMenuItem(m2, "Copy link").PerformClick();
+        var copyLinkOk = false;
+        try { copyLinkOk = Clipboard.GetText() == fixture + "/second"; } catch { }
+        try { if (prevClip is not null) Clipboard.SetText(prevClip); } catch { }
+
+        var countBeforeDup = opened.Count;
+        OpenAndGetMenuItem(m1, "Duplicate").PerformClick();
+        var dupWait = Stopwatch.StartNew();
+        while (dupWait.Elapsed < TimeSpan.FromSeconds(5) && opened.Count == countBeforeDup)
+            await Task.Delay(25);
+        var dupDisplay = DisplayTabs();
+        var m1DispIdx = dupDisplay.IndexOf(m1);
+        var dupTab = m1DispIdx >= 0 && m1DispIdx + 1 < dupDisplay.Count ? dupDisplay[m1DispIdx + 1] : null;
+        if (dupTab is not null) await WaitForLoad(dupTab);
+        var duplicateOk = dupTab is not null && dupTab != m1 && dupTab.Url == fixture + "/first" && !dupTab.Pinned;
+
+        var m2Core = m2.View?.CoreWebView2 ?? throw new InvalidOperationException("m2 view not ready");
+        var reloadNavDone = false;
+        void OnM2Reloaded(object? _, CoreWebView2NavigationCompletedEventArgs e) { if (e.IsSuccess) reloadNavDone = true; }
+        m2Core.NavigationCompleted += OnM2Reloaded;
+        OpenAndGetMenuItem(m2, "Reload").PerformClick();
+        var reloadWait = Stopwatch.StartNew();
+        while (reloadWait.Elapsed < TimeSpan.FromSeconds(5) && !reloadNavDone)
+            await Task.Delay(25);
+        m2Core.NavigationCompleted -= OnM2Reloaded;
+        var reloadOk = reloadNavDone;
+
+        OpenAndGetMenuItem(m2, "Mute tab").PerformClick();
+        var mutedStateOk = m2.Muted && m2Core.IsMuted && ((ITabItem)tabControls[m2]).Audio == TabAudioState.Muted;
+        OpenAndGetMenuItem(m2, "Unmute tab").PerformClick();
+        var unmutedStateOk = !m2.Muted && !m2Core.IsMuted && ((ITabItem)tabControls[m2]).Audio == TabAudioState.None;
+        var muteUnmuteOk = mutedStateOk && unmutedStateOk;
+
+        m2.PlayingAudio = true;
+        RefreshTab(m2);
+        var audioPlayingShown = ((ITabItem)tabControls[m2]).Audio == TabAudioState.Playing;
+        m2.PlayingAudio = false;
+        RefreshTab(m2);
+        var audioIndicatorOk = audioPlayingShown && ((ITabItem)tabControls[m2]).Audio == TabAudioState.None;
+
+        // Close tabs below m1 (display order: [first(pinned), m1, dupTab, m2, m3]) while m3 is selected.
+        SelectTab(m3);
+        OpenAndGetMenuItem(m1, "Close tabs below").PerformClick();
+        var closeBelowOk = opened.Contains(first) && opened.Contains(m1)
+            && !opened.Contains(m2) && !opened.Contains(m3) && (dupTab is null || !opened.Contains(dupTab))
+            && selected == m1;
+
+        // Close other tabs from m1 (skips pinned first).
+        var m4 = new BrowserTab { SavedUrl = fixture + "/m4", SavedTitle = "M4" };
+        var m5 = new BrowserTab { SavedUrl = fixture + "/m5", SavedTitle = "M5" };
+        opened.AddRange([m4, m5]);
+        SyncTabs();
+        SelectTab(m4);
+        OpenAndGetMenuItem(m1, "Close other tabs").PerformClick();
+        var closeOthersOk = opened.Contains(first) && opened.Contains(m1)
+            && !opened.Contains(m4) && !opened.Contains(m5) && selected == m1;
+        CloseTab(m1, recordClosed: false);
+        SelectTab(first);
+
+        string? launchedExe = null;
+        string[]? launchedArgs = null;
+        launchWindowOverride = (exe, args) => { launchedExe = exe; launchedArgs = args; };
+        PressKey(Keys.Control | Keys.N);
+        launchWindowOverride = null;
+        var ctrlNLaunched = launchedExe == Environment.ProcessPath && launchedArgs is not null;
+        var newWindowArgsOk = NewWindowArgs(["--profile", @"C:\tmp\p", "--no-update-check", "https://example.com"])
+                .SequenceEqual(["--profile", @"C:\tmp\p", "--no-update-check"])
+            && NewWindowArgs(["--smoke-test", "a", "b"]).SequenceEqual([])
+            && NewWindowArgs(["--profile", @"C:\tmp\p"]).SequenceEqual(["--profile", @"C:\tmp\p"]);
+
+        var tabMenuAndNewWindow = new
+        {
+            copyLinkOk,
+            duplicateOk,
+            reloadOk,
+            muteUnmuteOk,
+            audioIndicatorOk,
+            closeBelowOk,
+            closeOthersOk,
+            ctrlNLaunched,
+            newWindowArgsOk,
+        };
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -4038,6 +4520,7 @@ sealed class BrowserWindow : Form
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
             urlWhenCleanOff, cliFlags,
             faviconCached, addressDisplayOk, tabDrag, tabFixes, highDpi, shareTimeout,
+            tabCycle, loadingStop, tabMenuAndNewWindow,
             postClean, blobUrl, permissions, downloads, processCrash,
             sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,

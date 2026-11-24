@@ -30,7 +30,7 @@ python test_smoke.py publish/browse.exe
 ## Features
 
 - **Session restore with lazy tabs**: Restores open and pinned tabs, the active tab, and the tab layout on startup. Only the selected tab creates a WebView2 and loads until you switch to other tabs. A per-profile mutex lets a second window open and restore without overwriting the first window's `session.json`.
-- **Sidebar or top tab strip**: Switch between the vertical sidebar (with a pinned-tab tile grid) and the horizontal top tab strip via **Settings** (`Ctrl+,`) or `Ctrl+Shift+S`. Drag tabs to reorder them, or drag between the tab list and the pinned tile grid (or across the pinned/unpinned divider in the top strip) to pin and unpin. Right-click a tab to pin, unpin, or close it; pinned tabs cannot be closed until unpinned.
+- **Sidebar or top tab strip**: Switch between the vertical sidebar (with a pinned-tab tile grid) and the horizontal top tab strip via **Settings** (`Ctrl+,`) or `Ctrl+Shift+S`. Drag tabs to reorder them, or drag between the tab list and the pinned tile grid (or across the pinned/unpinned divider in the top strip) to pin and unpin. Right-click a tab to reload, duplicate, copy link, pin/unpin, mute/unmute (with an audio/muted indicator on the tab), close it, close other tabs, or close tabs below; pinned tabs cannot be closed until unpinned. Tabs show a subtle loading indicator while navigating, and the reload button switches to Stop (`Esc` also stops loading).
 - **Settings**: Open **Settings** from the toolbar gear button or with `Ctrl+,` to choose theme (**System**, **Light**, or **Dark**, applied on next launch), switch tab layout (**Sidebar** or **Top tabs**), toggle ad & tracker blocking, link cleaning, sleeping tabs, automatic update checks, and the toolbar Share button, clear WebView2 browsing data (cookies, cache, history, and site data), and view the app version.
 - **Light and dark mode**: Follows the Windows system light/dark setting by default, or can be pinned to Light or Dark in **Settings**.
 - **Custom title bar**: Integrated minimize/maximize/close buttons and draggable window chrome.
@@ -49,10 +49,13 @@ python test_smoke.py publish/browse.exe
 | Shortcut | Action |
 | --- | --- |
 | `Ctrl+L` | Focus address bar |
-| `Esc` | Cancel address bar edit and return focus to the page |
+| `Esc` | Cancel address bar edit and return focus to the page, or stop loading |
 | `Ctrl+T` | New tab |
+| `Ctrl+N` | New window |
 | `Ctrl+W` | Close current tab (unpinned) |
 | `Ctrl+Shift+T` | Reopen last closed tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab (display order, wraps around) |
+| `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous tab (display order, wraps around) |
 | `Ctrl+Shift+S` | Toggle sidebar / top tab strip |
 | `Ctrl+,` | Open Settings |
 | `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` | Move current tab earlier / later within its group |
