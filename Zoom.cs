@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace SearchPort;
 
@@ -50,8 +51,10 @@ static class ZoomLevels
 sealed class SitePrefs
 {
     readonly Dictionary<string, double> zoom = new(StringComparer.OrdinalIgnoreCase);
+    readonly HashSet<string> shieldDisabled = new(StringComparer.OrdinalIgnoreCase);
 
     public int Count => zoom.Count;
+    public int ShieldDisabledCount => shieldDisabled.Count;
 
     public double GetZoom(string? origin) =>
         origin is not null && zoom.TryGetValue(origin, out var factor) ? factor : ZoomLevels.Default;
@@ -68,7 +71,19 @@ sealed class SitePrefs
         return true;
     }
 
+    public bool IsShieldDisabled(string? urlOrHost) =>
+        SitePrefsStore.HostOf(urlOrHost) is { } host && shieldDisabled.Contains(host);
+
+    public bool SetShieldDisabled(string? urlOrHost, bool disabled)
+    {
+        if (SitePrefsStore.HostOf(urlOrHost) is not { } host) return false;
+        return disabled ? shieldDisabled.Add(host) : shieldDisabled.Remove(host);
+    }
+
     public SortedDictionary<string, double> SnapshotZoom() => new(zoom, StringComparer.OrdinalIgnoreCase);
+
+    public string[] SnapshotShieldDisabled() =>
+        shieldDisabled.Count == 0 ? [] : [.. shieldDisabled.OrderBy(static x => x, StringComparer.Ordinal)];
 }
 
 static class SitePrefsStore
@@ -77,11 +92,32 @@ static class SitePrefsStore
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         WriteIndented = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
-    sealed record SitePrefsFile(Dictionary<string, double>? Zoom);
+    sealed record SitePrefsFile(Dictionary<string, double>? Zoom, string[]? ShieldDisabled = null);
 
     public static string? OriginOf(string? url) => ExternalSchemes.NormalizeSite(url);
+
+    public static string? HostOf(string? urlOrHost)
+    {
+        if (string.IsNullOrWhiteSpace(urlOrHost)) return null;
+        var trimmed = urlOrHost.Trim();
+        if (trimmed.Contains("://", StringComparison.Ordinal))
+        {
+            if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var uri)) return null;
+            if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) return null;
+            var h = uri.HostNameType is UriHostNameType.IPv4 or UriHostNameType.IPv6 ? uri.Host : uri.IdnHost;
+            h = h.TrimEnd('.').ToLowerInvariant();
+            return h.Length > 0 ? h : null;
+        }
+        if (trimmed.Any(c => char.IsWhiteSpace(c) || c < 0x20 || c is '/' or '?' or '#' or '@'))
+            return null;
+        var bare = trimmed.TrimEnd('.').ToLowerInvariant();
+        if (bare.Length == 0 || bare.Length > 253) return null;
+        var check = bare.StartsWith('[') && bare.EndsWith(']') ? bare[1..^1] : bare;
+        return Uri.CheckHostName(check) != UriHostNameType.Unknown ? bare : null;
+    }
 
     // Missing, empty, unreadable, or corrupt -> empty prefs, never throws.
     public static SitePrefs Load(string path)
@@ -98,12 +134,21 @@ static class SitePrefsStore
 
             using var doc = JsonDocument.Parse(text);
             if (doc.RootElement.ValueKind != JsonValueKind.Object) return prefs;
-            if (!doc.RootElement.TryGetProperty("zoom", out var zoomEl) || zoomEl.ValueKind != JsonValueKind.Object)
-                return prefs;
-            foreach (var prop in zoomEl.EnumerateObject())
+            if (doc.RootElement.TryGetProperty("zoom", out var zoomEl) && zoomEl.ValueKind == JsonValueKind.Object)
             {
-                if (prop.Value.ValueKind == JsonValueKind.Number && prop.Value.TryGetDouble(out var factor))
-                    prefs.SetZoom(prop.Name, factor);
+                foreach (var prop in zoomEl.EnumerateObject())
+                {
+                    if (prop.Value.ValueKind == JsonValueKind.Number && prop.Value.TryGetDouble(out var factor))
+                        prefs.SetZoom(prop.Name, factor);
+                }
+            }
+            if (doc.RootElement.TryGetProperty("shieldDisabled", out var shieldEl) && shieldEl.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in shieldEl.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.String)
+                        prefs.SetShieldDisabled(item.GetString(), true);
+                }
             }
         }
         catch { }
@@ -114,7 +159,8 @@ static class SitePrefsStore
     {
         var dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-        var payload = JsonSerializer.Serialize(new SitePrefsFile(new(prefs.SnapshotZoom())), Json);
+        var disabled = prefs.SnapshotShieldDisabled();
+        var payload = JsonSerializer.Serialize(new SitePrefsFile(new(prefs.SnapshotZoom()), disabled.Length > 0 ? disabled : null), Json);
         var tmp = $"{path}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp";
         try
         {
@@ -145,39 +191,47 @@ static class SitePrefsStore
         try
         {
             var missing = Load(file);
-            if (missing.Count != 0 || missing.GetZoom("https://example.com") != 1.0) return false;
+            if (missing.Count != 0 || missing.ShieldDisabledCount != 0 || missing.GetZoom("https://example.com") != 1.0) return false;
 
             File.WriteAllText(file, "{not valid json");
             var corrupt = Load(file);
-            if (corrupt.Count != 0) return false;
+            if (corrupt.Count != 0 || corrupt.ShieldDisabledCount != 0) return false;
 
             File.WriteAllText(file, "");
             if (Load(file).Count != 0) return false;
 
-            File.WriteAllText(file, """{"zoom":{"https://a.example":"bad","https://b.example":1.25,"https://c.example":1.0,"javascript:alert(1)":2.0,"https://d.example":99.0}}""");
+            File.WriteAllText(file, """{"zoom":{"https://a.example":"bad","https://b.example":1.25,"https://c.example":1.0,"javascript:alert(1)":2.0,"https://d.example":99.0},"shieldDisabled":["Example.COM","javascript:alert(1)","http://127.0.0.1:8080/ads","bad host"]}""");
             var sanitized = Load(file);
             if (sanitized.Count != 2
                 || sanitized.GetZoom("https://b.example") != 1.25
                 || sanitized.GetZoom("https://d.example") != ZoomLevels.Max
-                || sanitized.GetZoom("https://c.example") != 1.0)
+                || sanitized.GetZoom("https://c.example") != 1.0
+                || sanitized.ShieldDisabledCount != 2
+                || !sanitized.IsShieldDisabled("https://example.com/page")
+                || !sanitized.IsShieldDisabled("127.0.0.1")
+                || sanitized.IsShieldDisabled("other.example"))
                 return false;
 
             var prefs = new SitePrefs();
             prefs.SetZoom("https://Example.COM:443/path", 1.50);
             prefs.SetZoom("http://127.0.0.1:8080/x", 0.75);
             prefs.SetZoom("https://default.example/", 1.00);
+            prefs.SetShieldDisabled("https://News.Example.COM/story", true);
             Save(file, prefs);
             var loaded = Load(file);
             if (loaded.Count != 2
                 || loaded.GetZoom("https://example.com") != 1.50
                 || loaded.GetZoom("http://127.0.0.1:8080") != 0.75
-                || loaded.GetZoom("https://default.example") != 1.00)
+                || loaded.GetZoom("https://default.example") != 1.00
+                || !loaded.IsShieldDisabled("news.example.com")
+                || loaded.IsShieldDisabled("example.com"))
                 return false;
 
             prefs.SetZoom("https://example.com", 1.00);
+            prefs.SetShieldDisabled("news.example.com", false);
             Save(file, prefs);
             var afterReset = Load(file);
-            if (afterReset.Count != 1 || afterReset.GetZoom("https://example.com") != 1.00) return false;
+            if (afterReset.Count != 1 || afterReset.GetZoom("https://example.com") != 1.00 || afterReset.ShieldDisabledCount != 0) return false;
 
             return ZoomLevels.StepIn(1.0) == 1.10
                 && ZoomLevels.StepIn(1.10) == 1.25

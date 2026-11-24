@@ -118,6 +118,9 @@ static class Theme
         public const string Maximize = "\uE922";
         public const string Restore = "\uE923";
         public const string ChromeClose = "\uE8BB";
+
+        // Segoe Fluent Icons (https://learn.microsoft.com/en-us/windows/apps/design/style/segoe-fluent-icons-font): EA18 = Shield.
+        public const string Shield = "\uEA18";
     }
 
     public static readonly Font IconFont = Phosphor is { } p
@@ -126,6 +129,7 @@ static class Theme
     public static readonly Font SmallIconFont = Phosphor is { } p2
         ? new(p2.Family, 9.5f, FontStyle.Regular)
         : new(CaptionIconFamily, 8f, FontStyle.Regular);
+    public static readonly Font FluentSmallIconFont = new(CaptionIconFamily, 8.5f, FontStyle.Regular);
     public static readonly Font CaptionIconFont = new(CaptionIconFamily, 7.5f, FontStyle.Regular);
     public static readonly Font CloseIconFont = Phosphor is { } p3
         ? new(p3.Family, 7.5f, FontStyle.Regular)
@@ -448,6 +452,13 @@ sealed class AddressLine : ChromeControl
     Rectangle zoomPillRect;
     bool zoomHovered;
     bool zoomPressed;
+    bool shieldVisible;
+    bool shieldEnabled = true;
+    int shieldCount;
+    bool shieldOpen;
+    Rectangle shieldRect;
+    bool shieldHovered;
+    bool shieldPressed;
 
     internal AddressLine()
     {
@@ -489,17 +500,46 @@ sealed class AddressLine : ChromeControl
     internal bool ZoomPillVisible => zoomLabel is not null;
     internal string? ZoomPillText => zoomLabel;
     internal Rectangle ZoomPillBounds => zoomPillRect;
+    internal bool ShieldButtonVisible => !shieldRect.IsEmpty;
+    internal Rectangle ShieldButtonBounds => shieldRect;
+    internal int ShieldBlockedCount => shieldCount;
+    internal bool ShieldEnabledForSite => shieldEnabled;
     internal event Action? ZoomResetRequested;
+    internal event Action? ShieldClicked;
 
     internal void SetZoom(double factor)
     {
         var next = ZoomLevels.IsDefault(factor) ? null : ZoomLevels.FormatPercent(factor);
         if (zoomLabel == next) return;
         zoomLabel = next;
-        if (next is null) { zoomHovered = false; zoomPressed = false; Cursor = Cursors.IBeam; }
+        if (next is null) { zoomHovered = false; zoomPressed = false; UpdateCursor(); }
         PerformLayout();
         Invalidate();
     }
+
+    internal void SetShield(bool visible, bool enabled, int blockedCount)
+    {
+        var count = Math.Max(0, blockedCount);
+        if (shieldVisible == visible && shieldEnabled == enabled && shieldCount == count) return;
+        var layoutChanged = shieldVisible != visible
+            || (shieldEnabled && shieldCount > 0) != (enabled && count > 0)
+            || (enabled && shieldCount != count);
+        shieldVisible = visible;
+        shieldEnabled = enabled;
+        shieldCount = count;
+        if (!visible) { shieldHovered = false; shieldPressed = false; shieldOpen = false; UpdateCursor(); }
+        if (layoutChanged) PerformLayout();
+        Invalidate();
+    }
+
+    internal void SetShieldOpen(bool open)
+    {
+        if (shieldOpen == open) return;
+        shieldOpen = open;
+        Invalidate();
+    }
+
+    void UpdateCursor() => Cursor = (zoomHovered || shieldHovered) ? Cursors.Hand : Cursors.IBeam;
 
     internal static string FormatDisplayUrl(string url)
     {
@@ -545,23 +585,50 @@ sealed class AddressLine : ChromeControl
         PerformLayout();
     }
 
+    int RightControlsPad(int pad)
+    {
+        var leftEdge = Width - pad;
+        if (!zoomPillRect.IsEmpty) leftEdge = Math.Min(leftEdge, zoomPillRect.Left);
+        if (!shieldRect.IsEmpty) leftEdge = Math.Min(leftEdge, shieldRect.Left);
+        return leftEdge == Width - pad ? pad : (Width - leftEdge) + S(6);
+    }
+
+    string? ShieldCountText => shieldEnabled && shieldCount > 0 ? (shieldCount > 999 ? "999+" : shieldCount.ToString()) : null;
+
     protected override void OnLayout(LayoutEventArgs e)
     {
         base.OnLayout(e);
         var pad = S(10);
+        var pillH = S(20);
+        var pillInset = S(4);
         if (zoomLabel is not null && Width >= S(90))
         {
             var textW = TextRenderer.MeasureText(zoomLabel, Theme.FontForDpi(Theme.HintFont, DeviceDpi), Size.Empty, TextFormatFlags.NoPadding).Width;
             var pillW = textW + S(10);
-            var pillH = S(20);
-            var pillInset = S(4);
             zoomPillRect = new Rectangle(Width - pillInset - pillW, (Height - pillH) / 2, pillW, pillH);
         }
         else
         {
             zoomPillRect = Rectangle.Empty;
         }
-        var rightPad = zoomPillRect.IsEmpty ? pad : (Width - zoomPillRect.Left) + S(6);
+
+        if (shieldVisible && Width >= S(110))
+        {
+            var countText = ShieldCountText;
+            var iconW = S(14);
+            var shieldW = countText is not null
+                ? iconW + S(2) + TextRenderer.MeasureText(countText, Theme.FontForDpi(Theme.HintFont, DeviceDpi), Size.Empty, TextFormatFlags.NoPadding).Width + S(8)
+                : S(22);
+            var rightEdge = zoomPillRect.IsEmpty ? Width - pillInset : zoomPillRect.Left - S(4);
+            var left = rightEdge - shieldW;
+            shieldRect = left >= pad + S(40) ? new Rectangle(left, (Height - pillH) / 2, shieldW, pillH) : Rectangle.Empty;
+        }
+        else
+        {
+            shieldRect = Rectangle.Empty;
+        }
+
+        var rightPad = RightControlsPad(pad);
         var h = input.PreferredHeight;
         input.SetBounds(pad, Math.Max(0, (Height - h) / 2), Math.Max(0, Width - pad - rightPad), h);
     }
@@ -569,11 +636,13 @@ sealed class AddressLine : ChromeControl
     protected override void OnMouseMove(MouseEventArgs e)
     {
         base.OnMouseMove(e);
-        var over = !zoomPillRect.IsEmpty && zoomPillRect.Contains(e.Location);
-        if (over != zoomHovered)
+        var overZoom = !zoomPillRect.IsEmpty && zoomPillRect.Contains(e.Location);
+        var overShield = !overZoom && !shieldRect.IsEmpty && shieldRect.Contains(e.Location);
+        if (overZoom != zoomHovered || overShield != shieldHovered)
         {
-            zoomHovered = over;
-            Cursor = over ? Cursors.Hand : Cursors.IBeam;
+            zoomHovered = overZoom;
+            shieldHovered = overShield;
+            UpdateCursor();
             Invalidate();
         }
     }
@@ -581,10 +650,11 @@ sealed class AddressLine : ChromeControl
     protected override void OnMouseLeave(EventArgs e)
     {
         base.OnMouseLeave(e);
-        if (zoomHovered)
+        if (zoomHovered || shieldHovered)
         {
             zoomHovered = false;
-            Cursor = Cursors.IBeam;
+            shieldHovered = false;
+            UpdateCursor();
             Invalidate();
         }
     }
@@ -596,19 +666,37 @@ sealed class AddressLine : ChromeControl
         if (!zoomPillRect.IsEmpty && zoomPillRect.Contains(e.Location))
         {
             zoomPressed = true;
+            shieldPressed = false;
+            return;
+        }
+        if (!shieldRect.IsEmpty && shieldRect.Contains(e.Location))
+        {
+            shieldPressed = true;
+            zoomPressed = false;
             return;
         }
         zoomPressed = false;
+        shieldPressed = false;
         if (!input.Focused) FocusInput();
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
     {
         base.OnMouseUp(e);
-        if (e.Button != MouseButtons.Left || !zoomPressed) return;
-        zoomPressed = false;
-        if (!zoomPillRect.IsEmpty && zoomPillRect.Contains(e.Location))
-            ZoomResetRequested?.Invoke();
+        if (e.Button != MouseButtons.Left) return;
+        if (zoomPressed)
+        {
+            zoomPressed = false;
+            if (!zoomPillRect.IsEmpty && zoomPillRect.Contains(e.Location))
+                ZoomResetRequested?.Invoke();
+            return;
+        }
+        if (shieldPressed)
+        {
+            shieldPressed = false;
+            if (!shieldRect.IsEmpty && shieldRect.Contains(e.Location))
+                ShieldClicked?.Invoke();
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -623,11 +711,43 @@ sealed class AddressLine : ChromeControl
         else
         {
             var pad = S(10);
-            var rightPad = zoomPillRect.IsEmpty ? pad : (Width - zoomPillRect.Left) + S(6);
+            var rightPad = RightControlsPad(pad);
             var textRect = new Rectangle(pad, 0, Math.Max(0, Width - pad - rightPad), Height);
             var empty = string.IsNullOrEmpty(input.Text);
             TextRenderer.DrawText(g, DisplayText, Theme.FontForDpi(Theme.UiFont, DeviceDpi), textRect, empty ? Theme.Muted : Theme.InkSoft,
                 TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+        }
+        if (!shieldRect.IsEmpty)
+        {
+            var countText = ShieldCountText;
+            if (shieldOpen || shieldHovered)
+                Theme.FillRounded(g, Theme.CloseHoverFill, shieldRect, Sf(6f));
+            else if (countText is not null)
+                Theme.FillRounded(g, Theme.BadgeFill, shieldRect, Sf(6f));
+
+            var iconColor = shieldOpen ? Theme.Ink
+                : !shieldEnabled ? Theme.Faint
+                : (shieldHovered || countText is not null) ? Theme.InkSoft : Theme.Muted;
+            var iconFont = Theme.FontForDpi(Theme.FluentSmallIconFont, DeviceDpi);
+            if (countText is not null)
+            {
+                var iconBox = new Rectangle(shieldRect.Left + S(3), shieldRect.Top, S(14), shieldRect.Height);
+                TextRenderer.DrawText(g, Theme.Glyphs.Shield, iconFont, iconBox, iconColor,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                var countBox = new Rectangle(iconBox.Right + S(1), shieldRect.Top, Math.Max(0, shieldRect.Right - iconBox.Right - S(4)), shieldRect.Height);
+                TextRenderer.DrawText(g, countText, Theme.FontForDpi(Theme.HintFont, DeviceDpi), countBox, shieldOpen || shieldHovered ? Theme.Ink : Theme.InkSoft,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+            }
+            else
+            {
+                TextRenderer.DrawText(g, Theme.Glyphs.Shield, iconFont, shieldRect, iconColor,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
+                if (!shieldEnabled)
+                {
+                    using var slashPen = new Pen(Theme.Muted, Math.Max(1.2f, Sf(1.2f)));
+                    g.DrawLine(slashPen, shieldRect.Left + S(5), shieldRect.Bottom - S(5), shieldRect.Right - S(5), shieldRect.Top + S(5));
+                }
+            }
         }
         if (!zoomPillRect.IsEmpty && zoomLabel is not null)
         {
