@@ -50,8 +50,17 @@ static class Session
     // Missing, empty or corrupt → null. A file that exists but can't be read throws, so the caller won't overwrite it.
     public static SessionState? Load(string path)
     {
-        if (!File.Exists(path)) return null;
-        var text = File.ReadAllText(path);
+        string text;
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            text = reader.ReadToEnd();
+        }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return null;
+        }
         if (string.IsNullOrWhiteSpace(text)) return null;
         SessionState? state;
         try { state = JsonSerializer.Deserialize<SessionState>(text, Json); }
@@ -72,7 +81,18 @@ static class Session
         try
         {
             File.WriteAllText(tmp, JsonSerializer.Serialize(new SessionState(tabs, selected, state.Vertical), Json));
-            File.Move(tmp, path, overwrite: true);
+            for (var attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    File.Move(tmp, path, overwrite: true);
+                    break;
+                }
+                catch (Exception ex) when (attempt < 4 && ex is IOException or UnauthorizedAccessException)
+                {
+                    Thread.Sleep(25 * (attempt + 1));
+                }
+            }
         }
         catch
         {

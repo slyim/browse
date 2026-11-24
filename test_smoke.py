@@ -282,6 +282,22 @@ def run():
                 bad_root = subprocess.run([str(exe), '--smoke-test', 'C:\\', base], timeout=15)
                 assert bad_root.returncode != 0, f'Expected non-zero exit for drive-root report path, got {bad_root.returncode}'
 
+                existing_file = path / 'not-a-dir.txt'
+                existing_file.write_text('x', encoding='utf-8')
+                for bad_args in (
+                    ['--profile'],
+                    ['--profile', ''],
+                    ['--profile', '   '],
+                    ['--profile', '--no-update-check'],
+                    ['--profile', str(path / 'bad|profile')],
+                    ['--profile', str(path / 'bad?profile')],
+                    ['--profile', str(path / 'bad<profile>')],
+                    ['--profile', 'bad:profile'],
+                    ['--profile', str(existing_file)],
+                ):
+                    bad_profile = subprocess.run([str(exe), *bad_args], timeout=15)
+                    assert bad_profile.returncode == 2, f'Expected exit 2 for {bad_args}, got {bad_profile.returncode}'
+
                 report = run_phase(exe, output, base)
                 assert report['first'] == 'First page marker'
                 assert report['second'] == 'Second page marker'
@@ -369,6 +385,18 @@ def run():
                     'tryCoreGuards': True,
                     'recoveryPreservesUrl': True,
                 }, report.get('processCrash')
+                debounce = report.get('sessionDebounce')
+                assert debounce is not None, report
+                assert debounce['titleEvents'] >= 5, debounce
+                assert debounce['writesDuringBurst'] <= 1, debounce
+                assert 1 <= debounce['writesAfterDebounce'] <= 2, debounce
+                assert debounce['savedAnimTitle'] is True, debounce
+                assert debounce['shareDeleteOk'] is True, debounce
+                assert debounce['retryOk'] is True, debounce
+                assert report.get('restoreShortcuts') == {
+                    'restoringDuringEnv': True,
+                    'shortcutsIgnored': True,
+                }, report.get('restoreShortcuts')
                 favicon_files = list((path / 'Favicons').glob('*.png'))
                 assert len(favicon_files) == 1, favicon_files
                 assert favicon_files[0].read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
@@ -460,6 +488,10 @@ def run():
                 assert [p for p in Fixture.requested if p != '/favicon.ico'] == ['/second?a'], Fixture.requested
                 assert json.loads(session_path.read_text(encoding='utf-8')) == expected_session
                 assert restore['canSaveSession'] is True, restore
+                assert '(tabs not saved)' not in restore['windowTitle'], restore
+                assert restore['sessionNoticeVisible'] is False, restore
+                assert restore['restoringDuringEnv'] is True, restore
+                assert restore['restoringCleared'] is True, restore
                 assert not list(path.glob('*.tmp')), list(path.glob('*.tmp'))
 
                 # Second instance while another process holds the profile mutex must restore normally without writing session.json.
@@ -479,6 +511,8 @@ def run():
                     Fixture.requested.clear()
                     locked = run_phase(exe, path / 'locked.json', base, 'restore')
                     assert locked['canSaveSession'] is False, locked
+                    assert '(tabs not saved)' in locked['windowTitle'], locked
+                    assert locked['sessionNoticeVisible'] is True, locked
                     assert locked['selectedIndex'] == 1, locked
                     assert [{k: t[k] for k in ('url', 'title', 'pinned')} for t in locked['tabs']] == expected_tabs, locked
                     assert session_path.read_text(encoding='utf-8') == pretty_session
@@ -487,6 +521,49 @@ def run():
                 finally:
                     kernel32.ReleaseMutex(lock_handle)
                     kernel32.CloseHandle(lock_handle)
+
+                # #34: second instance takes over session saving once the first window releases the lock.
+                takeover_handle = kernel32.CreateMutexW(None, True, report['sessionLockName'])
+                assert takeover_handle and ctypes.get_last_error() == 0, f'Failed to acquire takeover mutex ({ctypes.get_last_error()})'
+                takeover_released = False
+                takeover_report_path = path / 'takeover.json'
+                takeover_ready = path / 'takeover.ready'
+                takeover_signal = path / 'takeover.released'
+                session_path.write_text(pretty_session, encoding='utf-8')
+                takeover_proc = subprocess.Popen([str(exe), '--smoke-test', str(takeover_report_path), base, 'takeover'])
+                try:
+                    for _ in range(400):
+                        if takeover_ready.is_file() or takeover_proc.poll() is not None:
+                            break
+                        sleep(0.05)
+                    assert takeover_ready.is_file(), f'Takeover process did not signal ready (exit {takeover_proc.poll()})'
+                    assert session_path.read_text(encoding='utf-8') == pretty_session
+                    kernel32.ReleaseMutex(takeover_handle)
+                    kernel32.CloseHandle(takeover_handle)
+                    takeover_released = True
+                    takeover_signal.write_text('ok', encoding='utf-8')
+                    takeover_proc.wait(timeout=20)
+                    assert takeover_report_path.is_file(), f'Missing takeover report (exit {takeover_proc.returncode})'
+                    takeover = json.loads(takeover_report_path.read_text(encoding='utf-8-sig'))
+                    print(json.dumps(takeover, indent=2))
+                    assert takeover_proc.returncode == 0, takeover
+                    assert takeover['lockedInitially'] is True, takeover
+                    assert '(tabs not saved)' in takeover['titleWhenLocked'], takeover
+                    assert takeover['noticeWhenLocked'] is True, takeover
+                    assert takeover['stillLockedBeforeRelease'] is True, takeover
+                    assert takeover['tookOver'] is True, takeover
+                    assert '(tabs not saved)' not in takeover['titleAfterTakeover'], takeover
+                    assert takeover['noticeAfterTakeover'] is False, takeover
+                    taken_session = json.loads(session_path.read_text(encoding='utf-8'))
+                    assert any(t['url'] == base + '/third?from=b' for t in taken_session['tabs']), taken_session
+                    assert not list(path.glob('*.tmp')), list(path.glob('*.tmp'))
+                finally:
+                    if takeover_proc.poll() is None:
+                        takeover_proc.kill()
+                        takeover_proc.wait(timeout=5)
+                    if not takeover_released:
+                        kernel32.ReleaseMutex(takeover_handle)
+                        kernel32.CloseHandle(takeover_handle)
 
                 for name, payload in (('corrupt', '{not json'), ('empty', '')):
                     session_path.write_text(payload, encoding='utf-8')

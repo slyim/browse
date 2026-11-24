@@ -19,6 +19,25 @@ sealed record CliOptions(
 
 static class Program
 {
+    static readonly char[] InvalidPathSegmentChars = Path.GetInvalidFileNameChars()
+        .Where(c => c != Path.DirectorySeparatorChar && c != Path.AltDirectorySeparatorChar)
+        .ToArray();
+
+    internal static string? TryResolveProfileDir(string dir)
+    {
+        if (string.IsNullOrWhiteSpace(dir)) return null;
+        string full;
+        try { full = Path.GetFullPath(dir); }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return null; }
+        var root = Path.GetPathRoot(full);
+        if (string.IsNullOrEmpty(root)) return null;
+        var validRoot = (root.Length == 3 && char.IsAsciiLetter(root[0]) && root[1] == ':' && root[2] == '\\')
+            || (root.StartsWith(@"\\", StringComparison.Ordinal) && root.Length > 2 && root[2..].IndexOfAny(InvalidPathSegmentChars) < 0);
+        if (!validRoot || full[root.Length..].IndexOfAny(InvalidPathSegmentChars) >= 0) return null;
+        if (File.Exists(full)) return null;
+        return full;
+    }
+
     internal static CliOptions? ParseArgs(string[] args)
     {
         string? profileDir = null;
@@ -34,7 +53,7 @@ static class Program
                     noUpdateCheck = true;
                     break;
                 case "--profile":
-                    if (++i >= args.Length || string.IsNullOrWhiteSpace(args[i])) return null;
+                    if (++i >= args.Length || string.IsNullOrWhiteSpace(args[i]) || args[i].StartsWith("--", StringComparison.Ordinal)) return null;
                     profileDir = args[i];
                     break;
                 case "--smoke-test":
@@ -43,7 +62,7 @@ static class Program
                     fixture = args[++i];
                     if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
                     {
-                        if (args[i + 1] is not ("restore" or "perf" or "sleep")) return null;
+                        if (args[i + 1] is not ("restore" or "perf" or "sleep" or "takeover")) return null;
                         smokePhase = args[++i];
                     }
                     break;
@@ -67,19 +86,20 @@ static class Program
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return 2; }
             if (string.IsNullOrEmpty(smokeDir)) return 2;
         }
-        string profile;
-        try
+        string? resolvedProfileDir = null;
+        if (opts.ProfileDir is { } rawProfileDir)
         {
-            profile = opts.Smoke ? Path.Combine(smokeDir!, "WebView") :
-                opts.ProfileDir is { } dir ? Path.Combine(Path.GetFullPath(dir), "WebView") :
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SearchWindows", "WebView");
+            resolvedProfileDir = TryResolveProfileDir(rawProfileDir);
+            if (resolvedProfileDir is null) return 2;
         }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return 2; }
+        var profile = opts.Smoke ? Path.Combine(smokeDir!, "WebView") :
+            resolvedProfileDir is not null ? Path.Combine(resolvedProfileDir, "WebView") :
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SearchWindows", "WebView");
 
         if (!opts.Smoke) Updater.StartCleanupOldBinary();
         var profileRoot = Path.GetDirectoryName(profile)!;
         var settingsFile = Path.Combine(profileRoot, "settings.json");
-        var (initialSettings, settingsExisted) = !opts.Smoke || opts.SmokePhase is "restore" or "perf"
+        var (initialSettings, settingsExisted) = !opts.Smoke || opts.SmokePhase is "restore" or "perf" or "takeover"
             ? SettingsStore.Load(settingsFile)
             : (new AppSettings(), false);
         ApplicationConfiguration.Initialize();
@@ -87,19 +107,25 @@ static class Program
         Application.SetColorMode(SettingsStore.ToColorMode(initialSettings.Theme));
 #pragma warning restore WFO5001
         var sessionLock = Session.TryAcquireLock(profile);
+        BrowserWindow? browser = null;
         try
         {
             var envTask = CreateEnvironment(profile);
             var sessionFile = Path.Combine(profileRoot, "session.json");
-            var sessionTask = !opts.Smoke || opts.SmokePhase is "restore" or "perf" ? Task.Run(() => Session.Load(sessionFile)) : null;
-            using var browser = new BrowserWindow(
-                sessionFile, settingsFile, initialSettings, settingsExisted, envTask, sessionTask, sessionLock is not null,
+            var sessionTask = !opts.Smoke || opts.SmokePhase is "restore" or "perf" or "takeover" ? Task.Run(() => Session.Load(sessionFile)) : null;
+            browser = new BrowserWindow(
+                sessionFile, settingsFile, initialSettings, settingsExisted, envTask, sessionTask, sessionLock,
                 opts.SmokeReport, opts.Fixture, opts.SmokePhase,
-                opts.NoUpdateCheck, args, () => { sessionLock?.Dispose(); sessionLock = null; });
+                opts.NoUpdateCheck, args);
+            sessionLock = null;
             Application.Run(browser);
             return browser.ExitCode;
         }
-        finally { sessionLock?.Dispose(); }
+        finally
+        {
+            browser?.Dispose();
+            sessionLock?.Dispose();
+        }
     }
 
     static Task<CoreWebView2Environment> CreateEnvironment(string profile)
@@ -140,6 +166,17 @@ sealed class BrowserWindow : Form
     readonly ChromePanel cardFrame = new() { Dock = DockStyle.Fill, BackColor = Theme.Frame };
     readonly Panel cardBorder = new() { Dock = DockStyle.Fill, BackColor = Theme.Hairline };
     readonly Panel pages = new() { Dock = DockStyle.Fill, BackColor = Theme.Ground };
+    readonly Label sessionNotice = new()
+    {
+        Dock = DockStyle.Bottom,
+        Font = Theme.HintFont,
+        ForeColor = Theme.Muted,
+        BackColor = Theme.Frame,
+        Text = "Another window is open — tabs in this window won't be saved until it closes.",
+        TextAlign = ContentAlignment.MiddleLeft,
+        Visible = false,
+        AccessibleName = "Session not saved notice",
+    };
 
     readonly AddressLine address = new();
     readonly IconButton backBtn;
@@ -155,6 +192,7 @@ sealed class BrowserWindow : Form
     readonly ToolTip tips = new();
 
     static readonly TimeSpan IdleSleepThreshold = TimeSpan.FromMinutes(5);
+    readonly System.Windows.Forms.Timer saveTimer = new() { Interval = 500 };
     readonly System.Windows.Forms.Timer sleepTimer = new() { Interval = 30_000 };
     readonly System.Windows.Forms.Timer dragScrollTimer = new() { Interval = 30 };
 
@@ -173,13 +211,12 @@ sealed class BrowserWindow : Form
     readonly FaviconCache favicons;
     readonly Task<CoreWebView2Environment> envTask;
     readonly Task<SessionState?>? sessionTask;
-    readonly bool canSaveSession;
     readonly string? smokeReport;
     readonly string? fixture;
     readonly string? smokePhase;
     readonly bool noUpdateCheck;
     readonly string[] launchArgs;
-    readonly Action releaseSessionLock;
+    IDisposable? sessionLock;
     AppSettings settings;
     bool settingsExisted;
     SettingsDialog? settingsDialog;
@@ -197,13 +234,16 @@ sealed class BrowserWindow : Form
     int stripScroll;
     int stripContentWidth;
     bool sessionReady;
-    bool restoring;
+    bool restoring = true;
+    bool restoringDuringEnv;
     bool busy;
     bool closed;
     bool recoveringBrowser;
+    int sessionSaveCount;
     Func<string, string, bool>? confirmDownloadOverride;
     long envMs;
     long drawTabsTicks;
+    bool CanSaveSession => sessionLock is not null;
     public int ExitCode { get; private set; } = 1;
     public bool ChromeHidden => chromeHidden;
 
@@ -329,7 +369,7 @@ sealed class BrowserWindow : Form
         }
     }
 
-    public BrowserWindow(string sessionFile, string settingsFile, AppSettings initialSettings, bool settingsExisted, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, bool canSaveSession, string? smokeReport, string? fixture, string? smokePhase = null, bool noUpdateCheck = false, string[]? launchArgs = null, Action? releaseSessionLock = null)
+    public BrowserWindow(string sessionFile, string settingsFile, AppSettings initialSettings, bool settingsExisted, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, IDisposable? sessionLock, string? smokeReport, string? fixture, string? smokePhase = null, bool noUpdateCheck = false, string[]? launchArgs = null)
     {
         this.sessionFile = sessionFile;
         this.settingsFile = settingsFile;
@@ -339,14 +379,12 @@ sealed class BrowserWindow : Form
         favicons = new FaviconCache(sessionFile);
         this.envTask = envTask;
         this.sessionTask = sessionTask;
-        this.canSaveSession = canSaveSession;
+        this.sessionLock = sessionLock;
         this.smokeReport = smokeReport;
         this.fixture = fixture;
         this.smokePhase = smokePhase;
         this.noUpdateCheck = noUpdateCheck;
         this.launchArgs = launchArgs ?? [];
-        this.releaseSessionLock = releaseSessionLock ?? (() => { });
-        Text = "browse";
         Font = Theme.UiFont;
         ForeColor = Theme.Ink;
         BackColor = Theme.Frame;
@@ -389,6 +427,7 @@ sealed class BrowserWindow : Form
 
         cardBorder.Controls.Add(pages);
         cardFrame.Controls.Add(cardBorder);
+        cardFrame.Controls.Add(sessionNotice);
 
         Controls.Add(cardFrame);
         Controls.Add(sidebar);
@@ -402,20 +441,23 @@ sealed class BrowserWindow : Form
 
         SetOrientation(settings.VerticalTabs, persistSettings: false);
         UpdateNavButtons();
+        UpdateWindowTitle();
+        sidebar.Enabled = topStrip.Enabled = false;
 
         address.Input.KeyDown += (_, e) => {
             if (e.KeyCode != Keys.Enter) return;
             e.SuppressKeyPress = true;
             _ = Go(address.Input.Text);
         };
+        saveTimer.Tick += (_, _) => { saveTimer.Stop(); WriteSessionNow(); };
         sleepTimer.Tick += (_, _) => { if (settings.SleepingTabsEnabled) _ = SleepIdleTabs(IdleSleepThreshold); };
         sleepTimer.Start();
         dragScrollTimer.Tick += (_, _) => HandleDragAutoScroll();
         Activated += (_, _) => SetCaptionWindowActive(true);
         Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); };
         Load += async (_, _) => await Start();
-        FormClosing += (_, _) => SaveSession();
-        FormClosed += (_, _) => { closed = true; CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); };
+        FormClosing += (_, _) => FlushSession();
+        FormClosed += (_, _) => { closed = true; CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); };
     }
 
     int S(int px) => LogicalToDeviceUnits(px);
@@ -433,15 +475,18 @@ sealed class BrowserWindow : Form
     {
         if (disposing)
         {
+            if (!closed) FlushSession();
             closed = true;
             CancelTabDrag();
             pending?.Cancel();
             updateCts?.Cancel();
             updateCts?.Dispose();
             updateCts = null;
+            saveTimer.Dispose();
             sleepTimer.Dispose();
             dragScrollTimer.Dispose();
             if (!dropLine.IsDisposed) dropLine.Dispose();
+            ReleaseSessionLock();
         }
         base.Dispose(disposing);
         if (disposing) { tips.Dispose(); favicons.Dispose(); }
@@ -456,6 +501,8 @@ sealed class BrowserWindow : Form
         sideAddressWrap.Padding = new(0, 0, 0, S(8));
         sideNewTab.Height = S(28);
         topStrip.Height = S(52);
+        sessionNotice.Height = S(22);
+        sessionNotice.Padding = new(S(8), 0, S(8), 0);
     }
 
     void ToggleMaximize() => WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Normal : FormWindowState.Maximized;
@@ -504,8 +551,10 @@ sealed class BrowserWindow : Form
     void UpdateWindowTitle()
     {
         var title = selected?.Title;
-        var next = string.IsNullOrWhiteSpace(title) ? "browse" : $"{title} — browse";
+        var brand = CanSaveSession ? "browse" : "browse (tabs not saved)";
+        var next = string.IsNullOrWhiteSpace(title) ? brand : $"{title} — {brand}";
         if (Text != next) Text = next;
+        sessionNotice.Visible = !chromeHidden && !CanSaveSession;
     }
 
     public void SetChromeHidden(bool hidden)
@@ -524,6 +573,8 @@ sealed class BrowserWindow : Form
         sidebar.Visible = !chromeHidden && vertical;
         topStrip.Visible = !chromeHidden && !vertical;
         minBtn.Visible = maxBtn.Visible = closeBtn.Visible = !chromeHidden;
+        sessionNotice.Visible = !chromeHidden && !CanSaveSession;
+        sessionNotice.BackColor = vertical ? Theme.Frame : Theme.Ground;
 
         if (chromeHidden)
         {
@@ -890,13 +941,21 @@ sealed class BrowserWindow : Form
 
     async Task Start()
     {
+        restoring = true;
+        sidebar.Enabled = topStrip.Enabled = false;
+        restoringDuringEnv = restoring && !sidebar.Enabled && !topStrip.Enabled;
         try
         {
             var envWatch = Stopwatch.StartNew();
             environment = await envTask;
             envMs = envWatch.ElapsedMilliseconds;
             if (closed) return;
-            if (smokeReport is not null) await SmokeTest();
+            if (smokeReport is not null)
+            {
+                restoring = false;
+                sidebar.Enabled = topStrip.Enabled = true;
+                await SmokeTest();
+            }
             else
             {
                 await Restore();
@@ -911,6 +970,10 @@ sealed class BrowserWindow : Form
             if (smokeReport is not null) File.WriteAllText(smokeReport, JsonSerializer.Serialize(new { error = ex.ToString() }));
             else if (!closed) MessageBox.Show(this, ex.Message, "Could not start WebView2", MessageBoxButtons.OK, MessageBoxIcon.Error);
             if (!closed && !IsDisposed && IsHandleCreated) BeginInvoke(Close);
+        }
+        finally
+        {
+            if (!IsDisposed) { restoring = false; sidebar.Enabled = topStrip.Enabled = true; }
         }
     }
 
@@ -961,15 +1024,15 @@ sealed class BrowserWindow : Form
 
     async Task Restore()
     {
-        SessionState? state;
-        // shortcut: a session.json that exists but can't be read (locked) is left untouched and nothing is saved this run.
-        try { state = sessionTask is not null ? await sessionTask : Session.Load(sessionFile); }
-        catch (Exception) { if (!closed) await Open(); return; }
-        if (closed) return;
         restoring = true; // no tab opening, closing or clicks while restored tabs are still being created
         sidebar.Enabled = topStrip.Enabled = false;
         try
         {
+            SessionState? state;
+            // shortcut: a session.json that exists but can't be read (locked) is left untouched and nothing is saved this run.
+            try { state = sessionTask is not null ? await sessionTask : Session.Load(sessionFile); }
+            catch (Exception) { if (!closed) await Open(); return; }
+            if (closed) return;
             if (!settingsExisted && state is not null && state.Vertical != vertical)
             {
                 settings = settings with { VerticalTabs = state.Vertical };
@@ -986,14 +1049,43 @@ sealed class BrowserWindow : Form
                 if (closed) return;
                 SelectTab(opened[Math.Clamp(state.Selected, 0, opened.Count - 1)]);
             }
+            if (!closed) sessionReady = true;
         }
         finally { restoring = false; sidebar.Enabled = topStrip.Enabled = true; }
-        if (!closed) sessionReady = true;
+    }
+
+    bool EnsureSessionLock()
+    {
+        if (sessionLock is not null) return true;
+        sessionLock = Session.TryAcquireLock(ProfileDir);
+        if (sessionLock is null) return false;
+        if (!IsDisposed) UpdateWindowTitle();
+        return true;
+    }
+
+    void ReleaseSessionLock()
+    {
+        sessionLock?.Dispose();
+        sessionLock = null;
     }
 
     void SaveSession()
     {
-        if (!canSaveSession || !sessionReady || closed) return;
+        if (!sessionReady || closed || IsDisposed) return;
+        saveTimer.Stop();
+        saveTimer.Start();
+    }
+
+    void FlushSession()
+    {
+        if (closed || IsDisposed) return;
+        saveTimer.Stop();
+        WriteSessionNow();
+    }
+
+    void WriteSessionNow()
+    {
+        if (!sessionReady || closed || !EnsureSessionLock()) return;
         var kept = new List<SessionTab>();
         var selectedIndex = 0;
         foreach (var tab in opened)
@@ -1002,7 +1094,11 @@ sealed class BrowserWindow : Form
             if (tab == selected) selectedIndex = kept.Count;
             kept.Add(new SessionTab(url, tab.Title, tab.Pinned));
         }
-        try { Session.Save(sessionFile, new SessionState([.. kept], selectedIndex, vertical)); }
+        try
+        {
+            Session.Save(sessionFile, new SessionState([.. kept], selectedIndex, vertical));
+            sessionSaveCount++;
+        }
         catch { }
     }
 
@@ -2188,13 +2284,13 @@ sealed class BrowserWindow : Form
         switch (keyData)
         {
             case Keys.Control | Keys.L: address.FocusInput(); return true;
-            case Keys.Control | Keys.T: NewTab(); return true;
-            case Keys.Control | Keys.W: CloseCurrent(); return true;
-            case Keys.Control | Keys.Shift | Keys.T: ReopenClosedTab(); return true;
-            case Keys.Control | Keys.Shift | Keys.S: SetOrientation(!vertical); return true;
+            case Keys.Control | Keys.T: if (!restoring) NewTab(); return true;
+            case Keys.Control | Keys.W: if (!restoring) CloseCurrent(); return true;
+            case Keys.Control | Keys.Shift | Keys.T: if (!restoring) ReopenClosedTab(); return true;
+            case Keys.Control | Keys.Shift | Keys.S: if (!restoring) SetOrientation(!vertical); return true;
             case Keys.Control | Keys.Oemcomma: OpenSettings(); return true;
-            case Keys.Control | Keys.Shift | Keys.PageUp: MoveSelectedTab(-1); return true;
-            case Keys.Control | Keys.Shift | Keys.PageDown: MoveSelectedTab(1); return true;
+            case Keys.Control | Keys.Shift | Keys.PageUp: if (!restoring) MoveSelectedTab(-1); return true;
+            case Keys.Control | Keys.Shift | Keys.PageDown: if (!restoring) MoveSelectedTab(1); return true;
             case Keys.Alt | Keys.Left: GoBack(); return true;
             case Keys.Alt | Keys.Right: GoForward(); return true;
             case Keys.Control | Keys.R:
@@ -2206,11 +2302,14 @@ sealed class BrowserWindow : Form
             var key = keyData & Keys.KeyCode;
             if (key is >= Keys.D1 and <= Keys.D9)
             {
-                var display = DisplayTabs();
-                if (display.Count > 0)
+                if (!restoring)
                 {
-                    var idx = key == Keys.D9 ? display.Count - 1 : (int)(key - Keys.D1);
-                    if (idx < display.Count) SelectTab(display[idx]);
+                    var display = DisplayTabs();
+                    if (display.Count > 0)
+                    {
+                        var idx = key == Keys.D9 ? display.Count - 1 : (int)(key - Keys.D1);
+                        if (idx < display.Count) SelectTab(display[idx]);
+                    }
                 }
                 return true;
             }
@@ -2404,9 +2503,9 @@ sealed class BrowserWindow : Form
             (workDir, var extractDir) = await Updater.DownloadAndExtractAsync(release, cts.Token);
             if (closed || IsDisposed) return;
             Updater.SwapFiles(exePath, extractDir);
-            SaveSession();
+            FlushSession();
             sessionReady = false;
-            releaseSessionLock();
+            ReleaseSessionLock();
             try { Updater.Launch(exePath, launchArgs); }
             catch
             {
@@ -2580,6 +2679,46 @@ sealed class BrowserWindow : Form
             Close();
             return;
         }
+        if (smokePhase == "takeover")
+        {
+            await Restore();
+            await WaitForSelectedLoad();
+            var lockedInitially = !CanSaveSession;
+            var titleWhenLocked = Text;
+            var noticeWhenLocked = sessionNotice.Visible;
+            var bTab = await Open($"{fixture}/third?from=b");
+            await WaitForLoad(bTab);
+            FlushSession();
+            var stillLockedBeforeRelease = !CanSaveSession;
+            var smokeRoot = Path.GetDirectoryName(smokeReport!)!;
+            File.WriteAllText(Path.Combine(smokeRoot, "takeover.ready"), "ready");
+            var releaseFile = Path.Combine(smokeRoot, "takeover.released");
+            var waitRelease = Stopwatch.StartNew();
+            while (waitRelease.Elapsed < TimeSpan.FromSeconds(15) && !File.Exists(releaseFile))
+                await Task.Delay(50);
+            if (!File.Exists(releaseFile))
+                throw new TimeoutException("Timed out waiting for primary window lock release.");
+            SaveSession();
+            var waitTakeover = Stopwatch.StartNew();
+            while (waitTakeover.Elapsed < TimeSpan.FromSeconds(5) && !CanSaveSession)
+                await Task.Delay(50);
+            var tookOver = CanSaveSession;
+            var titleAfterTakeover = Text;
+            var noticeAfterTakeover = sessionNotice.Visible;
+            File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new
+            {
+                lockedInitially,
+                titleWhenLocked,
+                noticeWhenLocked,
+                stillLockedBeforeRelease,
+                tookOver,
+                titleAfterTakeover,
+                noticeAfterTakeover
+            }));
+            ExitCode = 0;
+            Close();
+            return;
+        }
         if (smokePhase == "restore")
         {
             await Restore();
@@ -2602,7 +2741,11 @@ sealed class BrowserWindow : Form
                 horizontalLayout = CheckHorizontalLayout(),
                 pinnedSurvivesClose = firstPinned is null || opened.Contains(firstPinned),
                 pinnedFirst = CheckPinnedFirst(),
-                canSaveSession
+                canSaveSession = CanSaveSession,
+                windowTitle = Text,
+                sessionNoticeVisible = sessionNotice.Visible,
+                restoringDuringEnv,
+                restoringCleared = !restoring && sidebar.Enabled && topStrip.Enabled
             }));
             ExitCode = 0;
             Close();
@@ -2942,6 +3085,17 @@ sealed class BrowserWindow : Form
             && Program.ParseArgs(["--profile", @"C:\tmp\p", "--no-update-check"]) is { NoUpdateCheck: true, ProfileDir: @"C:\tmp\p", Smoke: false }
             && Program.ParseArgs(["--no-update-check", "--profile", @"C:\tmp\p"]) is { NoUpdateCheck: true, ProfileDir: @"C:\tmp\p", Smoke: false }
             && Program.ParseArgs(["--profile"]) is null
+            && Program.ParseArgs(["--profile", ""]) is null
+            && Program.ParseArgs(["--profile", "   "]) is null
+            && Program.ParseArgs(["--profile", "--no-update-check"]) is null
+            && Program.TryResolveProfileDir(@"C:\tmp\p") is not null
+            && Program.TryResolveProfileDir("") is null
+            && Program.TryResolveProfileDir("   ") is null
+            && Program.TryResolveProfileDir("bad\0path") is null
+            && Program.TryResolveProfileDir(@"C:\bad|path") is null
+            && Program.TryResolveProfileDir(@"C:\bad?path") is null
+            && Program.TryResolveProfileDir(@"C:\a:b") is null
+            && Program.TryResolveProfileDir(settingsFile) is null
             && Program.ParseArgs(["--smoke-test", @"C:\tmp\r.json", "http://127.0.0.1:1", "restore", "--no-update-check"]) is { Smoke: true, SmokePhase: "restore", NoUpdateCheck: true }
             && Program.ParseArgs(["--smoke-test", @"C:\tmp\r.json", "http://127.0.0.1:1", "bogus"]) is null;
         async Task DispatchClick(CoreWebView2 core, int x, int y)
@@ -2994,7 +3148,7 @@ sealed class BrowserWindow : Form
         var blankSessionClean = false;
         if (blankTab is not null && blankTab != popupOpener && blankTab.IsPopup && blankTab.Url is null)
         {
-            SaveSession();
+            FlushSession();
             var savedRaw = File.Exists(sessionFile) ? File.ReadAllText(sessionFile) : "";
             var savedState = Session.Load(sessionFile);
             blankSessionClean = !savedRaw.Contains("about:blank", StringComparison.OrdinalIgnoreCase)
@@ -3135,7 +3289,7 @@ sealed class BrowserWindow : Form
         var keyboardReorder = kbUp && kbUpClamp && kbDown;
 
         // Saved session.json reflects pinned-first order and selected index.
-        SaveSession();
+        FlushSession();
         var savedDragSession = Session.Load(sessionFile);
         var sessionOrderMatches = savedDragSession is not null
             && savedDragSession.Selected == 2
@@ -3397,6 +3551,95 @@ sealed class BrowserWindow : Form
         CloseTab(crashTab, recordClosed: false);
         SelectTab(first);
 
+        // #37: rapid title changes coalesce into a debounced save; FileShare.Delete reader and transient lock retries succeed.
+        var debounceTab = await Open(fixture + "/first");
+        await WaitForLoad(debounceTab);
+        var debounceCore = debounceTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Debounce tab view is not ready.");
+        FlushSession();
+        var savesBefore = sessionSaveCount;
+        var titleEvents = 0;
+        void CountDebounceTitle(object? _, object __) => titleEvents++;
+        debounceCore.DocumentTitleChanged += CountDebounceTitle;
+        await debounceCore.ExecuteScriptAsync("let n=0;const iv=setInterval(()=>{document.title='Anim '+(++n);if(n>=15)clearInterval(iv);},15);");
+        var animWait = Stopwatch.StartNew();
+        while (animWait.Elapsed < TimeSpan.FromSeconds(5) && debounceTab.Title != "Anim 15")
+            await Task.Delay(20);
+        debounceCore.DocumentTitleChanged -= CountDebounceTitle;
+        var writesDuringBurst = sessionSaveCount - savesBefore;
+        var debounceWait = Stopwatch.StartNew();
+        while (debounceWait.Elapsed < TimeSpan.FromSeconds(2) && sessionSaveCount == savesBefore)
+            await Task.Delay(50);
+        var writesAfterDebounce = sessionSaveCount - savesBefore;
+        var savedAnimTitle = Session.Load(sessionFile)?.Tabs.Any(t => t.Title == "Anim 15") ?? false;
+
+        var shareDeleteOk = false;
+        using (new FileStream(sessionFile, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete))
+        {
+            shareDeleteOk = Session.Load(sessionFile) is not null;
+        }
+
+        var retryOk = false;
+        var retryFile = Path.Combine(Path.GetDirectoryName(sessionFile)!, "retry-test.json");
+        try
+        {
+            var sampleState = new SessionState([new SessionTab(fixture + "/first", "Retry", false)], 0, true);
+            Session.Save(retryFile, sampleState);
+            using var blockerReady = new ManualResetEventSlim();
+            var blocker = Task.Run(() =>
+            {
+                using var fs = new FileStream(retryFile, FileMode.Open, FileAccess.Read, FileShare.Read);
+                blockerReady.Set();
+                Thread.Sleep(55);
+            });
+            blockerReady.Wait();
+            Session.Save(retryFile, sampleState with { Vertical = false });
+            await blocker;
+            retryOk = Session.Load(retryFile) is { Vertical: false };
+        }
+        finally { try { File.Delete(retryFile); } catch { } }
+        CloseTab(debounceTab, recordClosed: false);
+        SelectTab(first);
+        var sessionDebounce = new
+        {
+            titleEvents,
+            writesDuringBurst,
+            writesAfterDebounce,
+            savedAnimTitle,
+            shareDeleteOk,
+            retryOk,
+        };
+
+        // #42: restoring disables tab chrome before awaits and ignores tab/layout shortcuts.
+        var restoreGuardTab = await Open(fixture + "/second");
+        await WaitForLoad(restoreGuardTab);
+        var guardSelectedBefore = selected;
+        var guardCountBefore = opened.Count;
+        var guardVerticalBefore = vertical;
+        closedUrls.Push(fixture + "/closed-during-restore");
+        var closedCountBefore = closedUrls.Count;
+        restoring = true;
+        try
+        {
+            PressKey(Keys.Control | Keys.T);
+            PressKey(Keys.Control | Keys.W);
+            PressKey(Keys.Control | Keys.Shift | Keys.T);
+            PressKey(Keys.Control | Keys.Shift | Keys.S);
+            PressKey(Keys.Control | Keys.Shift | Keys.PageUp);
+            PressKey(Keys.Control | Keys.Shift | Keys.PageDown);
+            PressKey(Keys.Control | Keys.D1);
+            PressKey(Keys.Control | Keys.D2);
+            PressKey(Keys.Control | Keys.D9);
+        }
+        finally { restoring = false; }
+        var shortcutsIgnored = opened.Count == guardCountBefore
+            && selected == guardSelectedBefore
+            && vertical == guardVerticalBefore
+            && closedUrls.Count == closedCountBefore;
+        if (closedUrls.Count > 0 && closedUrls.Peek() == fixture + "/closed-during-restore") closedUrls.Pop();
+        CloseTab(restoreGuardTab, recordClosed: false);
+        SelectTab(first);
+        var restoreShortcuts = new { restoringDuringEnv, shortcutsIgnored };
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -3408,6 +3651,7 @@ sealed class BrowserWindow : Form
             urlWhenCleanOff, cliFlags,
             faviconCached, addressDisplayOk, tabDrag,
             postClean, blobUrl, permissions, downloads, processCrash,
+            sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
             rejectsLocalFiles = Resolve("file:///C:/Windows/win.ini") == null && !PageHandoff.Allowed("file:///C:/Windows/win.ini"),
             // Must match RESOLVE in test_smoke.py.
