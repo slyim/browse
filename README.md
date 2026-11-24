@@ -8,6 +8,14 @@ Windows port of [Office Commun's Search](https://github.com/driceroland/Search),
 
 Get `browse.exe` from the [latest release](https://github.com/slyim/browse/releases/latest), unzip, and run it. Needs the .NET 10 Desktop Runtime (see below).
 
+Or with [Scoop](https://scoop.sh), which also installs the .NET runtime (that step needs an Administrator shell the first time):
+
+```powershell
+scoop bucket add extras
+scoop bucket add browse https://github.com/slyim/browse
+scoop install browse/browse
+```
+
 ## Requirements
 
 - Windows 10 or Windows 11 (x64)

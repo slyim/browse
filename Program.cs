@@ -4231,8 +4231,8 @@ sealed class BrowserWindow : Form
                     updateBtn.Bounds, shareBtn.Bounds, settingsBtn.Bounds,
                     minBtn.Bounds, maxBtn.Bounds, closeBtn.Bounds,
                 };
-                simulatedDpiOk &= MinimumSize == new Size(S(640), S(420))
-                    && address.Width >= S(160) && address.Height == S(28)
+                // MinimumSize is not checked here: Windows caps it to small screens (e.g. CI's 1024x768); the live check covers it.
+                simulatedDpiOk &= address.Width >= S(160) && address.Height == S(28)
                     && simRects.All(r => r.Width > 0 && r.Height > 0 && simArea.Contains(r))
                     && NoOverlap(simRects);
             }

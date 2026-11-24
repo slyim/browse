@@ -1,13 +1,13 @@
 {
-    "version": "0.0.1",
+    "version": "0.0.2",
     "description": "Small, fast Windows web browser: vertical tabs, built-in ad/tracker blocking, sleeping tabs. WinForms + system WebView2, no bundled Chromium.",
     "homepage": "https://github.com/slyim/browse",
     "license": "MIT",
     "depends": "extras/windowsdesktop-runtime-lts",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/slyim/browse/releases/download/v0.0.1/browse-0.0.1-win-x64.zip",
-            "hash": "574c96e1ff1a7846d7df6735d425c2909269fcdd6706391cacc6dc5dfc3c0292"
+            "url": "https://github.com/slyim/browse/releases/download/v0.0.2/browse-0.0.2-win-x64.zip",
+            "hash": "a38b379706bafe198453d333053ef155a7c0eedd49762e0bb73004a68f266853"
         }
     },
     "bin": "browse.exe",
