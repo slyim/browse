@@ -1,9 +1,11 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
+using Microsoft.Win32;
 
 namespace SearchPort;
 
@@ -12,7 +14,8 @@ sealed record CliOptions(
     bool NoUpdateCheck,
     string? SmokeReport,
     string? Fixture,
-    string? SmokePhase)
+    string? SmokePhase,
+    string? Url = null)
 {
     public bool Smoke => SmokeReport is not null;
 }
@@ -22,6 +25,50 @@ static class Program
     static readonly char[] InvalidPathSegmentChars = Path.GetInvalidFileNameChars()
         .Where(c => c != Path.DirectorySeparatorChar && c != Path.AltDirectorySeparatorChar)
         .ToArray();
+
+    internal static bool IsAllowedHtmlFilePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || path.Length < 4) return false;
+        if (!char.IsAsciiLetter(path[0]) || path[1] != ':' || path[2] is not ('\\' or '/')) return false;
+        if (path[^1] is ' ' or '.') return false;
+        if (path[3..].IndexOfAny(InvalidPathSegmentChars) >= 0) return false;
+        var ext = Path.GetExtension(path);
+        return ext.Equals(".htm", StringComparison.OrdinalIgnoreCase)
+            || ext.Equals(".html", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool IsAllowedLocalHtmlUri(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw) || !raw.StartsWith("file:", StringComparison.OrdinalIgnoreCase)) return false;
+        if (!Uri.TryCreate(raw, UriKind.Absolute, out var uri)) return false;
+        if (!uri.IsFile || uri.IsUnc || uri.UserInfo.Length > 0 || !string.IsNullOrEmpty(uri.Host)) return false;
+        return IsAllowedHtmlFilePath(uri.LocalPath);
+    }
+
+    internal static string? TryValidateLaunchUrl(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw) || raw.Length > LaunchPipe.MaxUrlLength) return null;
+        var text = raw.Trim();
+        if (text.Length == 0 || text.Length > LaunchPipe.MaxUrlLength) return null;
+        if (text.Any(c => c < 0x20 || c == 0x7F)) return null;
+        if (PageHandoff.Allowed(text)) return new Uri(text).AbsoluteUri;
+        if (text.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+            return IsAllowedLocalHtmlUri(text) ? new Uri(text).AbsoluteUri : null;
+        if (text.Length >= 3 && char.IsAsciiLetter(text[0]) && text[1] == ':' && text[2] is '\\' or '/')
+        {
+            if (!IsAllowedHtmlFilePath(text)) return null;
+            try
+            {
+                var full = Path.GetFullPath(text);
+                return IsAllowedHtmlFilePath(full) ? new Uri(full).AbsoluteUri : null;
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                return null;
+            }
+        }
+        return null;
+    }
 
     internal static string? TryResolveProfileDir(string dir)
     {
@@ -45,6 +92,7 @@ static class Program
         string? smokeReport = null;
         string? fixture = null;
         string? smokePhase = null;
+        string? url = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -57,21 +105,24 @@ static class Program
                     profileDir = args[i];
                     break;
                 case "--smoke-test":
-                    if (smokeReport is not null || i + 2 >= args.Length) return null;
+                    if (smokeReport is not null || url is not null || i + 2 >= args.Length) return null;
                     smokeReport = args[++i];
                     fixture = args[++i];
                     if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
                     {
-                        if (args[i + 1] is not ("restore" or "perf" or "sleep" or "takeover")) return null;
+                        if (args[i + 1] is not ("restore" or "perf" or "sleep" or "takeover" or "forward")) return null;
                         smokePhase = args[++i];
                     }
                     break;
                 default:
-                    if (smokeReport is not null) return null;
+                    if (smokeReport is not null || url is not null) return null;
+                    if (args[i].StartsWith("--", StringComparison.Ordinal)) return null;
+                    url = TryValidateLaunchUrl(args[i]);
+                    if (url is null) return null;
                     break;
             }
         }
-        return new CliOptions(profileDir, noUpdateCheck, smokeReport, fixture, smokePhase);
+        return new CliOptions(profileDir, noUpdateCheck, smokeReport, fixture, smokePhase, url);
     }
 
     [STAThread]
@@ -96,6 +147,10 @@ static class Program
             resolvedProfileDir is not null ? Path.Combine(resolvedProfileDir, "WebView") :
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SearchWindows", "WebView");
 
+        var sessionLock = Session.TryAcquireLock(profile);
+        if (opts.Url is not null && !opts.Smoke && sessionLock is null && LaunchPipe.TryForward(profile, opts.Url))
+            return 0;
+
         if (!opts.Smoke) Updater.StartCleanupOldBinary();
         var profileRoot = Path.GetDirectoryName(profile)!;
         var settingsFile = Path.Combine(profileRoot, "settings.json");
@@ -106,7 +161,9 @@ static class Program
 #pragma warning disable WFO5001 // experimental in .NET 10; gives native menus, scrollbars, text boxes and title bar the system theme
         Application.SetColorMode(SettingsStore.ToColorMode(initialSettings.Theme));
 #pragma warning restore WFO5001
-        var sessionLock = Session.TryAcquireLock(profile);
+        var restartArgs = new List<string>(3);
+        if (opts.ProfileDir is not null) { restartArgs.Add("--profile"); restartArgs.Add(opts.ProfileDir); }
+        if (opts.NoUpdateCheck) restartArgs.Add("--no-update-check");
         BrowserWindow? browser = null;
         try
         {
@@ -116,7 +173,7 @@ static class Program
             browser = new BrowserWindow(
                 sessionFile, settingsFile, initialSettings, settingsExisted, envTask, sessionTask, sessionLock,
                 opts.SmokeReport, opts.Fixture, opts.SmokePhase,
-                opts.NoUpdateCheck, args);
+                opts.NoUpdateCheck, [.. restartArgs], opts.Url);
             sessionLock = null;
             Application.Run(browser);
             return browser.ExitCode;
@@ -216,6 +273,9 @@ sealed class BrowserWindow : Form
     readonly string? smokePhase;
     readonly bool noUpdateCheck;
     readonly string[] launchArgs;
+    readonly string? initialUrl;
+    readonly List<string> pendingExternalUrls = [];
+    CancellationTokenSource? launchPipeCts;
     IDisposable? sessionLock;
     AppSettings settings;
     bool settingsExisted;
@@ -243,6 +303,9 @@ sealed class BrowserWindow : Form
     Func<string, string, bool>? confirmDownloadOverride;
     Func<string, bool>? confirmShareOverride;
     Action<string>? shareErrorOverride;
+    Func<string, string?, string?, (bool Allow, bool Remember)>? confirmExternalSchemeOverride;
+    Action<string, string?, bool, bool>? externalSchemeResultOverride;
+    bool suppressExternalLaunch;
     int? dpiOverride;
     long envMs;
     long drawTabsTicks;
@@ -323,6 +386,9 @@ sealed class BrowserWindow : Form
     [DllImport("user32.dll")]
     static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
+    [DllImport("user32.dll")]
+    static extern bool SetForegroundWindow(IntPtr hWnd);
+
     static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = (IntPtr)(-4);
 
     [DllImport("user32.dll")]
@@ -341,6 +407,7 @@ sealed class BrowserWindow : Form
         public bool Pinned { get; set; } = saved?.Pinned ?? false;
         public string? PendingUrl { get; set; } = saved?.Url;
         public string? SavedUrl { get; set; } = saved?.Url;
+        public string? AllowedFileUri { get; set; }
         public string? SavedTitle { get; set; } = saved?.Title;
         public string? LastUrl { get; set; }
         public string? LastTitle { get; set; }
@@ -355,11 +422,20 @@ sealed class BrowserWindow : Form
         public bool Navigating => ActiveNavigationId is not null;
         public Func<int> BlockedCount { get; set; } = () => 0;
         public Func<bool, Task> SetShieldEnabledAsync { get; set; } = _ => Task.CompletedTask;
+        public bool IsAllowedFileNavigation(string? uri)
+        {
+            if (AllowedFileUri is null || string.IsNullOrEmpty(uri)) return false;
+            if (!Uri.TryCreate(AllowedFileUri, UriKind.Absolute, out var allowed)
+                || !Uri.TryCreate(uri, UriKind.Absolute, out var actual))
+                return false;
+            if (!actual.IsFile || actual.IsUnc || !string.IsNullOrEmpty(actual.Host)) return false;
+            return string.Equals(allowed.LocalPath, actual.LocalPath, StringComparison.OrdinalIgnoreCase);
+        }
         public string? Url
         {
             get
             {
-                try { if (View is { IsDisposed: false, CoreWebView2.Source: { } s } && PageHandoff.Allowed(s)) return s; }
+                try { if (View is { IsDisposed: false, CoreWebView2.Source: { } s } && (PageHandoff.Allowed(s) || IsAllowedFileNavigation(s))) return s; }
                 catch (Exception ex) when (ex is COMException or InvalidOperationException) { }
                 return SavedUrl ?? LastUrl;
             }
@@ -383,7 +459,7 @@ sealed class BrowserWindow : Form
         }
     }
 
-    public BrowserWindow(string sessionFile, string settingsFile, AppSettings initialSettings, bool settingsExisted, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, IDisposable? sessionLock, string? smokeReport, string? fixture, string? smokePhase = null, bool noUpdateCheck = false, string[]? launchArgs = null)
+    public BrowserWindow(string sessionFile, string settingsFile, AppSettings initialSettings, bool settingsExisted, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, IDisposable? sessionLock, string? smokeReport, string? fixture, string? smokePhase = null, bool noUpdateCheck = false, string[]? launchArgs = null, string? initialUrl = null)
     {
         this.sessionFile = sessionFile;
         this.settingsFile = settingsFile;
@@ -399,6 +475,7 @@ sealed class BrowserWindow : Form
         this.smokePhase = smokePhase;
         this.noUpdateCheck = noUpdateCheck;
         this.launchArgs = launchArgs ?? [];
+        this.initialUrl = initialUrl;
         Font = Theme.FontForDpi(Theme.UiFont, DeviceDpi);
         ForeColor = Theme.Ink;
         BackColor = Theme.Frame;
@@ -476,7 +553,7 @@ sealed class BrowserWindow : Form
         Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); };
         Load += async (_, _) => await Start();
         FormClosing += (_, _) => FlushSession();
-        FormClosed += (_, _) => { closed = true; CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); };
+        FormClosed += (_, _) => { closed = true; StopLaunchPipe(); CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); };
     }
 
     int S(int px) => dpiOverride is { } dpi
@@ -498,6 +575,7 @@ sealed class BrowserWindow : Form
         {
             if (!closed) FlushSession();
             closed = true;
+            StopLaunchPipe();
             CancelTabDrag();
             pending?.Cancel();
             updateCts?.Cancel();
@@ -983,6 +1061,7 @@ sealed class BrowserWindow : Form
         restoring = true;
         sidebar.Enabled = topStrip.Enabled = false;
         restoringDuringEnv = restoring && !sidebar.Enabled && !topStrip.Enabled;
+        if (smokeReport is null && sessionLock is not null) StartLaunchPipe();
         try
         {
             var envWatch = Stopwatch.StartNew();
@@ -998,6 +1077,8 @@ sealed class BrowserWindow : Form
             else
             {
                 await Restore();
+                if (closed) return;
+                await DrainPendingExternalUrlsAsync();
                 if (closed) return;
                 if (selected?.Url is null) address.FocusInput();
                 else if (selected.View is { IsDisposed: false } view) FocusView(view); // a focused address bar ignores redirects
@@ -1078,7 +1159,7 @@ sealed class BrowserWindow : Form
                 settings = settings with { VerticalTabs = state.Vertical };
                 SetOrientation(state.Vertical, persistSettings: false);
             }
-            if (state is not { Tabs.Length: > 0 }) await Open();
+            if (state is not { Tabs.Length: > 0 }) await Open(initialUrl);
             else
             {
                 foreach (var item in state.Tabs)
@@ -1088,10 +1169,81 @@ sealed class BrowserWindow : Form
                 }
                 if (closed) return;
                 SelectTab(opened[Math.Clamp(state.Selected, 0, opened.Count - 1)]);
+                if (initialUrl is not null) await Open(initialUrl);
             }
             if (!closed) sessionReady = true;
         }
         finally { restoring = false; sidebar.Enabled = topStrip.Enabled = true; }
+    }
+
+    void StartLaunchPipe()
+    {
+        if (closed || IsDisposed || launchPipeCts is not null) return;
+        var cts = new CancellationTokenSource();
+        if (LaunchPipe.StartServer(ProfileDir, AcceptForwardedUrl, cts.Token) is null)
+        {
+            cts.Dispose();
+            return;
+        }
+        launchPipeCts = cts;
+    }
+
+    void StopLaunchPipe()
+    {
+        var cts = Interlocked.Exchange(ref launchPipeCts, null);
+        if (cts is null) return;
+        try { cts.Cancel(); } catch { }
+        cts.Dispose();
+    }
+
+    bool AcceptForwardedUrl(string url)
+    {
+        if (closed || IsDisposed || !IsHandleCreated) return false;
+        try
+        {
+            BeginInvoke(() => _ = OpenExternalUrlAsync(url));
+            return true;
+        }
+        catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    async Task OpenExternalUrlAsync(string url)
+    {
+        if (closed || IsDisposed) return;
+        BringToFrontFromExternal();
+        if (restoring || environment is null)
+        {
+            pendingExternalUrls.Add(url);
+            return;
+        }
+        await OpenInteractive(url);
+    }
+
+    async Task DrainPendingExternalUrlsAsync()
+    {
+        while (pendingExternalUrls.Count > 0 && !closed && !IsDisposed)
+        {
+            var next = pendingExternalUrls[0];
+            pendingExternalUrls.RemoveAt(0);
+            await OpenInteractive(next);
+            BringToFrontFromExternal();
+        }
+    }
+
+    void BringToFrontFromExternal()
+    {
+        if (closed || IsDisposed) return;
+        if (WindowState == FormWindowState.Minimized)
+            WindowState = FormWindowState.Normal;
+        if (!Visible) Show();
+        var prevTopMost = TopMost;
+        TopMost = true;
+        TopMost = prevTopMost;
+        Activate();
+        if (IsHandleCreated) SetForegroundWindow(Handle);
     }
 
     bool EnsureSessionLock()
@@ -1099,7 +1251,11 @@ sealed class BrowserWindow : Form
         if (sessionLock is not null) return true;
         sessionLock = Session.TryAcquireLock(ProfileDir);
         if (sessionLock is null) return false;
-        if (!IsDisposed) UpdateWindowTitle();
+        if (!IsDisposed)
+        {
+            UpdateWindowTitle();
+            if (smokeReport is null) StartLaunchPipe();
+        }
         return true;
     }
 
@@ -1210,8 +1366,10 @@ sealed class BrowserWindow : Form
                     tab.PendingPageUri = Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u : null;
                 }
                 core.NavigationStarting += (_, e) => {
-                    if (!IsNavigable(e.Uri))
+                    var isAllowedFile = tab.IsAllowedFileNavigation(e.Uri);
+                    if (!IsNavigable(e.Uri) && !isAllowedFile)
                     {
+                        if (ExternalSchemes.CanPassNavigationToExternalHandler(e.Uri)) return;
                         e.Cancel = true;
                         return;
                     }
@@ -1290,7 +1448,7 @@ sealed class BrowserWindow : Form
                     });
                 };
                 core.ProcessFailed += (_, e) => HandleProcessFailed(tab, view, e.ProcessFailedKind);
-                core.LaunchingExternalUriScheme += (_, e) => e.Cancel = true;
+                core.LaunchingExternalUriScheme += (_, e) => HandleLaunchingExternalUriScheme(tab, e);
                 core.NewWindowRequested += (_, e) => {
                     e.Handled = true;
                     if (!e.IsUserInitiated || !IsPopupAllowed(e.Uri) || environment is null || closed || restoring || IsDisposed || !IsHandleCreated)
@@ -1305,6 +1463,13 @@ sealed class BrowserWindow : Form
                     if (!opened.Contains(tab)) return;
                     var src = TryCore(() => core.Source);
                     if (src is not null && PageHandoff.Allowed(src))
+                    {
+                        tab.AllowedFileUri = null;
+                        tab.Loaded = true;
+                        tab.SavedUrl = null;
+                        tab.LastUrl = src;
+                    }
+                    else if (src is not null && tab.IsAllowedFileNavigation(src))
                     {
                         tab.Loaded = true;
                         tab.SavedUrl = null;
@@ -1418,6 +1583,68 @@ sealed class BrowserWindow : Form
                 MessageBoxButtons.OKCancel,
                 MessageBoxIcon.Warning,
                 MessageBoxDefaultButton.Button2) == DialogResult.OK;
+
+    void HandleLaunchingExternalUriScheme(BrowserTab tab, CoreWebView2LaunchingExternalUriSchemeEventArgs e)
+    {
+        var isActiveTab = tab == selected && !closed && !tab.Closed;
+        var decision = ExternalSchemes.Decide(
+            e.Uri, e.InitiatingOrigin, isActiveTab, e.IsUserInitiated, settings.AllowedExternalApps,
+            out var scheme, out var site);
+        if (decision == ExternalSchemeDecision.Deny)
+        {
+            e.Cancel = true;
+            if (scheme is not null) externalSchemeResultOverride?.Invoke(scheme, site, false, false);
+            return;
+        }
+        if (decision == ExternalSchemeDecision.AllowRemembered)
+        {
+            e.Cancel = suppressExternalLaunch;
+            externalSchemeResultOverride?.Invoke(scheme!, site, true, false);
+            return;
+        }
+        if (IsDisposed || !IsHandleCreated)
+        {
+            e.Cancel = true;
+            return;
+        }
+        var deferral = e.GetDeferral();
+        BeginInvoke(() =>
+        {
+            try
+            {
+                if (closed || tab.Closed || IsDisposed || tab != selected)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+                var appName = ExternalSchemes.ResolveAppName(scheme!);
+                var (allow, remember) = PromptExternalScheme(scheme!, site, appName);
+                if (allow && remember && site is not null)
+                    RememberExternalAppPermission(site, scheme!);
+                e.Cancel = !allow || suppressExternalLaunch;
+                externalSchemeResultOverride?.Invoke(scheme!, site, allow, true);
+            }
+            catch { e.Cancel = true; }
+            finally { deferral.Complete(); }
+        });
+    }
+
+    (bool Allow, bool Remember) PromptExternalScheme(string scheme, string? site, string? appName)
+    {
+        if (confirmExternalSchemeOverride is not null)
+            return confirmExternalSchemeOverride(scheme, site, appName);
+        using var dialog = new ExternalAppDialog(scheme, site, appName);
+        var allow = dialog.ShowDialog(this) == DialogResult.OK;
+        return (allow, allow && dialog.RememberChoice);
+    }
+
+    void RememberExternalAppPermission(string site, string scheme)
+    {
+        var updated = ExternalSchemes.NormalizePermissions([.. settings.AllowedExternalApps, new ExternalAppPermission(site, scheme)]);
+        if (updated.SequenceEqual(settings.AllowedExternalApps)) return;
+        ApplySettings(settings with { AllowedExternalApps = updated });
+        settingsDialog?.SyncFrom(settings);
+    }
 
     void OpenDownloads()
     {
@@ -1572,7 +1799,8 @@ sealed class BrowserWindow : Form
     async Task<BrowserTab> Open(string? target = null)
     {
         var cleaned = target is null ? null : (settings.CleanLinksEnabled ? CleanLink.Clean(target) : target);
-        var tab = new BrowserTab { SavedUrl = cleaned };
+        var allowedFileUri = cleaned is not null && Program.IsAllowedLocalHtmlUri(cleaned) ? cleaned : null;
+        var tab = new BrowserTab { SavedUrl = cleaned, AllowedFileUri = allowedFileUri };
         await EnsureView(tab);
         if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return tab;
         opened.Add(tab);
@@ -2405,10 +2633,28 @@ sealed class BrowserWindow : Form
             settingsDialog.Activate();
             return;
         }
-        settingsDialog = new SettingsDialog(settings, noUpdateCheck, ApplySettings, ClearBrowsingDataAsync);
+        settingsDialog = new SettingsDialog(
+            settings,
+            noUpdateCheck,
+            ApplySettings,
+            ClearBrowsingDataAsync,
+            () => BrowserRegistration.IsRegistered(),
+            RegisterDefaultBrowser,
+            UnregisterDefaultBrowser);
         settingsDialog.FormClosed += (_, _) => { settingsDialog = null; };
         settingsDialog.Show(this);
     }
+
+    void RegisterDefaultBrowser()
+    {
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exePath))
+            throw new InvalidOperationException("Could not determine the browse executable path.");
+        BrowserRegistration.Register(exePath);
+        BrowserRegistration.OpenDefaultAppsSettings();
+    }
+
+    void UnregisterDefaultBrowser() => BrowserRegistration.Unregister();
 
     Task ApplyBlockingAsync(bool enabled) =>
         Task.WhenAll(opened.ToArray()
@@ -2577,6 +2823,7 @@ sealed class BrowserWindow : Form
             Updater.SwapFiles(exePath, extractDir);
             FlushSession();
             sessionReady = false;
+            StopLaunchPipe();
             ReleaseSessionLock();
             try { Updater.Launch(exePath, launchArgs); }
             catch
@@ -2715,6 +2962,60 @@ sealed class BrowserWindow : Form
 
     async Task SmokeTest()
     {
+        if (smokePhase == "forward")
+        {
+            var initial = await Open($"{fixture}/first");
+            await WaitForLoad(initial);
+            StartLaunchPipe();
+            var pipeName = LaunchPipe.PipeName(ProfileDir);
+            var rejectsBadScheme = false;
+            var rejectsOversized = false;
+            try
+            {
+                using (var c1 = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly))
+                {
+                    await c1.ConnectAsync(2000);
+                    await c1.WriteAsync(Encoding.UTF8.GetBytes("javascript:alert(1)\n"));
+                    await c1.FlushAsync();
+                    var ack = new byte[1];
+                    rejectsBadScheme = await c1.ReadAsync(ack) == 1 && ack[0] == 0;
+                }
+                using (var c2 = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly))
+                {
+                    await c2.ConnectAsync(2000);
+                    try
+                    {
+                        await c2.WriteAsync(Encoding.UTF8.GetBytes("https://example.com/" + new string('a', 17_000) + "\n"));
+                        await c2.FlushAsync();
+                        var ack = new byte[1];
+                        var n = await c2.ReadAsync(ack);
+                        rejectsOversized = n == 0 || ack[0] == 0;
+                    }
+                    catch (IOException) { rejectsOversized = true; }
+                }
+            }
+            catch { }
+            var pipeRejectsInvalid = rejectsBadScheme && rejectsOversized && opened.Count == 1;
+
+            var smokeRoot = Path.GetDirectoryName(smokeReport!)!;
+            File.WriteAllText(Path.Combine(smokeRoot, "forward.ready"), "ready");
+            var waitForward = Stopwatch.StartNew();
+            while (waitForward.Elapsed < TimeSpan.FromSeconds(15)
+                && (opened.Count < 2 || !opened[^1].Loaded || opened[^1].Navigating))
+                await Task.Delay(50);
+            var forwardedTab = opened.Count >= 2 ? opened[^1] : null;
+            File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new
+            {
+                tabCount = opened.Count,
+                openedUrl = forwardedTab?.Url,
+                openedTitle = forwardedTab?.Title,
+                selectedIsNewTab = forwardedTab is not null && selected == forwardedTab,
+                pipeRejectsInvalid,
+            }));
+            ExitCode = 0;
+            Close();
+            return;
+        }
         if (smokePhase == "sleep")
         {
             var sleepTabs = new List<BrowserTab>(5);
@@ -3985,8 +4286,17 @@ sealed class BrowserWindow : Form
         var settingsDialogDpiOk = true;
         foreach (var dpi in new[] { 96, 144, 192 })
         {
-            using var simSettings = new SettingsDialog(settings, noUpdateCheck, _ => { }, () => Task.CompletedTask, dpi);
+            using var simSettings = new SettingsDialog(settings, noUpdateCheck, _ => { }, () => Task.CompletedTask, dpiOverride: dpi);
             settingsDialogDpiOk &= simSettings.VerifyLayoutInsideClient();
+        }
+
+        var externalAppDialogOk = true;
+        foreach (var dpi in new[] { 96, 144, 192 })
+        {
+            using var simExtWithSite = new ExternalAppDialog("vscode", "https://github.com", "Visual Studio Code", dpi);
+            externalAppDialogOk &= simExtWithSite.VerifyLayoutInsideClient();
+            using var simExtNoSite = new ExternalAppDialog("mailto", null, null, dpi);
+            externalAppDialogOk &= simExtNoSite.VerifyLayoutInsideClient();
         }
 
         var highDpi = new
@@ -3997,6 +4307,228 @@ sealed class BrowserWindow : Form
             simulatedDpiOk,
             shareDialogOk,
             settingsDialogDpiOk,
+            externalAppDialogOk,
+        };
+
+        // #49: URL CLI argument parsing, validation, local HTML opening, and per-user registry registration under a test root.
+        var tempHtmlPath = Path.Combine(Path.GetDirectoryName(smokeReport!)!, "local-test.html");
+        File.WriteAllText(tempHtmlPath, "<!doctype html><title>Local HTML marker</title><main>local</main>");
+        var localHtmlOpensSafely = false;
+        try
+        {
+            var localHtmlUri = Program.TryValidateLaunchUrl(tempHtmlPath);
+            if (localHtmlUri is not null)
+            {
+                var localTab = await Open(localHtmlUri);
+                await WaitForLoad(localTab);
+                FlushSession();
+                var savedAfterLocal = File.Exists(sessionFile) ? File.ReadAllText(sessionFile) : "";
+                localHtmlOpensSafely = localTab.Title == "Local HTML marker"
+                    && localTab.Url == localHtmlUri
+                    && !PageHandoff.Allowed(localHtmlUri)
+                    && !localTab.IsAllowedFileNavigation("file:///C:/Windows/win.ini")
+                    && !savedAfterLocal.Contains("local-test.html", StringComparison.OrdinalIgnoreCase);
+                CloseTab(localTab, recordClosed: false);
+                SelectTab(first);
+            }
+        }
+        finally { try { File.Delete(tempHtmlPath); } catch { } }
+
+        var cliUrl = new
+        {
+            validHttp = Program.ParseArgs(["http://example.com/a"]) is { Url: "http://example.com/a", ProfileDir: null, NoUpdateCheck: false },
+            validHttpsWithFlags = Program.ParseArgs(["--profile", @"C:\tmp\p", "--no-update-check", "https://example.com/x?q=1"]) is { ProfileDir: @"C:\tmp\p", NoUpdateCheck: true, Url: "https://example.com/x?q=1" },
+            validFileUri = Program.ParseArgs(["file:///C:/tmp/page.html"]) is { Url: "file:///C:/tmp/page.html" }
+                && Program.ParseArgs(["file:///C:/tmp/PAGE.HTM"]) is { Url: "file:///C:/tmp/PAGE.HTM" },
+            validLocalPath = Program.ParseArgs([@"C:\tmp\page.html"]) is { Url: "file:///C:/tmp/page.html" },
+            rejectsBadInputs = Program.ParseArgs(["javascript:alert(1)"]) is null
+                && Program.ParseArgs(["vbscript:msgbox(1)"]) is null
+                && Program.ParseArgs(["data:text/html,hi"]) is null
+                && Program.ParseArgs(["file:///C:/Windows/win.ini"]) is null
+                && Program.ParseArgs([@"C:\Windows\win.ini"]) is null
+                && Program.ParseArgs([@"\\server\share\page.html"]) is null
+                && Program.ParseArgs(["file://server/share/page.html"]) is null
+                && Program.ParseArgs(["mailto:a@example.com"]) is null
+                && Program.ParseArgs(["ms-msdt:/id"]) is null
+                && Program.ParseArgs(["ftp://example.com"]) is null
+                && Program.ParseArgs(["https://user:pw@example.com"]) is null
+                && Program.ParseArgs(["about:blank"]) is null
+                && Program.ParseArgs(["edge://settings"]) is null
+                && Program.ParseArgs(["example.com"]) is null
+                && Program.ParseArgs(["--unknown-flag"]) is null
+                && Program.ParseArgs(["https://a.example/", "https://b.example/"]) is null
+                && Program.ParseArgs(["https://example.com/" + new string('a', LaunchPipe.MaxUrlLength)]) is null,
+            localHtmlOpensSafely,
+        };
+
+        var testRegRoot = $@"Software\browse-smoke-test-{Guid.NewGuid():N}";
+        var regNotInitially = false;
+        var regWrittenOk = false;
+        var regRemovedOk = false;
+        try
+        {
+            regNotInitially = !BrowserRegistration.IsRegistered(Registry.CurrentUser, testRegRoot);
+            const string fakeExe = @"C:\Tools\browse.exe";
+            BrowserRegistration.Register(fakeExe, Registry.CurrentUser, testRegRoot, notifyShell: false);
+            var expectedCapPath = $@"{testRegRoot}\Clients\StartMenuInternet\browse\Capabilities";
+            using (var regApps = Registry.CurrentUser.OpenSubKey($@"{testRegRoot}\RegisteredApplications"))
+            using (var cap = Registry.CurrentUser.OpenSubKey(expectedCapPath))
+            using (var urlAssoc = Registry.CurrentUser.OpenSubKey($@"{expectedCapPath}\URLAssociations"))
+            using (var fileAssoc = Registry.CurrentUser.OpenSubKey($@"{expectedCapPath}\FileAssociations"))
+            using (var progCmd = Registry.CurrentUser.OpenSubKey($@"{testRegRoot}\Classes\browseHTML\shell\open\command"))
+            {
+                regWrittenOk = BrowserRegistration.IsRegistered(Registry.CurrentUser, testRegRoot)
+                    && (regApps?.GetValue("browse") as string) == expectedCapPath
+                    && (cap?.GetValue("ApplicationName") as string) == "browse"
+                    && (cap?.GetValue("ApplicationIcon") as string) == $"{fakeExe},0"
+                    && (urlAssoc?.GetValue("http") as string) == "browseHTML"
+                    && (urlAssoc?.GetValue("https") as string) == "browseHTML"
+                    && (fileAssoc?.GetValue(".htm") as string) == "browseHTML"
+                    && (fileAssoc?.GetValue(".html") as string) == "browseHTML"
+                    && (progCmd?.GetValue("") as string) == $"\"{fakeExe}\" \"%1\"";
+            }
+            BrowserRegistration.Unregister(Registry.CurrentUser, testRegRoot, notifyShell: false);
+            using (var regAppsAfter = Registry.CurrentUser.OpenSubKey($@"{testRegRoot}\RegisteredApplications"))
+            using (var clientAfter = Registry.CurrentUser.OpenSubKey($@"{testRegRoot}\Clients\StartMenuInternet\browse"))
+            using (var progAfter = Registry.CurrentUser.OpenSubKey($@"{testRegRoot}\Classes\browseHTML"))
+            {
+                regRemovedOk = !BrowserRegistration.IsRegistered(Registry.CurrentUser, testRegRoot)
+                    && regAppsAfter?.GetValue("browse") is null
+                    && clientAfter is null
+                    && progAfter is null;
+            }
+        }
+        finally
+        {
+            try { Registry.CurrentUser.DeleteSubKeyTree(testRegRoot, throwOnMissingSubKey: false); } catch { }
+        }
+        var browserRegistration = new
+        {
+            notInitially = regNotInitially,
+            writtenOk = regWrittenOk,
+            removedOk = regRemovedOk,
+        };
+
+        // #50: External URI scheme decisions, dangerous scheme denials, background denial, prompt + remember + clear flow.
+        var dangerousList = new[]
+        {
+            "javascript:alert(1)", "vbscript:msgbox(1)", "file:///C:/a.html",
+            "ms-msdt:/id", "search-ms:query=a", "ms-officecmd:u|https://evil.example",
+            "ms-appinstaller:?source=https://evil.example/a.msix", "shell:AppsFolder",
+        };
+        var dangerousDenied = dangerousList.All(u =>
+            ExternalSchemes.Decide(u, "https://example.com", true, true,
+                [new ExternalAppPermission("https://example.com", ExternalSchemes.NormalizeScheme(u) ?? "x")],
+                out _, out _) == ExternalSchemeDecision.Deny);
+        var bgDecisionDenied = ExternalSchemes.Decide("mailto:a@example.com", "https://example.com", false, false, [], out _, out _) == ExternalSchemeDecision.Deny;
+        var promptDecision = ExternalSchemes.Decide("vscode://file/c:/a", "https://github.com", true, true, [], out var decScheme, out var decSite) == ExternalSchemeDecision.Prompt
+            && decScheme == "vscode" && decSite == "https://github.com";
+        var rememberedDecision = ExternalSchemes.Decide("vscode://file/c:/a", "https://github.com", true, true,
+            [new ExternalAppPermission("https://github.com", "vscode")], out _, out _) == ExternalSchemeDecision.AllowRemembered
+            && ExternalSchemes.Decide("vscode://file/c:/a", "https://github.com", true, false,
+                [new ExternalAppPermission("https://github.com", "vscode")], out _, out _) == ExternalSchemeDecision.Deny;
+        var opaqueOriginNoSite = ExternalSchemes.Decide("mailto:a@example.com", "null", true, true, [], out _, out var opaqueSite) == ExternalSchemeDecision.Prompt
+            && opaqueSite is null;
+
+        var extBg = await Open(fixture + "/external-scheme");
+        await WaitForLoad(extBg);
+        var extFg = await Open(fixture + "/external-scheme");
+        await WaitForLoad(extFg);
+        var extBgCore = extBg.View?.CoreWebView2 ?? throw new InvalidOperationException("External scheme bg tab not ready.");
+        var extFgCore = extFg.View?.CoreWebView2 ?? throw new InvalidOperationException("External scheme fg tab not ready.");
+
+        suppressExternalLaunch = true;
+        var extEvents = new List<(string Scheme, string? Site, bool Allowed, bool Prompted)>();
+        var promptCalls = 0;
+        externalSchemeResultOverride = (s, site, allowed, prompted) => extEvents.Add((s, site, allowed, prompted));
+        confirmExternalSchemeOverride = (_, _, _) => { promptCalls++; return (false, false); };
+
+        // Background non-user-initiated launch must be denied without prompting.
+        await extBgCore.ExecuteScriptAsync("location.href='mailto:bg@example.com';");
+        var extWait = Stopwatch.StartNew();
+        while (extWait.Elapsed < TimeSpan.FromSeconds(2) && extEvents.Count < 1)
+            await Task.Delay(50);
+        var liveBgDenied = promptCalls == 0 && extEvents.All(ev => !ev.Allowed && !ev.Prompted);
+
+        // Foreground user click with Cancel override denies without saving.
+        extEvents.Clear();
+        promptCalls = 0;
+        await Task.Delay(150);
+        await DispatchClick(extFgCore, 60, 20);
+        extWait.Restart();
+        while (extWait.Elapsed < TimeSpan.FromSeconds(5) && extEvents.Count < 1)
+            await Task.Delay(50);
+        var livePromptDenyOk = extEvents.Count == 1
+            && extEvents[0].Scheme == "mailto"
+            && extEvents[0].Site == fixture
+            && !extEvents[0].Allowed
+            && extEvents[0].Prompted
+            && promptCalls == 1
+            && settings.AllowedExternalApps.Length == 0;
+
+        // Foreground user click with Allow + Remember persists permission in settings.json.
+        extEvents.Clear();
+        promptCalls = 0;
+        confirmExternalSchemeOverride = (_, _, _) => { promptCalls++; return (true, true); };
+        await DispatchClick(extFgCore, 60, 20);
+        extWait.Restart();
+        while (extWait.Elapsed < TimeSpan.FromSeconds(5) && extEvents.Count < 1)
+            await Task.Delay(50);
+        var persistedAfterRemember = SettingsStore.Load(settingsFile).Settings.AllowedExternalApps
+            .SequenceEqual([new ExternalAppPermission(fixture!, "mailto")]);
+        var liveRememberOk = extEvents.Count == 1
+            && extEvents[0].Allowed
+            && extEvents[0].Prompted
+            && promptCalls == 1
+            && persistedAfterRemember;
+
+        // Second click uses remembered permission with no prompt.
+        extEvents.Clear();
+        promptCalls = 0;
+        await DispatchClick(extFgCore, 60, 20);
+        extWait.Restart();
+        while (extWait.Elapsed < TimeSpan.FromSeconds(5) && extEvents.Count < 1)
+            await Task.Delay(50);
+        var liveRememberedSkipsPrompt = extEvents.Count == 1
+            && extEvents[0].Allowed
+            && !extEvents[0].Prompted
+            && promptCalls == 0;
+
+        // Clearing remembered permissions persists empty list and causes next click to prompt again.
+        ApplySettings(settings with { AllowedExternalApps = [] });
+        var clearedOnDisk = SettingsStore.Load(settingsFile).Settings.AllowedExternalApps.Length == 0;
+        extEvents.Clear();
+        promptCalls = 0;
+        confirmExternalSchemeOverride = (_, _, _) => { promptCalls++; return (false, false); };
+        await DispatchClick(extFgCore, 60, 20);
+        extWait.Restart();
+        while (extWait.Elapsed < TimeSpan.FromSeconds(5) && extEvents.Count < 1)
+            await Task.Delay(50);
+        var liveClearRePrompts = clearedOnDisk
+            && extEvents.Count == 1
+            && !extEvents[0].Allowed
+            && extEvents[0].Prompted
+            && promptCalls == 1;
+
+        confirmExternalSchemeOverride = null;
+        externalSchemeResultOverride = null;
+        suppressExternalLaunch = false;
+        CloseTab(extFg, recordClosed: false);
+        CloseTab(extBg, recordClosed: false);
+        SelectTab(first);
+
+        var externalSchemes = new
+        {
+            dangerousDenied,
+            bgDecisionDenied,
+            promptDecision,
+            rememberedDecision,
+            opaqueOriginNoSite,
+            liveBgDenied,
+            livePromptDenyOk,
+            liveRememberOk,
+            liveRememberedSkipsPrompt,
+            liveClearRePrompts,
         };
 
         // #41: Share capture times out on a page with a blocked script thread and re-enables Share afterwards.
@@ -4036,7 +4568,7 @@ sealed class BrowserWindow : Form
             updaterSelfCheck, settingsRoundTrip, phosphorLoaded, iconFontFamily, captionFontFamily,
             settingsDialogOk, shareToggleWorks,
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
-            urlWhenCleanOff, cliFlags,
+            urlWhenCleanOff, cliFlags, cliUrl, browserRegistration, externalSchemes,
             faviconCached, addressDisplayOk, tabDrag, tabFixes, highDpi, shareTimeout,
             postClean, blobUrl, permissions, downloads, processCrash,
             sessionDebounce, restoreShortcuts,

@@ -25,13 +25,15 @@ dotnet publish Search.Windows.csproj -c Release -warnaserror -o publish
 python test_smoke.py publish/browse.exe
 ```
 
-`test_smoke.py` launches the built executable against a local loopback fixture in a temporary profile and verifies navigation, URL resolution, tab layouts, custom title bar hit-testing, tracker/ad blocking (on and off), link cleaning (on and off), settings persistence, Phosphor icon font loading, session save/restore (including multi-instance lock behavior), sleeping tabs, and one-time Share delivery.
+`test_smoke.py` launches the built executable against a local loopback fixture in a temporary profile and verifies navigation, URL resolution, CLI URL launching and instance forwarding, per-user browser registration, external app prompts and remembered permissions, tab layouts, custom title bar hit-testing, tracker/ad blocking (on and off), link cleaning (on and off), settings persistence, Phosphor icon font loading, session save/restore (including multi-instance lock behavior), sleeping tabs, and one-time Share delivery.
 
 ## Features
 
 - **Session restore with lazy tabs**: Restores open and pinned tabs, the active tab, and the tab layout on startup. Only the selected tab creates a WebView2 and loads until you switch to other tabs. A per-profile mutex lets a second window open and restore without overwriting the first window's `session.json`.
+- **Open URLs from the command line & default browser**: Run `browse.exe <url>` (accepts `http://`, `https://`, and local `.htm`/`.html` files; rejects other schemes) to open a link in a new tab, forwarding it to an already-running window for that profile over a current-user named pipe and bringing it to the front. Combine with `--profile <folder>` and `--no-update-check`. Register `browse` per-user in **Settings** (**Make browse available as a default browser**) to expose it in Windows Default Apps, or click **Remove** to delete the registration.
+- **External app prompts**: Prompts before opening external URI schemes (such as `mailto:`, `zoommtg:`, or `vscode:`), showing the scheme (and resolved app name) plus the requesting site, with an optional **Always allow `<scheme>` links from `<site>`** checkbox. Launches not started by a click, background tabs, and dangerous schemes (`javascript:`, `vbscript:`, `file:`, `ms-msdt:`, `search-ms:`, `ms-officecmd:`, etc.) are denied without prompting. Clear remembered choices anytime in **Settings**.
 - **Sidebar or top tab strip**: Switch between the vertical sidebar (with a pinned-tab tile grid) and the horizontal top tab strip via **Settings** (`Ctrl+,`) or `Ctrl+Shift+S`. Drag tabs to reorder them, or drag between the tab list and the pinned tile grid (or across the pinned/unpinned divider in the top strip) to pin and unpin. Right-click a tab to pin, unpin, or close it; pinned tabs cannot be closed until unpinned.
-- **Settings**: Open **Settings** from the toolbar gear button or with `Ctrl+,` to choose theme (**System**, **Light**, or **Dark**, applied on next launch), switch tab layout (**Sidebar** or **Top tabs**), toggle ad & tracker blocking, link cleaning, sleeping tabs, automatic update checks, and the toolbar Share button, clear WebView2 browsing data (cookies, cache, history, and site data), and view the app version.
+- **Settings**: Open **Settings** from the toolbar gear button or with `Ctrl+,` to choose theme (**System**, **Light**, or **Dark**, applied on next launch), switch tab layout (**Sidebar** or **Top tabs**), toggle ad & tracker blocking, link cleaning, sleeping tabs, automatic update checks, and the toolbar Share button, register or remove `browse` as a per-user default browser option (then pick it in Windows Default Apps), clear WebView2 browsing data (cookies, cache, history, and site data), clear remembered external app permissions, and view the app version.
 - **Light and dark mode**: Follows the Windows system light/dark setting by default, or can be pinned to Light or Dark in **Settings**.
 - **Custom title bar**: Integrated minimize/maximize/close buttons and draggable window chrome.
 - **Tracker/ad blocking and link cleaning**: Blocks requests to common third-party ad/tracker domains, hides common ad containers via CSS, and strips tracking query parameters (`utm_*`, `fbclid`, `gclid`, etc., plus `si` on YouTube and Spotify) while leaving signed URLs intact. Both can be toggled in **Settings**.
@@ -78,10 +80,12 @@ All user data lives under `%LOCALAPPDATA%\SearchWindows\`:
 
 - `WebView\` — WebView2 profile (cookies, cache, site storage)
 - `session.json` — Open and pinned tabs (`url`, `title`, `pinned`), `selected` tab index, and `vertical` (sidebar vs. top strip). It does not store page text, cookies, or form inputs.
-- `settings.json` — Preferences from **Settings** (`theme`, `verticalTabs`, `blockingEnabled`, `cleanLinksEnabled`, `sleepingTabsEnabled`, `autoUpdateCheck`, `shareEnabled`).
+- `settings.json` — Preferences from **Settings** (`theme`, `verticalTabs`, `blockingEnabled`, `cleanLinksEnabled`, `sleepingTabsEnabled`, `autoUpdateCheck`, `shareEnabled`, `allowedExternalApps`).
 - `update-check.txt` — UTC timestamp of the last update check (omitted when `--no-update-check` is passed or automatic update checks are off).
 
-Run `browse.exe --profile <folder>` to keep a separate profile (WebView data, `session.json`, and `settings.json`) in that folder instead.
+If you click **Make browse available as a default browser** in **Settings**, `browse` writes per-user browser registration keys under `HKCU\Software\Clients\StartMenuInternet\browse`, `HKCU\Software\RegisteredApplications`, and `HKCU\Software\Classes\browseHTML` (no admin required); clicking **Remove** deletes them.
+
+Run `browse.exe --profile <folder>` to keep a separate profile (WebView data, `session.json`, and `settings.json`) in that folder instead, or `browse.exe [--profile <folder>] [--no-update-check] <url>` to open a URL directly.
 
 ## License
 

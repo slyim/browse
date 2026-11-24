@@ -204,6 +204,12 @@ class Fixture(BaseHTTPRequestHandler):
                 '<a id="dl-exe" href="/download/tool.exe" download="tool.exe"'
                 ' style="position:fixed;left:0;top:0;width:120px;height:40px;display:block">Download</a>'
             ).encode()
+        elif self.path.startswith('/external-scheme'):
+            body = (
+                '<!doctype html><title>External scheme</title>'
+                '<a id="open-ext" href="mailto:test@example.com"'
+                ' style="position:fixed;left:0;top:0;width:120px;height:40px;display:block">Open app</a>'
+            ).encode()
         elif self.path.startswith('/geo'):
             body = (
                 '<!doctype html><title>Geo</title>'
@@ -299,6 +305,11 @@ def run():
                     ['--profile', str(path / 'bad<profile>')],
                     ['--profile', 'bad:profile'],
                     ['--profile', str(existing_file)],
+                    ['javascript:alert(1)'],
+                    ['file:///C:/Windows/win.ini'],
+                    ['mailto:a@example.com'],
+                    ['ms-msdt:/id'],
+                    ['--unknown-flag'],
                 ):
                     bad_profile = subprocess.run([str(exe), *bad_args], timeout=15)
                     assert bad_profile.returncode == 2, f'Expected exit 2 for {bad_args}, got {bad_profile.returncode}'
@@ -341,6 +352,31 @@ def run():
                 assert report.get('urlWhenCleanOff') == base + '/first?id=7&utm_source=keepme&fbclid=keep123#frag', report.get('urlWhenCleanOff')
                 assert '/first?id=7&utm_source=keepme&fbclid=keep123' in Fixture.requested, Fixture.requested
                 assert report.get('cliFlags') is True, report.get('cliFlags')
+                assert report.get('cliUrl') == {
+                    'validHttp': True,
+                    'validHttpsWithFlags': True,
+                    'validFileUri': True,
+                    'validLocalPath': True,
+                    'rejectsBadInputs': True,
+                    'localHtmlOpensSafely': True,
+                }, report.get('cliUrl')
+                assert report.get('browserRegistration') == {
+                    'notInitially': True,
+                    'writtenOk': True,
+                    'removedOk': True,
+                }, report.get('browserRegistration')
+                assert report.get('externalSchemes') == {
+                    'dangerousDenied': True,
+                    'bgDecisionDenied': True,
+                    'promptDecision': True,
+                    'rememberedDecision': True,
+                    'opaqueOriginNoSite': True,
+                    'liveBgDenied': True,
+                    'livePromptDenyOk': True,
+                    'liveRememberOk': True,
+                    'liveRememberedSkipsPrompt': True,
+                    'liveClearRePrompts': True,
+                }, report.get('externalSchemes')
                 assert (exe.parent / 'Phosphor-LICENSE.txt').is_file(), f'Missing Phosphor-LICENSE.txt next to {exe}'
                 assert not (path / 'update-check.txt').exists(), 'Smoke test must skip update checks'
                 assert report.get('faviconCached') is True, report.get('faviconCached')
@@ -424,6 +460,7 @@ def run():
                     'simulatedDpiOk': True,
                     'shareDialogOk': True,
                     'settingsDialogDpiOk': True,
+                    'externalAppDialogOk': True,
                 }, report.get('highDpi')
                 assert report.get('shareTimeout') == {
                     'disabledDuringCapture': True,
@@ -507,6 +544,7 @@ def run():
                     'sleepingTabsEnabled': True,
                     'autoUpdateCheck': True,
                     'shareEnabled': True,
+                    'allowedExternalApps': [],
                 }, saved_settings
 
                 Fixture.requested.clear()
@@ -652,6 +690,40 @@ def run():
                     f"SLEEP memoryBeforeMB={sleep_report['memoryBeforeMB']} "
                     f"memoryAfterMB={sleep_report['memoryAfterMB']}"
                 )
+
+                # #49: Launching a second instance with a URL forwards it to the running window for that profile and exits.
+                fwd_dir = path / 'forward'
+                fwd_dir.mkdir()
+                fwd_report_path = fwd_dir / 'forward.json'
+                fwd_ready = fwd_dir / 'forward.ready'
+                fwd_proc = subprocess.Popen([str(exe), '--smoke-test', str(fwd_report_path), base, 'forward'])
+                try:
+                    for _ in range(400):
+                        if fwd_ready.is_file() or fwd_proc.poll() is not None:
+                            break
+                        sleep(0.05)
+                    assert fwd_ready.is_file(), f'Forward host did not signal ready (exit {fwd_proc.poll()})'
+                    sender = subprocess.run(
+                        [str(exe), '--profile', str(fwd_dir), '--no-update-check', base + '/third'],
+                        timeout=15,
+                    )
+                    assert sender.returncode == 0, f'Expected sender exit 0, got {sender.returncode}'
+                    fwd_proc.wait(timeout=20)
+                    assert fwd_report_path.is_file(), f'Missing forward report (exit {fwd_proc.returncode})'
+                    fwd_report = json.loads(fwd_report_path.read_text(encoding='utf-8-sig'))
+                    print(json.dumps(fwd_report, indent=2))
+                    assert fwd_proc.returncode == 0, fwd_report
+                    assert fwd_report == {
+                        'tabCount': 2,
+                        'openedUrl': base + '/third',
+                        'openedTitle': 'Third page marker',
+                        'selectedIsNewTab': True,
+                        'pipeRejectsInvalid': True,
+                    }, fwd_report
+                finally:
+                    if fwd_proc.poll() is None:
+                        fwd_proc.kill()
+                        fwd_proc.wait(timeout=5)
             finally:
                 server.shutdown()
                 thread.join()
