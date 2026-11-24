@@ -260,6 +260,8 @@ sealed class BrowserWindow : Form
     readonly System.Windows.Forms.Timer dragScrollTimer = new() { Interval = 30 };
     readonly System.Windows.Forms.Timer loadingTimer = new() { Interval = 60 };
     readonly System.Windows.Forms.Timer responsiveTimer = new() { Interval = 1500 };
+    readonly MotionClock motion = new();
+    readonly TabLayoutMotion layoutMotion;
     int loadingPhase;
 
     readonly List<BrowserTab> opened = [];
@@ -268,9 +270,13 @@ sealed class BrowserWindow : Form
     Hairline? stripHairline;
     BrowserTab? dragTab;
     TabChromeControl? dragControl;
+    Point dragStartScreenPt;
+    int dragStartScroll;
     Point dragScreenPt;
     TabDropTarget? dragTarget;
     bool pinDropPlaceholder;
+    int lastStripX;
+    int lastStripMaxRun;
     readonly string sessionFile;
     readonly string settingsFile;
     readonly string sitePrefsFile;
@@ -332,6 +338,7 @@ sealed class BrowserWindow : Form
     internal bool BrowserFullscreen => fullscreen.BrowserFullscreen;
     internal bool ElementFullscreen => fullscreen.ElementFullscreen;
 
+    const int WM_SETTINGCHANGE = 0x001A;
     const int WM_NCCALCSIZE = 0x0083;
     const int WM_NCHITTEST = 0x0084;
     const int WM_NCMOUSEMOVE = 0x00A0;
@@ -505,6 +512,8 @@ sealed class BrowserWindow : Form
         this.sessionTask = sessionTask;
         this.sessionLock = sessionLock;
         this.smokeReport = smokeReport;
+        if (smokeReport is not null) motion.ForceEnabled = false;
+        layoutMotion = new TabLayoutMotion(motion, ApplyAnimatedListLayout);
         this.fixture = fixture;
         this.smokePhase = smokePhase;
         this.noUpdateCheck = noUpdateCheck;
@@ -613,7 +622,7 @@ sealed class BrowserWindow : Form
         SizeChanged += (_, _) => CloseDownloadsFlyout();
         Load += async (_, _) => await Start();
         FormClosing += HandleFormClosing;
-        FormClosed += (_, _) => { closed = true; StopLaunchPipe(); CancelTabDrag(); CloseDownloadsFlyout(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); };
+        FormClosed += (_, _) => { closed = true; StopLaunchPipe(); CancelTabDrag(animate: false); CloseDownloadsFlyout(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); responsiveTimer.Stop(); responsiveTimer.Dispose(); layoutMotion.Dispose(); motion.Dispose(); };
     }
 
     int S(int px) => dpiOverride is { } dpi
@@ -636,7 +645,7 @@ sealed class BrowserWindow : Form
             if (!closed) FlushSession();
             closed = true;
             StopLaunchPipe();
-            CancelTabDrag();
+            CancelTabDrag(animate: false);
             CloseDownloadsFlyout();
             downloads.Dispose();
             pending?.Cancel();
@@ -648,6 +657,8 @@ sealed class BrowserWindow : Form
             dragScrollTimer.Dispose();
             loadingTimer.Dispose();
             responsiveTimer.Dispose();
+            layoutMotion.Dispose();
+            motion.Dispose();
             if (!dropLine.IsDisposed) dropLine.Dispose();
             ReleaseSessionLock();
         }
@@ -657,7 +668,7 @@ sealed class BrowserWindow : Form
 
     void ApplyChromeMetrics()
     {
-        metricsDpi = DeviceDpi;
+        metricsDpi = dpiOverride ?? DeviceDpi;
         MinimumSize = new(S(640), S(420));
         sidebar.Width = S(232);
         sidebar.Padding = new(S(10), 0, S(10), S(10));
@@ -971,7 +982,7 @@ sealed class BrowserWindow : Form
     void RescaleChrome()
     {
         Font = Theme.FontForDpi(Theme.UiFont, DeviceDpi);
-        CancelTabDrag();
+        CancelTabDrag(animate: false);
         SuspendLayout();
         ApplyChromeMetrics();
         ApplyChromeVisibility();
@@ -1066,6 +1077,8 @@ sealed class BrowserWindow : Form
             pressedCaptionHit = 0;
             SyncCaptionInteraction();
         }
+        if (m.Msg == WM_SETTINGCHANGE)
+            motion.RefreshSystemPreference();
         base.WndProc(ref m);
     }
 
@@ -1120,36 +1133,67 @@ sealed class BrowserWindow : Form
         x += addrW + S(8);
 
         var maxRun = Math.Max(0, rightStart - S(24) - x - gap - btn);
+        lastStripX = x;
+        lastStripMaxRun = maxRun;
         var shown = LayoutStripTabItems(maxRun, rowH);
         stripTabs.SetBounds(x, yRow, shown, rowH);
         stripNewTabBtn.SetBounds(x + shown + (shown > 0 ? gap : 0), yBtn, btn, btn);
+    }
+
+    int StripPillWidth(TabPill p, int fullPillW)
+    {
+        if (p.Closing)
+        {
+            foreach (var entry in layoutMotion.ClosingEntries)
+                if (ReferenceEquals(entry.Control, p))
+                    return Math.Max(0, (int)MathF.Round(entry.FullSize * entry.Scale.Value));
+            return 0;
+        }
+        var scale = layoutMotion.GetOpenScale(p);
+        return scale < 0.999f ? Math.Max(1, (int)MathF.Round(fullPillW * scale)) : fullPillW;
     }
 
     int LayoutStripTabItems(int maxRun, int rowH)
     {
         var gap = S(2);
         var pinW = S(30);
-        var pins = stripTabs.Controls.OfType<PinSquare>().ToArray();
+        var pins = stripTabs.Controls.OfType<PinSquare>().Where(p => !p.Closing).ToArray();
         var pills = stripTabs.Controls.OfType<TabPill>().ToArray();
+        var livePillCount = 0;
+        foreach (var p in pills) if (!p.Closing) livePillCount++;
         var line = stripTabs.Controls.OfType<Hairline>().FirstOrDefault();
 
         var x = 0;
         foreach (var _ in pins) x += pinW + gap;
         if (line is not null) x += S(4) + 1 + S(6);
-        var pillW = pills.Length > 0
-            ? Math.Clamp(Math.Max(0, maxRun - x - (pills.Length - 1) * gap) / pills.Length, S(36), S(186))
+        var pillW = livePillCount > 0
+            ? Math.Clamp(Math.Max(0, maxRun - x - (livePillCount - 1) * gap) / livePillCount, S(36), S(186))
             : 0;
-        if (pills.Length > 0) x += pills.Length * pillW + (pills.Length - 1) * gap;
-        else if (pins.Length > 0) x -= gap;
 
-        stripContentWidth = Math.Max(0, x);
+        var totalW = x;
+        var lastGap = 0;
+        if (pills.Length > 0)
+        {
+            foreach (var p in pills)
+            {
+                var w = StripPillWidth(p, pillW);
+                if (w <= 0) continue;
+                var g = pillW > 0 && w < pillW ? (int)MathF.Round(gap * (w / (float)pillW)) : gap;
+                totalW += w + g;
+                lastGap = g;
+            }
+            totalW -= lastGap;
+        }
+        else if (pins.Length > 0) totalW -= gap;
+
+        stripContentWidth = Math.Max(0, totalW);
         var shown = Math.Min(stripContentWidth, maxRun);
         stripScroll = Math.Clamp(stripScroll, 0, Math.Max(0, stripContentWidth - shown));
 
         var pos = -stripScroll;
         foreach (var p in pins)
         {
-            p.SetBounds(pos, 0, pinW, rowH);
+            p.SetBaseBounds(pos, 0, pinW, rowH, layoutMotion.CurrentOffset(p));
             pos += pinW + gap;
         }
         if (line is not null)
@@ -1161,8 +1205,10 @@ sealed class BrowserWindow : Form
         }
         foreach (var p in pills)
         {
-            p.SetBounds(pos, 0, pillW, rowH);
-            pos += pillW + gap;
+            var w = StripPillWidth(p, pillW);
+            p.SetBaseBounds(pos, 0, w, rowH, layoutMotion.CurrentOffset(p));
+            if (w > 0)
+                pos += w + (pillW > 0 && w < pillW ? (int)MathF.Round(gap * (w / (float)pillW)) : gap);
         }
         return shown;
     }
@@ -1176,7 +1222,11 @@ sealed class BrowserWindow : Form
         if (shift == 0) return false;
         stripTabs.SuspendLayout();
         foreach (Control c in stripTabs.Controls)
-            if (!ReferenceEquals(c, dropLine)) c.Left += shift;
+        {
+            if (ReferenceEquals(c, dropLine)) continue;
+            if (c is TabChromeControl tc) tc.ShiftBaseX(shift);
+            else c.Left += shift;
+        }
         stripTabs.ResumeLayout();
         return true;
     }
@@ -2359,6 +2409,7 @@ sealed class BrowserWindow : Form
             e.NewWindow = popupCore;
             opened.Add(popup);
             SelectTab(popup);
+            AnimateNewTabOpen(popup);
         }
         catch
         {
@@ -2394,6 +2445,7 @@ sealed class BrowserWindow : Form
         if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return tab;
         opened.Add(tab);
         SelectTab(tab, focusView: !address.InputFocused);
+        AnimateNewTabOpen(tab);
         if (cleaned is null) TryCore(() => core.NavigateToString(Home));
         else TryCore(() => core.Navigate(cleaned));
         SaveSession();
@@ -2587,10 +2639,41 @@ sealed class BrowserWindow : Form
         }
     }
 
+    void AnimateNewTabOpen(BrowserTab tab)
+    {
+        if (restoring || closed || IsDisposed || !motion.Enabled || tab.Pinned) return;
+        if (tabControls.TryGetValue(tab, out var ctrl) && ctrl is TabChromeControl tc && !tc.IsDisposed)
+        {
+            layoutMotion.StartOpen(tc);
+            ApplyAnimatedListLayout();
+        }
+    }
+
     void DetachTab(BrowserTab tab, bool recordClosed)
     {
-        if (tab == dragTab) CancelTabDrag();
+        if (tab == dragTab) CancelTabDrag(animate: false);
         ExitElementFullscreenForTab(tab, exitDocument: false);
+        if (!tab.Pinned)
+        {
+            var loose = opened.Where(t => !t.Pinned).ToList();
+            var looseIdx = loose.IndexOf(tab);
+            BrowserTab? afterTab = looseIdx > 0 ? loose[looseIdx - 1] : null;
+            if (!closed && !IsDisposed && tabControls.TryGetValue(tab, out var ctrl) && ctrl is TabChromeControl tc && !tc.IsDisposed)
+            {
+                var fullSize = vertical ? S(28) : (tc.BaseBounds.Width > 0 ? tc.BaseBounds.Width : tc.Width);
+                if (motion.Enabled && layoutMotion.StartClose(tc, tab, afterTab, vertical, fullSize))
+                    tabControls.Remove(tab);
+                else
+                {
+                    layoutMotion.RedirectClosingAnchor(tab, afterTab);
+                    layoutMotion.RemoveControl(tc);
+                }
+            }
+            else
+            {
+                layoutMotion.RedirectClosingAnchor(tab, afterTab);
+            }
+        }
         tab.Closed = true;
         tab.ActiveNavigationId = null;
         tab.PendingPageUri = null;
@@ -2750,6 +2833,7 @@ sealed class BrowserWindow : Form
     bool MoveTab(BrowserTab tab, bool targetPinned, int targetIndex)
     {
         if (closed || tab.Closed || !opened.Contains(tab)) return false;
+        var wasPinned = tab.Pinned;
         var pinned = opened.Where(t => t.Pinned).ToList();
         var loose = opened.Where(t => !t.Pinned).ToList();
         var source = tab.Pinned ? pinned : loose;
@@ -2759,6 +2843,15 @@ sealed class BrowserWindow : Form
         var maxIndex = targetPinned == tab.Pinned ? dest.Count - 1 : dest.Count;
         var clamped = Math.Clamp(targetIndex, 0, Math.Max(0, maxIndex));
         if (tab.Pinned == targetPinned && oldIndex == clamped) return false;
+
+        Dictionary<TabChromeControl, Point>? fromLocations = null;
+        if (motion.Enabled && !restoring)
+        {
+            fromLocations = new Dictionary<TabChromeControl, Point>(tabControls.Count);
+            foreach (var c in tabControls.Values)
+                if (c is TabChromeControl tc && !tc.IsDisposed)
+                    fromLocations[tc] = tc.Location;
+        }
 
         source.RemoveAt(oldIndex);
         tab.Pinned = targetPinned;
@@ -2771,7 +2864,36 @@ sealed class BrowserWindow : Form
         if (tab.Pinned && tab.View is { IsDisposed: false, CoreWebView2: { } vCore } && TryCore(() => vCore.IsSuspended))
             TryCore(() => vCore.Resume());
 
+        layoutMotion.SnapOffsetsToZero();
         SyncTabs();
+
+        if (fromLocations is not null && motion.Enabled && !restoring)
+        {
+            if (wasPinned != targetPinned)
+            {
+                if (tabControls.TryGetValue(tab, out var movedCtrl) && movedCtrl is TabChromeControl tc && !tc.IsDisposed)
+                {
+                    tc.TriggerAppear(0f, Motion.PinTransitionDurationMs);
+                    if (vertical)
+                        layoutMotion.StartOffsetGlide(tc, 0f, targetPinned ? S(10) : -S(10), 0f, 0f, Motion.PinTransitionDurationMs);
+                    else
+                        layoutMotion.StartOffsetGlide(tc, targetPinned ? S(12) : -S(12), 0f, 0f, 0f, Motion.PinTransitionDurationMs);
+                }
+            }
+            else
+            {
+                foreach (var c in tabControls.Values)
+                {
+                    if (c is not TabChromeControl tc || tc.IsDisposed) continue;
+                    if (!fromLocations.TryGetValue(tc, out var oldLoc)) continue;
+                    var dx = oldLoc.X - tc.BaseBounds.X;
+                    var dy = oldLoc.Y - tc.BaseBounds.Y;
+                    if (dx != 0 || dy != 0)
+                        layoutMotion.StartOffsetGlide(tc, dx, dy, 0f, 0f, Motion.DropGlideDurationMs);
+                }
+            }
+        }
+
         SaveSession();
         return true;
     }
@@ -2801,21 +2923,172 @@ sealed class BrowserWindow : Form
     bool StartTabDrag(BrowserTab tab, Point screenPt)
     {
         if (closed || restoring || chromeHidden || !opened.Contains(tab)) return false;
-        if (dragTab is not null) CancelTabDrag();
+        if (dragTab is not null) CancelTabDrag(animate: false);
+        layoutMotion.FinishClosing();
+        layoutMotion.SnapOffsetsToZero();
         dragTab = tab;
         dragControl = tabControls.TryGetValue(tab, out var ctrl) ? ctrl as TabChromeControl : null;
+        dragStartScreenPt = screenPt;
+        dragStartScroll = vertical ? sideTabs.ScrollOffset : stripScroll;
         dragScreenPt = screenPt;
         pinDropPlaceholder = false;
+        if (dragControl is { IsDisposed: false } dc) dc.BringToFront();
         dragScrollTimer.Start();
         UpdateTabDrag(screenPt);
         return true;
+    }
+
+    void UpdateDraggedControlPosition(BrowserTab tab, Point screenPt)
+    {
+        if (dragControl is not { IsDisposed: false } dc) return;
+        var baseLoc = dc.BaseBounds.Location;
+        if (vertical)
+        {
+            if (tab.Pinned)
+            {
+                var dx = screenPt.X - dragStartScreenPt.X;
+                var dy = screenPt.Y - dragStartScreenPt.Y;
+                dc.Location = new Point(baseLoc.X + dx, baseLoc.Y + dy);
+            }
+            else
+            {
+                var dy = (screenPt.Y - dragStartScreenPt.Y) + (sideTabs.ScrollOffset - dragStartScroll);
+                dc.Location = new Point(baseLoc.X, baseLoc.Y + dy);
+            }
+        }
+        else
+        {
+            var dx = (screenPt.X - dragStartScreenPt.X) + (stripScroll - dragStartScroll);
+            dc.Location = new Point(baseLoc.X + dx, baseLoc.Y);
+        }
+    }
+
+    void UpdateDragSiblingOffsets(BrowserTab tab, TabDropTarget? target)
+    {
+        var pinTabs = opened.Where(t => t.Pinned).ToList();
+        var looseTabs = opened.Where(t => !t.Pinned).ToList();
+
+        void SetTabOffset(BrowserTab t, float dx, float dy)
+        {
+            if (t == tab) return;
+            if (tabControls.TryGetValue(t, out var ctrl) && ctrl is TabChromeControl tc && !tc.IsDisposed)
+                layoutMotion.SetOffsetTarget(tc, dx, dy, Motion.DragSlideDurationMs);
+        }
+
+        if (target is not { } tgt)
+        {
+            foreach (var t in pinTabs) SetTabOffset(t, 0f, 0f);
+            foreach (var t in looseTabs) SetTabOffset(t, 0f, 0f);
+            return;
+        }
+
+        if (vertical)
+        {
+            var rowStep = S(28) + S(2);
+            var oldLooseIdx = tab.Pinned ? -1 : looseTabs.IndexOf(tab);
+            var targetLooseIdx = !tgt.Pinned ? DropSlotToTargetIndex(tab, false, tgt.Slot) : -1;
+            for (var i = 0; i < looseTabs.Count; i++)
+            {
+                if (looseTabs[i] == tab) continue;
+                var dy = 0f;
+                if (!tgt.Pinned)
+                {
+                    if (oldLooseIdx >= 0)
+                    {
+                        if (oldLooseIdx < targetLooseIdx && i > oldLooseIdx && i <= targetLooseIdx) dy = -rowStep;
+                        else if (targetLooseIdx < oldLooseIdx && i >= targetLooseIdx && i < oldLooseIdx) dy = rowStep;
+                    }
+                    else if (i >= tgt.Slot) dy = rowStep;
+                }
+                else if (oldLooseIdx >= 0 && i > oldLooseIdx) dy = -rowStep;
+                SetTabOffset(looseTabs[i], 0f, dy);
+            }
+
+            if (pinTabs.Count > 0)
+            {
+                var (cols, tileW, tileH, gap) = PinGridMetrics(pinTabs.Count);
+                Point Cell(int idx) => new((idx % cols) * (tileW + gap), (idx / cols) * (tileH + gap));
+                var oldPinIdx = tab.Pinned ? pinTabs.IndexOf(tab) : -1;
+                var targetPinIdx = tgt.Pinned ? DropSlotToTargetIndex(tab, true, tgt.Slot) : -1;
+                for (var i = 0; i < pinTabs.Count; i++)
+                {
+                    if (pinTabs[i] == tab) continue;
+                    var visIdx = i;
+                    if (tgt.Pinned)
+                    {
+                        if (oldPinIdx >= 0)
+                        {
+                            if (oldPinIdx < targetPinIdx && i > oldPinIdx && i <= targetPinIdx) visIdx = i - 1;
+                            else if (targetPinIdx < oldPinIdx && i >= targetPinIdx && i < oldPinIdx) visIdx = i + 1;
+                        }
+                        else if (i >= tgt.Slot) visIdx = i + 1;
+                    }
+                    else if (oldPinIdx >= 0 && i > oldPinIdx) visIdx = i - 1;
+                    var fromCell = Cell(i);
+                    var toCell = Cell(visIdx);
+                    SetTabOffset(pinTabs[i], toCell.X - fromCell.X, toCell.Y - fromCell.Y);
+                }
+            }
+            return;
+        }
+
+        var sGap = S(2);
+        var pinStep = S(30) + sGap;
+        var pillW = looseTabs.Count > 0 && tabControls.TryGetValue(looseTabs[0], out var firstPill) && firstPill is TabChromeControl fpc && fpc.BaseBounds.Width > 0
+            ? fpc.BaseBounds.Width
+            : S(100);
+        var pillStep = pillW + sGap;
+
+        if (tab.Pinned == tgt.Pinned)
+        {
+            var group = tgt.Pinned ? pinTabs : looseTabs;
+            var other = tgt.Pinned ? looseTabs : pinTabs;
+            var step = tgt.Pinned ? pinStep : pillStep;
+            var oldIdx = group.IndexOf(tab);
+            var targetIdx = DropSlotToTargetIndex(tab, tgt.Pinned, tgt.Slot);
+            for (var i = 0; i < group.Count; i++)
+            {
+                if (group[i] == tab) continue;
+                var dx = 0f;
+                if (oldIdx < targetIdx && i > oldIdx && i <= targetIdx) dx = -step;
+                else if (targetIdx < oldIdx && i >= targetIdx && i < oldIdx) dx = step;
+                SetTabOffset(group[i], dx, 0f);
+            }
+            foreach (var o in other) SetTabOffset(o, 0f, 0f);
+            return;
+        }
+
+        var pos = -stripScroll;
+        for (var i = 0; i <= pinTabs.Count; i++)
+        {
+            if (tgt.Pinned && i == tgt.Slot) pos += pinStep;
+            if (i < pinTabs.Count && pinTabs[i] != tab)
+            {
+                if (tabControls.TryGetValue(pinTabs[i], out var c) && c is TabChromeControl tc && !tc.IsDisposed)
+                    layoutMotion.SetOffsetTarget(tc, pos - tc.BaseBounds.X, 0f, Motion.DragSlideDurationMs);
+                pos += pinStep;
+            }
+        }
+        if (stripHairline is { IsDisposed: false }) pos += S(4) + 1 + S(6);
+        for (var i = 0; i <= looseTabs.Count; i++)
+        {
+            if (!tgt.Pinned && i == tgt.Slot) pos += pillStep;
+            if (i < looseTabs.Count && looseTabs[i] != tab)
+            {
+                if (tabControls.TryGetValue(looseTabs[i], out var c) && c is TabChromeControl tc && !tc.IsDisposed)
+                    layoutMotion.SetOffsetTarget(tc, pos - tc.BaseBounds.X, 0f, Motion.DragSlideDurationMs);
+                pos += pillStep;
+            }
+        }
     }
 
     void UpdateTabDrag(Point screenPt)
     {
         if (dragTab is null) return;
         dragScreenPt = screenPt;
+        UpdateDraggedControlPosition(dragTab, screenPt);
         dragTarget = HitTestTabDrop(screenPt, dragTab);
+        UpdateDragSiblingOffsets(dragTab, dragTarget);
         UpdateDropVisuals(dragTab, dragTarget);
     }
 
@@ -2823,6 +3096,7 @@ sealed class BrowserWindow : Form
     {
         if (dragTab is not { } tab) return;
         dragScreenPt = screenPt;
+        var ctrl = dragControl;
         var target = HitTestTabDrop(screenPt, tab);
         dragScrollTimer.Stop();
         dragTab = null;
@@ -2833,6 +3107,17 @@ sealed class BrowserWindow : Form
         sidePins.SetDropPreview(false, false, null);
 
         var moved = target is { } t && MoveTab(tab, t.Pinned, DropSlotToTargetIndex(tab, t.Pinned, t.Slot));
+        if (!moved)
+        {
+            if (ctrl is { IsDisposed: false })
+            {
+                if (motion.Enabled)
+                    layoutMotion.StartOffsetGlide(ctrl, ctrl.Left - ctrl.BaseBounds.X, ctrl.Top - ctrl.BaseBounds.Y, 0f, 0f, Motion.DropGlideDurationMs);
+                else
+                    ctrl.Location = ctrl.BaseBounds.Location;
+            }
+            layoutMotion.ReturnAllOffsetsToZero(Motion.DropGlideDurationMs, animate: motion.Enabled);
+        }
         if (pinDropPlaceholder)
         {
             pinDropPlaceholder = false;
@@ -2844,7 +3129,9 @@ sealed class BrowserWindow : Form
         }
     }
 
-    void CancelTabDrag()
+    void CancelTabDrag() => CancelTabDrag(animate: true);
+
+    void CancelTabDrag(bool animate)
     {
         dragScrollTimer.Stop();
         var ctrl = dragControl;
@@ -2852,7 +3139,24 @@ sealed class BrowserWindow : Form
         dragControl = null;
         dragTarget = null;
         ClearDropVisuals();
-        if (ctrl is { IsDisposed: false }) ctrl.CancelDrag();
+        if (ctrl is { IsDisposed: false })
+        {
+            ctrl.CancelDrag();
+            if (animate && motion.Enabled)
+                layoutMotion.StartOffsetGlide(ctrl, ctrl.Left - ctrl.BaseBounds.X, ctrl.Top - ctrl.BaseBounds.Y, 0f, 0f, Motion.DropGlideDurationMs);
+            else
+                ctrl.Location = ctrl.BaseBounds.Location;
+        }
+        layoutMotion.ReturnAllOffsetsToZero(Motion.DropGlideDurationMs, animate: animate && motion.Enabled);
+    }
+
+    TabChromeControl[] OrderedTabControls(bool pinned)
+    {
+        var list = new List<TabChromeControl>(opened.Count);
+        foreach (var t in opened)
+            if (t.Pinned == pinned && tabControls.TryGetValue(t, out var c) && c is TabChromeControl tc && !tc.IsDisposed)
+                list.Add(tc);
+        return [.. list];
     }
 
     void ClearDropVisuals()
@@ -2907,7 +3211,7 @@ sealed class BrowserWindow : Form
             if (sidePt.Y < sideTabs.Top && (hasPins || pinDropPlaceholder))
             {
                 if (!hasPins) return new TabDropTarget(true, 0);
-                var pinControls = sidePins.Controls.OfType<PinSquare>().OrderBy(c => c.Top).ThenBy(c => c.Left).ToArray();
+                var pinControls = OrderedTabControls(pinned: true);
                 var (cols, _, tileH, gap) = PinGridMetrics(pinControls.Length);
                 var pinPt = sidePins.PointToClient(screenPt);
                 var rows = (pinControls.Length + cols - 1) / cols;
@@ -2918,7 +3222,8 @@ sealed class BrowserWindow : Form
                 var slot = rowEnd;
                 for (var i = rowStart; i < rowEnd; i++)
                 {
-                    if (pinPt.X < pinControls[i].Left + pinControls[i].Width / 2)
+                    var b = pinControls[i].BaseBounds;
+                    if (pinPt.X < b.Left + b.Width / 2)
                     {
                         slot = i;
                         break;
@@ -2927,13 +3232,14 @@ sealed class BrowserWindow : Form
                 return new TabDropTarget(true, slot);
             }
 
-            var looseControls = sideTabs.Items.OfType<TabRow>().ToArray();
+            var looseControls = OrderedTabControls(pinned: false);
             var listPt = sideTabs.PointToClient(screenPt);
             var contentY = listPt.Y + sideTabs.ScrollOffset;
             var listSlot = looseControls.Length;
             for (var i = 0; i < looseControls.Length; i++)
             {
-                if (contentY < looseControls[i].Top + looseControls[i].Height / 2)
+                var b = looseControls[i].BaseBounds;
+                if (contentY < b.Top + b.Height / 2)
                 {
                     listSlot = i;
                     break;
@@ -2947,23 +3253,24 @@ sealed class BrowserWindow : Form
             return null;
 
         var stripPt = stripTabs.PointToClient(screenPt);
-        var pins = stripTabs.Controls.OfType<PinSquare>().OrderBy(c => c.Left).ToArray();
-        var pills = stripTabs.Controls.OfType<TabPill>().OrderBy(c => c.Left).ToArray();
+        var pins = OrderedTabControls(pinned: true);
+        var pills = OrderedTabControls(pinned: false);
         bool targetPinned;
         if (pins.Length > 0 && pills.Length > 0)
         {
             var boundaryX = stripHairline is { IsDisposed: false } hl
                 ? hl.Left + hl.Width / 2
-                : (pins[^1].Right + pills[0].Left) / 2;
+                : (pins[^1].BaseBounds.Right + pills[0].BaseBounds.Left) / 2;
             targetPinned = stripPt.X < boundaryX;
         }
         else targetPinned = pins.Length > 0;
 
-        Control[] group = targetPinned ? pins : pills;
+        var group = targetPinned ? pins : pills;
         var stripSlot = group.Length;
         for (var i = 0; i < group.Length; i++)
         {
-            if (stripPt.X < group[i].Left + group[i].Width / 2)
+            var b = group[i].BaseBounds;
+            if (stripPt.X < b.Left + b.Width / 2)
             {
                 stripSlot = i;
                 break;
@@ -2987,7 +3294,7 @@ sealed class BrowserWindow : Form
         {
             if (t.Pinned)
             {
-                var pinControls = sidePins.Controls.OfType<PinSquare>().OrderBy(c => c.Top).ThenBy(c => c.Left).ToArray();
+                var pinControls = OrderedTabControls(pinned: true);
                 if (pinControls.Length == 0)
                 {
                     dropLine.Visible = false;
@@ -3011,14 +3318,14 @@ sealed class BrowserWindow : Form
                 int lineX, lineY;
                 if (t.Slot < pinControls.Length)
                 {
-                    var c = pinControls[t.Slot];
+                    var b = pinControls[t.Slot].BaseBounds;
                     var rowStart = (t.Slot / cols) * cols;
-                    lineX = t.Slot == rowStart ? Math.Max(0, c.Left - barW / 2) : (pinControls[t.Slot - 1].Right + c.Left - barW) / 2;
-                    lineY = c.Top;
+                    lineX = t.Slot == rowStart ? Math.Max(0, b.Left - barW / 2) : (pinControls[t.Slot - 1].BaseBounds.Right + b.Left - barW) / 2;
+                    lineY = b.Top;
                 }
                 else
                 {
-                    var last = pinControls[^1];
+                    var last = pinControls[^1].BaseBounds;
                     lineX = Math.Min(Math.Max(0, sidePins.ClientSize.Width - barW), last.Right + (gap - barW) / 2);
                     lineY = last.Top;
                 }
@@ -3027,28 +3334,28 @@ sealed class BrowserWindow : Form
             }
 
             sidePins.SetDropPreview(false, pinDropPlaceholder, null);
-            var looseControls = sideTabs.Items.OfType<TabRow>().ToArray();
+            var looseControls = OrderedTabControls(pinned: false);
             int y;
             if (looseControls.Length == 0) y = S(2);
-            else if (t.Slot == 0) y = looseControls[0].Top - sideTabs.ScrollOffset;
-            else if (t.Slot < looseControls.Length) y = (looseControls[t.Slot - 1].Bottom + looseControls[t.Slot].Top) / 2 - sideTabs.ScrollOffset;
-            else y = looseControls[^1].Bottom + S(1) - sideTabs.ScrollOffset;
+            else if (t.Slot == 0) y = looseControls[0].BaseBounds.Top - sideTabs.ScrollOffset;
+            else if (t.Slot < looseControls.Length) y = (looseControls[t.Slot - 1].BaseBounds.Bottom + looseControls[t.Slot].BaseBounds.Top) / 2 - sideTabs.ScrollOffset;
+            else y = looseControls[^1].BaseBounds.Bottom + S(1) - sideTabs.ScrollOffset;
             var maxY = Math.Max(0, sideTabs.ClientSize.Height - thickness);
             var clampedY = Math.Clamp(y - thickness / 2, 0, maxY);
             ShowDropLine(sideTabs, new Rectangle(S(4), clampedY, Math.Max(0, sideTabs.ClientSize.Width - S(8)), thickness));
             return;
         }
 
-        var pins = stripTabs.Controls.OfType<PinSquare>().OrderBy(c => c.Left).ToArray();
-        var pills = stripTabs.Controls.OfType<TabPill>().OrderBy(c => c.Left).ToArray();
-        Control[] group = t.Pinned ? pins : pills;
+        var pins = OrderedTabControls(pinned: true);
+        var pills = OrderedTabControls(pinned: false);
+        var group = t.Pinned ? pins : pills;
         var vBarW = Math.Max(2, S(3));
         var vBarH = Math.Min(stripTabs.ClientSize.Height, S(22));
         int x;
         if (group.Length == 0) x = 0;
-        else if (t.Slot == 0) x = group[0].Left;
-        else if (t.Slot < group.Length) x = (group[t.Slot - 1].Right + group[t.Slot].Left) / 2;
-        else x = group[^1].Right;
+        else if (t.Slot == 0) x = group[0].BaseBounds.Left;
+        else if (t.Slot < group.Length) x = (group[t.Slot - 1].BaseBounds.Right + group[t.Slot].BaseBounds.Left) / 2;
+        else x = group[^1].BaseBounds.Right;
         var maxX = Math.Max(0, stripTabs.ClientSize.Width - vBarW);
         ShowDropLine(stripTabs, new Rectangle(Math.Clamp(x - vBarW / 2, 0, maxX), (stripTabs.ClientSize.Height - vBarH) / 2, vBarW, vBarH));
     }
@@ -3093,7 +3400,7 @@ sealed class BrowserWindow : Form
 
     void SetOrientation(bool sidebarMode, bool persistSettings = true)
     {
-        CancelTabDrag();
+        CancelTabDrag(animate: false);
         CloseDownloadsFlyout();
         vertical = sidebarMode;
         SuspendLayout();
@@ -3201,10 +3508,10 @@ sealed class BrowserWindow : Form
         }
         var drag = new TabDragCallbacks(pt => StartTabDrag(tab, pt), UpdateTabDrag, DropTabDrag, CancelTabDrag);
         Control created = tab.Pinned
-            ? new PinSquare(title, tab.Url, active, icon, onFrame: vertical, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase)
+            ? new PinSquare(title, tab.Url, active, icon, onFrame: vertical, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase, motion)
             : vertical
-                ? new TabRow(title, tab.Url, active, icon, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase)
-                : new TabPill(title, tab.Url, active, icon, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase);
+                ? new TabRow(title, tab.Url, active, icon, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase, motion)
+                : new TabPill(title, tab.Url, active, icon, () => SelectTab(tab), () => CloseTab(tab), drag, loading, audio, loadingPhase, motion);
         AttachTabMenu(created, tab, title);
         tabControls[tab] = created;
         return created;
@@ -3229,7 +3536,8 @@ sealed class BrowserWindow : Form
 
     void RebuildTabs()
     {
-        CancelTabDrag();
+        CancelTabDrag(animate: false);
+        layoutMotion.Reset();
         var t0 = Stopwatch.GetTimestamp();
         sidePins.SuspendLayout();
         stripTabs.SuspendLayout();
@@ -3266,9 +3574,66 @@ sealed class BrowserWindow : Form
         {
             if (tab.Closed || !opened.Contains(tab) || ctrl.IsDisposed || !MatchesControlKind(ctrl, tab))
             {
+                if (ctrl is TabChromeControl tc) layoutMotion.RemoveControl(tc);
                 tabControls.Remove(tab);
                 if (!ctrl.IsDisposed) ctrl.Dispose();
             }
+        }
+    }
+
+    int VerticalRowHeight(Control c)
+    {
+        var rowH = S(28);
+        if (c is not TabChromeControl tc) return rowH;
+        if (tc.Closing)
+        {
+            foreach (var entry in layoutMotion.ClosingEntries)
+                if (ReferenceEquals(entry.Control, tc))
+                    return Math.Max(0, (int)MathF.Round(entry.FullSize * entry.Scale.Value));
+            return 0;
+        }
+        var scale = layoutMotion.GetOpenScale(tc);
+        return scale < 0.999f ? Math.Max(1, (int)MathF.Round(rowH * scale)) : rowH;
+    }
+
+    List<Control> BuildVisualLooseControls(IReadOnlyList<BrowserTab> loose, bool createMissing)
+    {
+        var list = new List<Control>(loose.Count + layoutMotion.ClosingCount);
+        void AppendClosingAfter(BrowserTab? anchor)
+        {
+            foreach (var entry in layoutMotion.ClosingEntries)
+                if (entry.Vertical == vertical && !entry.Control.IsDisposed && ReferenceEquals(entry.AfterTab, anchor))
+                    list.Add(entry.Control);
+        }
+        AppendClosingAfter(null);
+        foreach (var tab in loose)
+        {
+            if (createMissing) list.Add(GetOrCreateTabControl(tab));
+            else if (tabControls.TryGetValue(tab, out var c) && !c.IsDisposed) list.Add(c);
+            AppendClosingAfter(tab);
+        }
+        return list;
+    }
+
+    void ApplyAnimatedListLayout()
+    {
+        if (closed || IsDisposed) return;
+        if (vertical)
+        {
+            var loose = opened.Where(t => !t.Pinned).ToList();
+            var list = BuildVisualLooseControls(loose, createMissing: false);
+            sideTabs.LayoutItemBounds(list, sideNewTab, S(28), S(2), VerticalRowHeight, layoutMotion.CurrentOffset);
+        }
+        else
+        {
+            var gap = S(2);
+            var rowH = S(28);
+            stripTabs.SuspendLayout();
+            var shown = LayoutStripTabItems(lastStripMaxRun, rowH);
+            stripTabs.ResumeLayout(false);
+            if (stripTabs.Width != shown) stripTabs.Width = shown;
+            var nextBtnX = lastStripX + shown + (shown > 0 ? gap : 0);
+            if (stripNewTabBtn.Left != nextBtnX) stripNewTabBtn.Left = nextBtnX;
         }
     }
 
@@ -3297,7 +3662,10 @@ sealed class BrowserWindow : Form
                         var sq = GetOrCreateTabControl(pinned[i]);
                         if (sq.Parent != sidePins) sidePins.Controls.Add(sq);
                         if (sidePins.Controls.GetChildIndex(sq) != i) sidePins.Controls.SetChildIndex(sq, i);
-                        sq.SetBounds((i % cols) * (tileW + gap), (i / cols) * (tileH + gap), tileW, tileH);
+                        var x = (i % cols) * (tileW + gap);
+                        var y = (i / cols) * (tileH + gap);
+                        if (sq is TabChromeControl tc) tc.SetBaseBounds(x, y, tileW, tileH, layoutMotion.CurrentOffset(tc));
+                        else sq.SetBounds(x, y, tileW, tileH);
                     }
                     var rows = (pinned.Length + cols - 1) / cols;
                     sidePins.Height = rows * tileH + (rows - 1) * gap + S(10);
@@ -3305,17 +3673,23 @@ sealed class BrowserWindow : Form
                 }
                 sidePins.ResumeLayout();
 
-                var list = new List<Control>(loose.Length);
-                foreach (var tab in loose) list.Add(GetOrCreateTabControl(tab));
-                sideTabs.SetItems(list, sideNewTab, S(28), S(2));
+                var list = layoutMotion.ClosingCount > 0
+                    ? BuildVisualLooseControls(loose, createMissing: true)
+                    : loose.Select(GetOrCreateTabControl).ToList();
+                sideTabs.SetItems(list, sideNewTab, S(28), S(2),
+                    layoutMotion.HasListAnimations ? VerticalRowHeight : null,
+                    layoutMotion.CurrentOffset);
             }
             else
             {
                 stripTabs.SuspendLayout();
                 PruneStaleControls();
-                var ordered = new List<Control>(opened.Count + 1);
+                var ordered = new List<Control>(opened.Count + layoutMotion.ClosingCount + 1);
                 foreach (var tab in pinned) ordered.Add(GetOrCreateTabControl(tab));
-                if (pinned.Length > 0 && loose.Length > 0)
+                var looseControls = layoutMotion.ClosingCount > 0
+                    ? BuildVisualLooseControls(loose, createMissing: true)
+                    : loose.Select(GetOrCreateTabControl).ToList();
+                if (pinned.Length > 0 && looseControls.Count > 0)
                 {
                     stripHairline ??= new Hairline();
                     ordered.Add(stripHairline);
@@ -3325,7 +3699,14 @@ sealed class BrowserWindow : Form
                     if (!stripHairline.IsDisposed) stripHairline.Dispose();
                     stripHairline = null;
                 }
-                foreach (var tab in loose) ordered.Add(GetOrCreateTabControl(tab));
+                ordered.AddRange(looseControls);
+                var keepStrip = new HashSet<Control>(ordered);
+                for (var i = stripTabs.Controls.Count - 1; i >= 0; i--)
+                {
+                    var existing = stripTabs.Controls[i];
+                    if (ReferenceEquals(existing, dropLine) || keepStrip.Contains(existing)) continue;
+                    stripTabs.Controls.RemoveAt(i);
+                }
                 for (var i = 0; i < ordered.Count; i++)
                 {
                     var c = ordered[i];
@@ -3875,9 +4256,9 @@ sealed class BrowserWindow : Form
     bool CheckPinnedFirst()
     {
         var items = vertical
-            ? sidePins.Controls.OfType<Control>().OrderBy(c => c.Top).ThenBy(c => c.Left).OfType<ITabItem>()
-                .Concat(sideTabs.Items.OfType<Control>().OrderBy(c => c.Top).OfType<ITabItem>()).ToArray()
-            : stripTabs.Controls.OfType<Control>().OrderBy(c => c.Left).OfType<ITabItem>().ToArray();
+            ? sidePins.Controls.OfType<Control>().Where(c => c is not TabChromeControl { Closing: true }).OrderBy(c => c.Top).ThenBy(c => c.Left).OfType<ITabItem>()
+                .Concat(sideTabs.Items.OfType<Control>().Where(c => c is not TabChromeControl { Closing: true }).OrderBy(c => c.Top).OfType<ITabItem>()).ToArray()
+            : stripTabs.Controls.OfType<Control>().Where(c => c is not TabChromeControl { Closing: true }).OrderBy(c => c.Left).OfType<ITabItem>().ToArray();
         var pinnedCount = opened.Count(t => t.Pinned);
         return items.Length == opened.Count
             && items.Take(pinnedCount).All(i => i.Pinned)
@@ -4696,6 +5077,204 @@ sealed class BrowserWindow : Form
             ctrlDigitFollowsOrder,
             keyboardReorder,
             sessionOrderMatches,
+        };
+
+        // #54: Tab micro-animations — easing/blend helper, hover fade, drag neighbor gap & glide, open/close motion, reduce-motion, idle clock stop.
+        var animEasingOk = Motion.EaseOutCubic(0f) == 0f
+            && Motion.EaseOutCubic(1f) == 1f
+            && Motion.EaseOutCubic(0.5f) > 0.5f && Motion.EaseOutCubic(0.5f) < 1f
+            && Motion.EaseOutCubic(-0.5f) == 0f && Motion.EaseOutCubic(1.5f) == 1f
+            && MathF.Abs(Motion.Lerp(10f, 30f, 0.5f) - 20f) < 0.001f
+            && Motion.Blend(Color.FromArgb(255, 0, 0, 0), Color.FromArgb(255, 200, 100, 50), 0.5f) == Color.FromArgb(255, 100, 50, 25)
+            && Motion.WithAlpha(Color.FromArgb(200, 10, 20, 30), 0.5f).A == 100
+            && Motion.SPI_GETCLIENTAREAANIMATION == 0x1042;
+        SendMessage(Handle, WM_SETTINGCHANGE, IntPtr.Zero, IntPtr.Zero);
+
+        var prevMotionOverride = motion.ForceEnabled;
+        bool animHoverFadeOk;
+        bool animDragNeighborGapOk;
+        bool animDragCancelGlideOk;
+        bool animDragDropGlideOk;
+        bool animOpenGrowOk;
+        bool animCloseRemovesOk;
+        bool animCloseReduceMotionOk;
+        bool animRapidCloseSafeOk;
+        bool animClockStopsIdle;
+        try
+        {
+            motion.ForceEnabled = true;
+            first.Pinned = false;
+            var a1 = new BrowserTab { SavedUrl = fixture + "/a1", SavedTitle = "Anim 1" };
+            var a2 = new BrowserTab { SavedUrl = fixture + "/a2", SavedTitle = "Anim 2" };
+            opened.AddRange([a1, a2]);
+            SelectTab(first);
+            SetOrientation(true);
+            PerformLayout();
+            motion.SnapAll();
+
+            // Hover fade & active-state transition on TabRow, PinSquare, and TabPill.
+            var firstRow = (TabChromeControl)tabControls[first];
+            var a1Row = (TabChromeControl)tabControls[a1];
+            var a2Row = (TabChromeControl)tabControls[a2];
+            a1Row.SetHoverState(true);
+            var rowHoverStarted = a1Row.HoverProgress < 1f && motion.IsRunning;
+            motion.Advance(Motion.HoverDurationMs / 2);
+            var rowHoverMid = a1Row.HoverProgress > 0f && a1Row.HoverProgress < 1f;
+            motion.Advance(Motion.HoverDurationMs);
+            var rowHoverSettled = a1Row.HoverProgress >= 0.999f && !motion.IsRunning;
+            a1Row.SetHoverState(false);
+            motion.Advance(Motion.HoverDurationMs + 10);
+            var rowUnhoverSettled = a1Row.HoverProgress <= 0.001f && !motion.IsRunning;
+
+            SelectTab(a1);
+            var activeStarted = a1Row.ActiveProgress < 1f && motion.IsRunning;
+            motion.Advance(Motion.HoverDurationMs + 10);
+            var activeSettled = a1Row.ActiveProgress >= 0.999f && firstRow.ActiveProgress <= 0.001f && !motion.IsRunning;
+            SelectTab(first);
+            motion.Advance(Motion.HoverDurationMs + 10);
+
+            // Verify PinSquare & TabPill hover fade too.
+            MoveTab(a1, true, 0);
+            motion.Advance(Motion.PinTransitionDurationMs + 10);
+            var a1Pin = (TabChromeControl)tabControls[a1];
+            a1Pin.SetHoverState(true);
+            motion.Advance(Motion.HoverDurationMs + 10);
+            var pinHoverOk = a1Pin.HoverProgress >= 0.999f && !motion.IsRunning;
+            a1Pin.SetHoverState(false);
+            motion.Advance(Motion.HoverDurationMs + 10);
+
+            SetOrientation(false);
+            PerformLayout();
+            var a2Pill = (TabChromeControl)tabControls[a2];
+            a2Pill.SetHoverState(true);
+            motion.Advance(Motion.HoverDurationMs + 10);
+            var pillHoverOk = a2Pill.HoverProgress >= 0.999f && !motion.IsRunning;
+            a2Pill.SetHoverState(false);
+            motion.Advance(Motion.HoverDurationMs + 10);
+
+            animHoverFadeOk = rowHoverStarted && rowHoverMid && rowHoverSettled && rowUnhoverSettled
+                && activeStarted && activeSettled && pinHoverOk && pillHoverOk;
+
+            // Back to vertical with [first, a1, a2] unpinned for drag & open/close checks.
+            MoveTab(a1, false, 0);
+            SetOrientation(true);
+            PerformLayout();
+            opened.Clear();
+            opened.AddRange([first, a1, a2]);
+            SyncTabs();
+            motion.SnapAll();
+            firstRow = (TabChromeControl)tabControls[first];
+            a1Row = (TabChromeControl)tabControls[a1];
+            a2Row = (TabChromeControl)tabControls[a2];
+
+            // Drag neighbor gap opens smoothly and settles; timer stops when settled.
+            var rowStep = S(28) + S(2);
+            var dragStarted = StartTabDrag(a2, CenterOnScreen(a2Row));
+            UpdateTabDrag(firstRow.PointToScreen(new Point(10, 2)));
+            var gapStarted = dragStarted && motion.IsRunning && (firstRow.Top - firstRow.BaseBounds.Top) < rowStep;
+            motion.Advance(Motion.DragSlideDurationMs / 2);
+            var gapMidOff = firstRow.Top - firstRow.BaseBounds.Top;
+            var gapMid = gapMidOff > 0 && gapMidOff < rowStep;
+            motion.Advance(Motion.DragSlideDurationMs + 10);
+            var gapEndOff = firstRow.Top - firstRow.BaseBounds.Top;
+            animDragNeighborGapOk = gapStarted && gapMid && gapEndOff == rowStep && !motion.IsRunning;
+
+            // Cancel (Esc) glides dragged tab and siblings back to their original slots.
+            CancelTabDrag(animate: true);
+            var cancelStarted = dragTab is null && motion.IsRunning;
+            motion.Advance(Motion.DropGlideDurationMs + 10);
+            animDragCancelGlideOk = cancelStarted
+                && firstRow.Location == firstRow.BaseBounds.Location
+                && a2Row.Location == a2Row.BaseBounds.Location
+                && !motion.IsRunning;
+
+            // Drop glides dragged tab into its new slot.
+            StartTabDrag(a2, CenterOnScreen(a2Row));
+            var dropPt = firstRow.PointToScreen(new Point(10, 2));
+            UpdateTabDrag(dropPt);
+            motion.Advance(Motion.DragSlideDurationMs / 2);
+            DropTabDrag(dropPt);
+            var dropOrderImmediate = opened.SequenceEqual([a2, first, a1]);
+            motion.Advance(Motion.DropGlideDurationMs + 10);
+            animDragDropGlideOk = dropOrderImmediate
+                && a2Row.Location == a2Row.BaseBounds.Location
+                && firstRow.Location == firstRow.BaseBounds.Location
+                && !motion.IsRunning;
+
+            // Open grows in height smoothly.
+            var aOpen = new BrowserTab { SavedUrl = fixture + "/aopen", SavedTitle = "Anim Open" };
+            opened.Add(aOpen);
+            SyncTabs();
+            AnimateNewTabOpen(aOpen);
+            var aOpenRow = (TabChromeControl)tabControls[aOpen];
+            var openStarted = aOpenRow.Height < S(28) && motion.IsRunning;
+            motion.Advance(Motion.OpenCloseDurationMs + 10);
+            animOpenGrowOk = openStarted && aOpenRow.Height == S(28) && !motion.IsRunning;
+
+            // Close shrinks out before removal when animations enabled.
+            CloseTab(aOpen, recordClosed: false);
+            var closeStarted = !opened.Contains(aOpen)
+                && aOpenRow.Closing
+                && layoutMotion.ClosingCount == 1
+                && !aOpenRow.IsDisposed
+                && sideTabs.Items.Contains(aOpenRow)
+                && motion.IsRunning;
+            motion.Advance(Motion.OpenCloseDurationMs / 2);
+            var closeShrinking = !aOpenRow.IsDisposed && aOpenRow.Height > 0 && aOpenRow.Height < S(28);
+            motion.Advance(Motion.OpenCloseDurationMs + 10);
+            animCloseRemovesOk = closeStarted && closeShrinking
+                && aOpenRow.IsDisposed
+                && !sideTabs.Items.Contains(aOpenRow)
+                && layoutMotion.ClosingCount == 0
+                && !motion.IsRunning;
+
+            // Reduce-motion mode removes closing tab immediately without starting the clock.
+            motion.ForceEnabled = false;
+            CloseTab(a1, recordClosed: false);
+            animCloseReduceMotionOk = !opened.Contains(a1)
+                && a1Row.IsDisposed
+                && layoutMotion.ClosingCount == 0
+                && !motion.IsRunning;
+
+            // Rapid double-close + drag during close stays consistent.
+            motion.ForceEnabled = true;
+            var r1 = new BrowserTab { SavedUrl = fixture + "/r1", SavedTitle = "Rapid 1" };
+            var r2 = new BrowserTab { SavedUrl = fixture + "/r2", SavedTitle = "Rapid 2" };
+            opened.AddRange([r1, r2]);
+            SyncTabs();
+            CloseTab(r1, recordClosed: false);
+            CloseTab(r2, recordClosed: false);
+            var bothClosing = !opened.Contains(r1) && !opened.Contains(r2) && layoutMotion.ClosingCount == 2;
+            StartTabDrag(a2, CenterOnScreen(a2Row));
+            var flushedOnDrag = layoutMotion.ClosingCount == 0;
+            CancelTabDrag(animate: false);
+            motion.ForceEnabled = false;
+            CloseTab(a2, recordClosed: false);
+            animRapidCloseSafeOk = bothClosing && flushedOnDrag && opened.SequenceEqual([first]) && !motion.IsRunning;
+        }
+        finally
+        {
+            motion.ForceEnabled = prevMotionOverride;
+            layoutMotion.Reset();
+            first.Pinned = true;
+            SelectTab(first);
+            SetOrientation(true);
+            PerformLayout();
+        }
+        animClockStopsIdle = !motion.IsRunning && motion.ActiveCount == 0;
+
+        var tabAnim = new
+        {
+            easingHelperOk = animEasingOk,
+            hoverFadeOk = animHoverFadeOk,
+            dragNeighborGapOk = animDragNeighborGapOk,
+            dragCancelGlideOk = animDragCancelGlideOk,
+            dragDropGlideOk = animDragDropGlideOk,
+            openGrowOk = animOpenGrowOk,
+            closeRemovesOk = animCloseRemovesOk,
+            closeReduceMotionOk = animCloseReduceMotionOk,
+            rapidCloseSafeOk = animRapidCloseSafeOk,
+            clockStopsIdle = animClockStopsIdle,
         };
 
         // #29: POST form on a utm_* URL keeps its body and is not converted to a GET.
@@ -6341,7 +6920,7 @@ sealed class BrowserWindow : Form
             settingsDialogOk, shareToggleWorks,
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
             urlWhenCleanOff, cliFlags, cliUrl, browserRegistration, externalSchemes,
-            faviconCached, addressDisplayOk, tabDrag, tabFixes, highDpi, shareTimeout,
+            faviconCached, addressDisplayOk, tabDrag, tabAnim, tabFixes, highDpi, shareTimeout,
             tabCycle, loadingStop, tabMenuAndNewWindow, findInPage, zoomAndPrint,
             postClean, blobUrl, permissions, downloads = downloadsReport, processCrash,
             crashUi, fullscreen = fullscreenReport,
