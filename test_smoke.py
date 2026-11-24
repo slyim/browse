@@ -77,6 +77,8 @@ RESOLVE = {
 CLEAN_LINK = {
     'https://example.com/p?utm_source=x&utm_medium=y&id=1': 'https://example.com/p?id=1',
     'https://example.com/p?fbclid=abc': 'https://example.com/p',
+    'https://shop.example/p?hmac=ab12&utm_source=x': 'https://shop.example/p?hmac=ab12&utm_source=x',
+    'https://api.example/p?oauth_signature=s%3D&fbclid=y': 'https://api.example/p?oauth_signature=s%3D&fbclid=y',
     'https://example.com/p?b=two%20words&gclid=1&a=1+2': 'https://example.com/p?b=two%20words&a=1+2',
     'https://example.com/p?id=42&utm_source=smoke&fbclid=abc#keep': 'https://example.com/p?id=42#keep',
     'https://example.com/p?utm_campaign=z#sec': 'https://example.com/p#sec',

@@ -19,6 +19,7 @@ static class CleanLink
     static readonly HashSet<string> Signatures = new(StringComparer.Ordinal)
     {
         "x-amz-signature", "x-goog-signature", "signature", "sig",
+        "oauth_signature", "hmac", "x-oss-signature", "q-signature", "x-signature", "x-hub-signature", "x-ms-signature", "hdnts", "hdnea",
     };
 
     public static string Clean(string url)
@@ -203,6 +204,7 @@ static class Shield
         return $$"""
             (() => {
               try {
+                if (!(document instanceof HTMLDocument)) return; // XML/SVG documents have no ads; a <style> would show up in them
                 const id = 'search-shield-css';
                 if (document.getElementById(id)) return;
                 const h = (location.hostname || '').toLowerCase().replace(/\.+$/, '');
