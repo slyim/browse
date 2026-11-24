@@ -30,11 +30,24 @@ static class PageHandoff
         })()
         """;
 
-    public static async Task<Snapshot> Capture(CoreWebView2 core)
+    public static readonly TimeSpan CaptureTimeout = TimeSpan.FromSeconds(5);
+
+    public static async Task<Snapshot> Capture(CoreWebView2 core, TimeSpan? timeout = null)
     {
         var before = core.Source;
         if (!Allowed(before)) throw new InvalidOperationException("Only HTTP and HTTPS pages can be shared.");
-        var result = await core.ExecuteScriptAsync(Script);
+        string result;
+        var scriptTask = core.ExecuteScriptAsync(Script);
+        try
+        {
+            result = await scriptTask.WaitAsync(timeout ?? CaptureTimeout);
+        }
+        catch (TimeoutException ex)
+        {
+            // Observe any late fault on the orphaned script task so it does not surface as unobserved.
+            _ = scriptTask.ContinueWith(static t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            throw new TimeoutException("Timed out reading page text. The page may be busy or showing a dialog.", ex);
+        }
         if (result.Length > 120_000) throw new InvalidOperationException("The captured response exceeds the share limit.");
         var snapshot = JsonSerializer.Deserialize<Snapshot>(result, Json);
         if (snapshot is null || snapshot.Title is null || snapshot.Text is null ||
