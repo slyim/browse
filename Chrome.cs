@@ -39,6 +39,7 @@ static class Theme
         public const string NewTab = "\uE710";
         public const string Close = "\uE711";
         public const string Share = "\uE72D";
+        public const string Update = "\uE896";
         public const string Minimize = "\uE921";
         public const string Maximize = "\uE922";
         public const string Restore = "\uE923";

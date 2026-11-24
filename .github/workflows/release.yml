@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify tag matches csproj Version
+        id: version
+        shell: pwsh
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          if ($env:TAG_NAME -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw "Tag '$($env:TAG_NAME)' must match vX.Y.Z"
+          }
+          $version = $Matches[1]
+          [xml]$csproj = Get-Content -LiteralPath Search.Windows.csproj
+          $node = $csproj.SelectSingleNode('/Project/PropertyGroup/Version')
+          $csprojVersion = if ($node) { $node.InnerText.Trim() } else { '' }
+          if ($csprojVersion -ne $version) {
+            throw "Tag version '$version' does not match <Version> '$csprojVersion' in Search.Windows.csproj"
+          }
+          "value=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.x
+
+      - name: Publish
+        run: dotnet publish Search.Windows.csproj -c Release -warnaserror -o publish
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.x'
+
+      - name: Smoke test
+        run: python test_smoke.py publish/browse.exe
+
+      - name: Package and create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $zip = "browse-$($env:VERSION)-win-x64.zip"
+          $files = Get-ChildItem -LiteralPath publish -File | Where-Object { $_.Extension -notin '.pdb', '.xml' }
+          if (-not ($files | Where-Object { $_.Name -eq 'browse.exe' })) {
+            throw 'publish/browse.exe not found'
+          }
+          Compress-Archive -LiteralPath $files.FullName -DestinationPath $zip -Force
+          $sha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $notes = @(
+            "Windows x64 build of browse $($env:VERSION)."
+            ""
+            "Requires the .NET 10 Desktop Runtime (x64) and the Microsoft Edge WebView2 Runtime."
+            "Unzip anywhere and run browse.exe."
+            ""
+            "SHA256 ($zip): $sha256"
+          ) -join "`n"
+          gh release create $env:TAG_NAME $zip --title "browse $($env:VERSION)" --notes $notes

@@ -193,6 +193,9 @@ def run():
                 assert report.get('menuDeferredDispose') is True, report.get('menuDeferredDispose')
                 assert report.get('ncTrackedOnDown') is True, report.get('ncTrackedOnDown')
                 assert report.get('captionNoTooltips') is True, report.get('captionNoTooltips')
+                assert report.get('updaterSelfCheck') is True, report.get('updaterSelfCheck')
+                assert report.get('cliFlags') is True, report.get('cliFlags')
+                assert not (path / 'update-check.txt').exists(), 'Smoke test must skip update checks'
                 assert report['snapshot']['text'] == 'First page marker', report
                 assert report['snapshot']['url'] == base + '/first', report
                 assert report['pipeOneUse'] is True

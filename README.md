@@ -58,12 +58,23 @@ python test_smoke.py publish/browse.exe
 | `Alt+Left` / `Alt+Right` | Back / Forward |
 | `Ctrl+R` or `F5` | Reload |
 
+## Updates
+
+On startup, `browse` checks for a newer release at most once every 24 hours with a single request to `api.github.com` (recording the last check time in `update-check.txt` next to `session.json`). Nothing is downloaded or installed unless you click the toolbar update button, which verifies the release asset's SHA-256 digest before swapping and restarting (or shows the Scoop/WinGet command if installed via a package manager).
+
+Pass `--no-update-check` to turn update checks off:
+
+```powershell
+browse.exe --no-update-check
+```
+
 ## Data location
 
 All user data lives under `%LOCALAPPDATA%\SearchWindows\`:
 
 - `WebView\` — WebView2 profile (cookies, cache, site storage)
 - `session.json` — Open and pinned tabs (`url`, `title`, `pinned`), `selected` tab index, and `vertical` (sidebar vs. top strip). It does not store page text, cookies, or form inputs.
+- `update-check.txt` — UTC timestamp of the last update check (omitted when `--no-update-check` is passed).
 
 Run `browse.exe --profile <folder>` to keep a separate profile (WebView data and `session.json`) in that folder instead.
 

@@ -7,36 +7,94 @@ using Microsoft.Web.WebView2.WinForms;
 
 namespace SearchPort;
 
+sealed record CliOptions(
+    string? ProfileDir,
+    bool NoUpdateCheck,
+    string? SmokeReport,
+    string? Fixture,
+    string? SmokePhase)
+{
+    public bool Smoke => SmokeReport is not null;
+}
+
 static class Program
 {
+    internal static CliOptions? ParseArgs(string[] args)
+    {
+        string? profileDir = null;
+        var noUpdateCheck = false;
+        string? smokeReport = null;
+        string? fixture = null;
+        string? smokePhase = null;
+        for (var i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--no-update-check":
+                    noUpdateCheck = true;
+                    break;
+                case "--profile":
+                    if (++i >= args.Length || string.IsNullOrWhiteSpace(args[i])) return null;
+                    profileDir = args[i];
+                    break;
+                case "--smoke-test":
+                    if (smokeReport is not null || i + 2 >= args.Length) return null;
+                    smokeReport = args[++i];
+                    fixture = args[++i];
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                    {
+                        if (args[i + 1] is not ("restore" or "perf" or "sleep")) return null;
+                        smokePhase = args[++i];
+                    }
+                    break;
+                default:
+                    if (smokeReport is not null) return null;
+                    break;
+            }
+        }
+        return new CliOptions(profileDir, noUpdateCheck, smokeReport, fixture, smokePhase);
+    }
+
     [STAThread]
     static int Main(string[] args)
     {
-        var smoke = false;
+        var opts = ParseArgs(args);
+        if (opts is null) return 2;
         string? smokeDir = null;
-        if (args is ["--smoke-test", ..])
+        if (opts.Smoke)
         {
-            if (args is not (["--smoke-test", _, _] or ["--smoke-test", _, _, "restore" or "perf" or "sleep"]))
-                return 2;
-            try { smokeDir = string.IsNullOrWhiteSpace(args[1]) ? null : Path.GetDirectoryName(Path.GetFullPath(args[1])); }
+            try { smokeDir = string.IsNullOrWhiteSpace(opts.SmokeReport) ? null : Path.GetDirectoryName(Path.GetFullPath(opts.SmokeReport)); }
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return 2; }
             if (string.IsNullOrEmpty(smokeDir)) return 2;
-            smoke = true;
         }
+        string profile;
+        try
+        {
+            profile = opts.Smoke ? Path.Combine(smokeDir!, "WebView") :
+                opts.ProfileDir is { } dir ? Path.Combine(Path.GetFullPath(dir), "WebView") :
+                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SearchWindows", "WebView");
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return 2; }
+
+        if (!opts.Smoke) Updater.StartCleanupOldBinary();
         ApplicationConfiguration.Initialize();
 #pragma warning disable WFO5001 // experimental in .NET 10; gives native menus, scrollbars, text boxes and title bar the system theme
         Application.SetColorMode(SystemColorMode.System);
 #pragma warning restore WFO5001
-        var profile = smoke ? Path.Combine(smokeDir!, "WebView") :
-            args is ["--profile", var dir] ? Path.Combine(Path.GetFullPath(dir), "WebView") :
-            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SearchWindows", "WebView");
-        using var sessionLock = Session.TryAcquireLock(profile);
-        var envTask = CreateEnvironment(profile);
-        var sessionFile = Path.Combine(Path.GetDirectoryName(profile)!, "session.json");
-        var sessionTask = !smoke || args is [.., "restore" or "perf"] ? Task.Run(() => Session.Load(sessionFile)) : null;
-        using var browser = new BrowserWindow(sessionFile, envTask, sessionTask, sessionLock is not null, smoke ? args[1] : null, smoke ? args[2] : null, smoke && args.Length == 4 ? args[3] : null);
-        Application.Run(browser);
-        return browser.ExitCode;
+        var sessionLock = Session.TryAcquireLock(profile);
+        try
+        {
+            var envTask = CreateEnvironment(profile);
+            var sessionFile = Path.Combine(Path.GetDirectoryName(profile)!, "session.json");
+            var sessionTask = !opts.Smoke || opts.SmokePhase is "restore" or "perf" ? Task.Run(() => Session.Load(sessionFile)) : null;
+            using var browser = new BrowserWindow(
+                sessionFile, envTask, sessionTask, sessionLock is not null,
+                opts.SmokeReport, opts.Fixture, opts.SmokePhase,
+                opts.NoUpdateCheck, args, () => { sessionLock?.Dispose(); sessionLock = null; });
+            Application.Run(browser);
+            return browser.ExitCode;
+        }
+        finally { sessionLock?.Dispose(); }
     }
 
     static Task<CoreWebView2Environment> CreateEnvironment(string profile)
@@ -83,6 +141,7 @@ sealed class BrowserWindow : Form
     readonly IconButton reloadBtn;
     readonly IconButton layoutBtn;
     readonly IconButton shareBtn;
+    readonly IconButton updateBtn;
     readonly IconButton stripNewTabBtn;
     readonly CaptionButton minBtn;
     readonly CaptionButton maxBtn;
@@ -103,9 +162,15 @@ sealed class BrowserWindow : Form
     readonly string? smokeReport;
     readonly string? fixture;
     readonly string? smokePhase;
+    readonly bool noUpdateCheck;
+    readonly string[] launchArgs;
+    readonly Action releaseSessionLock;
+    CancellationTokenSource? updateCts = new();
     CoreWebView2Environment? environment;
     BrowserTab? selected;
     CancellationTokenSource? pending;
+    UpdateRelease? availableUpdate;
+    bool updating;
     bool vertical = true;
     bool chromeHidden;
     int hoveredCaptionHit;
@@ -210,7 +275,7 @@ sealed class BrowserWindow : Form
             ? t : (string.IsNullOrWhiteSpace(SavedTitle) ? "New tab" : SavedTitle);
     }
 
-    public BrowserWindow(string sessionFile, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, bool canSaveSession, string? smokeReport, string? fixture, string? smokePhase = null)
+    public BrowserWindow(string sessionFile, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, bool canSaveSession, string? smokeReport, string? fixture, string? smokePhase = null, bool noUpdateCheck = false, string[]? launchArgs = null, Action? releaseSessionLock = null)
     {
         this.sessionFile = sessionFile;
         this.envTask = envTask;
@@ -219,6 +284,9 @@ sealed class BrowserWindow : Form
         this.smokeReport = smokeReport;
         this.fixture = fixture;
         this.smokePhase = smokePhase;
+        this.noUpdateCheck = noUpdateCheck;
+        this.launchArgs = launchArgs ?? [];
+        this.releaseSessionLock = releaseSessionLock ?? (() => { });
         Text = "browse";
         Font = Theme.UiFont;
         ForeColor = Theme.Ink;
@@ -233,6 +301,9 @@ sealed class BrowserWindow : Form
         reloadBtn = MakeIcon(Theme.Glyphs.Reload, "Reload", ReloadCurrent);
         layoutBtn = MakeIcon(Theme.Glyphs.Layout, "Switch tab layout", () => SetOrientation(!vertical));
         shareBtn = MakeIcon(Theme.Glyphs.Share, "Share page text once with a local agent", () => _ = SharePage());
+        updateBtn = MakeIcon(Theme.Glyphs.Update, "Update available", () => _ = ApplyUpdate());
+        updateBtn.Visible = false;
+        updateBtn.SetActive(true);
         stripNewTabBtn = MakeIcon(Theme.Glyphs.NewTab, "New tab", NewTab);
         stripNewTabBtn.SetSurface(Theme.Ground, Theme.StripHover, Theme.StripActive);
         sideNewTab = new QuietRow("New tab", NewTab);
@@ -283,7 +354,7 @@ sealed class BrowserWindow : Form
         Deactivate += (_, _) => { ClearCaptionInteraction(); SetCaptionWindowActive(false); };
         Load += async (_, _) => await Start();
         FormClosing += (_, _) => SaveSession();
-        FormClosed += (_, _) => { closed = true; pending?.Cancel(); sleepTimer.Stop(); sleepTimer.Dispose(); };
+        FormClosed += (_, _) => { closed = true; pending?.Cancel(); updateCts?.Cancel(); sleepTimer.Stop(); sleepTimer.Dispose(); };
     }
 
     int S(int px) => LogicalToDeviceUnits(px);
@@ -303,6 +374,9 @@ sealed class BrowserWindow : Form
         {
             closed = true;
             pending?.Cancel();
+            updateCts?.Cancel();
+            updateCts?.Dispose();
+            updateCts = null;
             sleepTimer.Dispose();
         }
         base.Dispose(disposing);
@@ -618,6 +692,7 @@ sealed class BrowserWindow : Form
         reloadBtn.SetBounds((btn + gap) * 2, y, btn, btn);
         layoutBtn.SetBounds(w - btn, y, btn, btn);
         shareBtn.SetBounds(w - btn * 2 - gap, y, btn, btn);
+        if (updateBtn.Visible) updateBtn.SetBounds(w - btn * 3 - gap * 2, y, btn, btn);
     }
 
     void LayoutTopStrip()
@@ -637,10 +712,13 @@ sealed class BrowserWindow : Form
         reloadBtn.SetBounds(x, yBtn, btn, btn); x += btn + S(8);
 
         var captionW = S(46) * 3;
-        var rightW = btn * 2 + gap;
+        var rightCount = updateBtn.Visible ? 3 : 2;
+        var rightW = btn * rightCount + gap * (rightCount - 1);
         var rightStart = w - captionW - S(8) - rightW;
-        layoutBtn.SetBounds(rightStart, yBtn, btn, btn);
-        shareBtn.SetBounds(rightStart + btn + gap, yBtn, btn, btn);
+        var rx = rightStart;
+        if (updateBtn.Visible) { updateBtn.SetBounds(rx, yBtn, btn, btn); rx += btn + gap; }
+        layoutBtn.SetBounds(rx, yBtn, btn, btn);
+        shareBtn.SetBounds(rx + btn + gap, yBtn, btn, btn);
 
         var maxAddr = Math.Max(0, rightStart - x - S(8) - btn - S(8));
         var addrW = Math.Min(Math.Clamp((w - pad * 2) * 26 / 100, S(160), S(340)), maxAddr);
@@ -740,6 +818,7 @@ sealed class BrowserWindow : Form
                 if (closed) return;
                 if (selected?.Url is null) address.FocusInput(); else selected.View?.Focus(); // a focused address bar ignores redirects
                 ExitCode = 0;
+                if (!noUpdateCheck) _ = CheckForUpdateAsync();
             }
         }
         catch (Exception ex)
@@ -1084,13 +1163,13 @@ sealed class BrowserWindow : Form
         var hover = sidebarMode ? Theme.SideHover : Theme.StripHover;
         var activeFill = sidebarMode ? Theme.SideActive : Theme.StripActive;
 
-        foreach (var b in new[] { backBtn, forwardBtn, reloadBtn, layoutBtn, shareBtn })
+        foreach (var b in new[] { backBtn, forwardBtn, reloadBtn, layoutBtn, shareBtn, updateBtn })
             b.SetSurface(surface, hover, activeFill);
         address.SetSurface(surface, hover);
 
         if (sidebarMode)
         {
-            sideTopBand.Controls.AddRange([backBtn, forwardBtn, reloadBtn, shareBtn, layoutBtn]);
+            sideTopBand.Controls.AddRange([backBtn, forwardBtn, reloadBtn, updateBtn, shareBtn, layoutBtn]);
             sideAddressWrap.Controls.Add(address);
             ApplyChromeVisibility();
             LayoutSideTopBand();
@@ -1099,7 +1178,7 @@ sealed class BrowserWindow : Form
         else
         {
             stripScroll = 0;
-            topStrip.Controls.AddRange([backBtn, forwardBtn, reloadBtn, address, shareBtn, layoutBtn]);
+            topStrip.Controls.AddRange([backBtn, forwardBtn, reloadBtn, address, updateBtn, shareBtn, layoutBtn]);
             stripTabs.SendToBack();
             ApplyChromeVisibility();
         }
@@ -1384,6 +1463,89 @@ sealed class BrowserWindow : Form
                 shareBtn.Enabled = true;
                 shareBtn.SetActive(false);
                 tips.SetToolTip(shareBtn, "Share page text once with a local agent");
+            }
+        }
+    }
+
+    async Task CheckForUpdateAsync()
+    {
+        if (updateCts is not { } cts) return;
+        var release = await Updater.CheckForUpdateAsync(sessionFile, cts.Token);
+        if (release is null || closed || IsDisposed) return;
+        availableUpdate = release;
+        var label = $"Update to {release.VersionText}";
+        updateBtn.AccessibleName = label;
+        tips.SetToolTip(updateBtn, label);
+        updateBtn.Visible = true;
+        if (vertical) LayoutSideTopBand();
+        else LayoutTopStrip();
+    }
+
+    async Task ApplyUpdate()
+    {
+        if (availableUpdate is not { } release || updating || closed) return;
+        var exePath = Environment.ProcessPath;
+        if (string.IsNullOrEmpty(exePath))
+        {
+            _ = OpenInteractive(release.ReleasePageUrl);
+            return;
+        }
+        var kind = Updater.DetectInstallKind(exePath);
+        if (kind != InstallKind.Direct)
+        {
+            var cmd = kind == InstallKind.Scoop ? "scoop update browse" : "winget upgrade slyim.browse";
+            MessageBox.Show(this,
+                $"browse {release.VersionText} is available.\n\nThis copy is managed by {kind}. Update it by running:\n\n{cmd}",
+                $"Update to {release.VersionText}", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        var installDir = Path.GetDirectoryName(exePath);
+        if (string.IsNullOrEmpty(installDir) || !Updater.IsInstallDirWritable(installDir))
+        {
+            _ = OpenInteractive(release.ReleasePageUrl);
+            return;
+        }
+        if (MessageBox.Show(this,
+            $"Download and install browse {release.VersionText}?\n\nbrowse will verify the SHA-256 digest, save your tabs, and restart.",
+            $"Update to {release.VersionText}", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+            return;
+
+        updating = true;
+        updateBtn.Enabled = false;
+        tips.SetToolTip(updateBtn, $"Updating to {release.VersionText}...");
+        string? workDir = null;
+        try
+        {
+            if (updateCts is not { } cts) return;
+            (workDir, var extractDir) = await Updater.DownloadAndExtractAsync(release, cts.Token);
+            if (closed || IsDisposed) return;
+            Updater.SwapFiles(exePath, extractDir);
+            SaveSession();
+            sessionReady = false;
+            releaseSessionLock();
+            try { Updater.Launch(exePath, launchArgs); }
+            catch
+            {
+                Updater.RestoreOldExe(exePath, exePath + ".old");
+                throw;
+            }
+            ExitCode = 0;
+            Close();
+        }
+        catch (OperationCanceledException) when (closed) { }
+        catch (Exception ex)
+        {
+            if (!closed && !IsDisposed)
+                MessageBox.Show(this, ex.Message, "Update failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            Updater.TryDeleteDirectory(workDir);
+            updating = false;
+            if (!closed && !IsDisposed && !updateBtn.IsDisposed)
+            {
+                updateBtn.Enabled = true;
+                tips.SetToolTip(updateBtn, $"Update to {release.VersionText}");
             }
         }
     }
@@ -1821,11 +1983,20 @@ sealed class BrowserWindow : Form
         };
         CloseTab(loopTab);
 
+        var updaterSelfCheck = Updater.SelfCheck();
+        var cliFlags = Program.ParseArgs(["--no-update-check"]) is { NoUpdateCheck: true, ProfileDir: null, Smoke: false }
+            && Program.ParseArgs(["--profile", @"C:\tmp\p", "--no-update-check"]) is { NoUpdateCheck: true, ProfileDir: @"C:\tmp\p", Smoke: false }
+            && Program.ParseArgs(["--no-update-check", "--profile", @"C:\tmp\p"]) is { NoUpdateCheck: true, ProfileDir: @"C:\tmp\p", Smoke: false }
+            && Program.ParseArgs(["--profile"]) is null
+            && Program.ParseArgs(["--smoke-test", @"C:\tmp\r.json", "http://127.0.0.1:1", "restore", "--no-update-check"]) is { Smoke: true, SmokePhase: "restore", NoUpdateCheck: true }
+            && Program.ParseArgs(["--smoke-test", @"C:\tmp\r.json", "http://127.0.0.1:1", "bogus"]) is null;
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
             verticalAndHorizontal = orientations, captionHidden, hitTests, maximizeToggles, chromeHiddenWorks,
             stripOverflowSafe, stripWheelScrolled, sideWheelStep, menuDeferredDispose, ncTrackedOnDown, captionNoTooltips,
+            updaterSelfCheck, cliFlags,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
             rejectsLocalFiles = Resolve("file:///C:/Windows/win.ini") == null && !PageHandoff.Allowed("file:///C:/Windows/win.ini"),
             // Must match RESOLVE in test_smoke.py.
