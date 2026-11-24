@@ -649,6 +649,19 @@ def run_checks():
                     'f11RestoresCollapsedOk': True,
                     'chromeHiddenAndAnchorOk': True,
                 }, report.get('collapsibleTabBar')
+                assert report.get('focusMode') == {
+                    'enterHidesAllOk': True,
+                    'staysAcrossOpsOk': True,
+                    'leftPeekOk': True,
+                    'topPeekOk': True,
+                    'captionInTopPeekOk': True,
+                    'peekAnimOk': True,
+                    'shortcutsOk': True,
+                    'insideChangesOk': True,
+                    'f11ReturnsOk': True,
+                    'restoreAllLayoutsOk': True,
+                    'menuToggleOk': True,
+                }, report.get('focusMode')
                 debounce = report.get('sessionDebounce')
                 assert debounce is not None, report
                 assert debounce['titleEvents'] >= 5, debounce
