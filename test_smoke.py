@@ -194,7 +194,20 @@ def run():
                 assert report.get('ncTrackedOnDown') is True, report.get('ncTrackedOnDown')
                 assert report.get('captionNoTooltips') is True, report.get('captionNoTooltips')
                 assert report.get('updaterSelfCheck') is True, report.get('updaterSelfCheck')
+                assert report.get('settingsRoundTrip') is True, report.get('settingsRoundTrip')
+                assert report.get('phosphorLoaded') is True, report.get('phosphorLoaded')
+                assert report.get('iconFontFamily') == 'Phosphor', report.get('iconFontFamily')
+                assert 'Segoe' in (report.get('captionFontFamily') or ''), report.get('captionFontFamily')
+                assert report.get('settingsDialogOk') is True, report.get('settingsDialogOk')
+                assert report.get('shareToggleWorks') is True, report.get('shareToggleWorks')
+                assert report.get('adStatusWhenBlockingOff') == 200, report.get('adStatusWhenBlockingOff')
+                assert report.get('adVisibleWhenBlockingOff') is True, report.get('adVisibleWhenBlockingOff')
+                assert report.get('adHiddenAfterBlockingOn') is True, report.get('adHiddenAfterBlockingOn')
+                assert report.get('adStatusAfterBlockingOn') == 403, report.get('adStatusAfterBlockingOn')
+                assert report.get('urlWhenCleanOff') == base + '/first?id=7&utm_source=keepme&fbclid=keep123#frag', report.get('urlWhenCleanOff')
+                assert '/first?id=7&utm_source=keepme&fbclid=keep123' in Fixture.requested, Fixture.requested
                 assert report.get('cliFlags') is True, report.get('cliFlags')
+                assert (exe.parent / 'Phosphor-LICENSE.txt').is_file(), f'Missing Phosphor-LICENSE.txt next to {exe}'
                 assert not (path / 'update-check.txt').exists(), 'Smoke test must skip update checks'
                 assert report['snapshot']['text'] == 'First page marker', report
                 assert report['snapshot']['url'] == base + '/first', report
@@ -244,6 +257,19 @@ def run():
                 assert set(session.keys()) == {'tabs', 'selected', 'vertical'}, session
                 assert [set(t.keys()) for t in session['tabs']] == [{'url', 'title', 'pinned'}] * 3, session
                 assert session == expected_session, session
+
+                settings_path = path / 'settings.json'
+                assert settings_path.is_file(), f'Missing settings.json at {settings_path}'
+                saved_settings = json.loads(settings_path.read_text(encoding='utf-8'))
+                assert saved_settings == {
+                    'theme': 'system',
+                    'verticalTabs': False,
+                    'blockingEnabled': True,
+                    'cleanLinksEnabled': True,
+                    'sleepingTabsEnabled': True,
+                    'autoUpdateCheck': True,
+                    'shareEnabled': True,
+                }, saved_settings
 
                 Fixture.requested.clear()
                 restore = run_phase(exe, path / 'restore.json', base, 'restore')

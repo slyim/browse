@@ -25,17 +25,18 @@ dotnet publish Search.Windows.csproj -c Release -warnaserror -o publish
 python test_smoke.py publish/browse.exe
 ```
 
-`test_smoke.py` launches the built executable against a local loopback fixture in a temporary profile and verifies navigation, URL resolution, tab layouts, custom title bar hit-testing, tracker/ad blocking, link cleaning, session save/restore (including multi-instance lock behavior), sleeping tabs, and one-time Share delivery.
+`test_smoke.py` launches the built executable against a local loopback fixture in a temporary profile and verifies navigation, URL resolution, tab layouts, custom title bar hit-testing, tracker/ad blocking (on and off), link cleaning (on and off), settings persistence, Phosphor icon font loading, session save/restore (including multi-instance lock behavior), sleeping tabs, and one-time Share delivery.
 
 ## Features
 
 - **Session restore with lazy tabs**: Restores open and pinned tabs, the active tab, and the tab layout on startup. Only the selected tab creates a WebView2 and loads until you switch to other tabs. A per-profile mutex lets a second window open and restore without overwriting the first window's `session.json`.
-- **Sidebar or top tab strip**: Switch between the vertical sidebar (with a pinned-tab tile grid) and the horizontal top tab strip via the layout button or `Ctrl+Shift+S`. Right-click a tab to pin, unpin, or close it; pinned tabs cannot be closed until unpinned.
-- **Light and dark mode**: Follows the Windows system light/dark setting on launch.
+- **Sidebar or top tab strip**: Switch between the vertical sidebar (with a pinned-tab tile grid) and the horizontal top tab strip via **Settings** (`Ctrl+,`) or `Ctrl+Shift+S`. Right-click a tab to pin, unpin, or close it; pinned tabs cannot be closed until unpinned.
+- **Settings**: Open **Settings** from the toolbar gear button or with `Ctrl+,` to choose theme (**System**, **Light**, or **Dark**, applied on next launch), switch tab layout (**Sidebar** or **Top tabs**), toggle ad & tracker blocking, link cleaning, sleeping tabs, automatic update checks, and the toolbar Share button, clear WebView2 browsing data (cookies, cache, history, and site data), and view the app version.
+- **Light and dark mode**: Follows the Windows system light/dark setting by default, or can be pinned to Light or Dark in **Settings**.
 - **Custom title bar**: Integrated minimize/maximize/close buttons and draggable window chrome.
-- **Tracker/ad blocking and link cleaning**: Blocks requests to common third-party ad/tracker domains, hides common ad containers via CSS, and strips tracking query parameters (`utm_*`, `fbclid`, `gclid`, etc., plus `si` on YouTube and Spotify) while leaving signed URLs intact.
-- **Sleeping tabs**: Suspends idle background tabs after 5 minutes to lower memory usage (skipping active, pinned, navigating, and audio-playing tabs) and resumes them when selected.
-- **One-time read-only Share**: Offers a one-time JSON snapshot (`{ url, title, text }`) of the active HTTP/HTTPS page over a local named pipe (`SearchWindows-<hex>`). A local tool can read it with:
+- **Tracker/ad blocking and link cleaning**: Blocks requests to common third-party ad/tracker domains, hides common ad containers via CSS, and strips tracking query parameters (`utm_*`, `fbclid`, `gclid`, etc., plus `si` on YouTube and Spotify) while leaving signed URLs intact. Both can be toggled in **Settings**.
+- **Sleeping tabs**: Suspends idle background tabs after 5 minutes to lower memory usage (skipping active, pinned, navigating, and audio-playing tabs) and resumes them when selected. Can be toggled in **Settings**.
+- **One-time read-only Share**: Offers a one-time JSON snapshot (`{ url, title, text }`) of the active HTTP/HTTPS page over a local named pipe (`SearchWindows-<hex>`). Can be hidden from the toolbar in **Settings**. A local tool can read it with:
 
   ```powershell
   .\read-page.ps1 -Name 'SearchWindows-<code-shown-in-the-dialog>'
@@ -53,6 +54,7 @@ python test_smoke.py publish/browse.exe
 | `Ctrl+W` | Close current tab (unpinned) |
 | `Ctrl+Shift+T` | Reopen last closed tab |
 | `Ctrl+Shift+S` | Toggle sidebar / top tab strip |
+| `Ctrl+,` | Open Settings |
 | `Ctrl+1`–`Ctrl+8` | Switch to tab 1–8 (pinned tabs first) |
 | `Ctrl+9` | Switch to last tab |
 | `Alt+Left` / `Alt+Right` | Back / Forward |
@@ -74,10 +76,11 @@ All user data lives under `%LOCALAPPDATA%\SearchWindows\`:
 
 - `WebView\` — WebView2 profile (cookies, cache, site storage)
 - `session.json` — Open and pinned tabs (`url`, `title`, `pinned`), `selected` tab index, and `vertical` (sidebar vs. top strip). It does not store page text, cookies, or form inputs.
-- `update-check.txt` — UTC timestamp of the last update check (omitted when `--no-update-check` is passed).
+- `settings.json` — Preferences from **Settings** (`theme`, `verticalTabs`, `blockingEnabled`, `cleanLinksEnabled`, `sleepingTabsEnabled`, `autoUpdateCheck`, `shareEnabled`).
+- `update-check.txt` — UTC timestamp of the last update check (omitted when `--no-update-check` is passed or automatic update checks are off).
 
-Run `browse.exe --profile <folder>` to keep a separate profile (WebView data and `session.json`) in that folder instead.
+Run `browse.exe --profile <folder>` to keep a separate profile (WebView data, `session.json`, and `settings.json`) in that folder instead.
 
 ## License
 
-This port includes code, block rules and design from Search, used under its MIT license; that notice is in `LICENSE-Search` and ships next to the exe.
+This port includes code, block rules and design from Search, used under its MIT license; that notice is in `LICENSE-Search` and ships next to the exe. Toolbar icons use [Phosphor Icons](https://phosphoricons.com) under its MIT license (`Phosphor-LICENSE.txt`, shipped next to the exe).

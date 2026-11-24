@@ -1,10 +1,18 @@
 using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.Runtime.InteropServices;
 
 namespace SearchPort;
 
 static class Theme
 {
-    // shortcut: the theme is read once at startup; a Windows light/dark switch applies on the next launch.
+    [DllImport("gdi32.dll")]
+    static extern IntPtr AddFontMemResourceEx(IntPtr pbFont, uint cbFont, IntPtr pdv, out uint pcFonts);
+
+    [DllImport("gdi32.dll")]
+    static extern bool RemoveFontMemResourceEx(IntPtr fh);
+
+    // shortcut: the theme is read once at startup; changing Theme in Settings or Windows applies on the next launch.
 #pragma warning disable WFO5001
     public static readonly bool Dark = Application.IsDarkModeEnabled;
 #pragma warning restore WFO5001
@@ -29,31 +37,87 @@ static class Theme
     public static readonly Color BadgeFill = Dark ? Color.FromArgb(0x14, 0xFF, 0xFF, 0xFF) : Color.FromArgb(0x10, 0x00, 0x00, 0x00);
     public static readonly Color CloseHoverFill = Dark ? Color.FromArgb(0x22, 0xFF, 0xFF, 0xFF) : Color.FromArgb(0x18, 0x00, 0x00, 0x00);
 
+    static readonly string CaptionIconFamily = FontFamily.Families.Any(f => f.Name.Equals("Segoe Fluent Icons", StringComparison.OrdinalIgnoreCase))
+        ? "Segoe Fluent Icons" : "Segoe MDL2 Assets";
+
+    static readonly (PrivateFontCollection Collection, IntPtr Memory, IntPtr GdiHandle, FontFamily Family)? Phosphor = TryLoadPhosphor();
+    public static bool PhosphorLoaded => Phosphor is not null;
+
+    static (PrivateFontCollection, IntPtr, IntPtr, FontFamily)? TryLoadPhosphor()
+    {
+        IntPtr mem = IntPtr.Zero;
+        IntPtr gdi = IntPtr.Zero;
+        PrivateFontCollection? pfc = null;
+        try
+        {
+            using var stream = typeof(Theme).Assembly.GetManifestResourceStream("Phosphor.ttf");
+            if (stream is null) return null;
+            using var ms = new MemoryStream();
+            stream.CopyTo(ms);
+            var bytes = ms.ToArray();
+            if (bytes.Length == 0) return null;
+
+            // Keep memory + GDI registration alive for the process lifetime so GDI TextRenderer resolves "Phosphor".
+            mem = Marshal.AllocCoTaskMem(bytes.Length);
+            Marshal.Copy(bytes, 0, mem, bytes.Length);
+            gdi = AddFontMemResourceEx(mem, (uint)bytes.Length, IntPtr.Zero, out var count);
+            if (gdi == IntPtr.Zero || count == 0)
+            {
+                Marshal.FreeCoTaskMem(mem);
+                return null;
+            }
+            pfc = new PrivateFontCollection();
+            pfc.AddMemoryFont(mem, bytes.Length);
+            if (pfc.Families.Length == 0)
+            {
+                pfc.Dispose();
+                RemoveFontMemResourceEx(gdi);
+                Marshal.FreeCoTaskMem(mem);
+                return null;
+            }
+            return (pfc, mem, gdi, pfc.Families[0]);
+        }
+        catch
+        {
+            pfc?.Dispose();
+            if (gdi != IntPtr.Zero) RemoveFontMemResourceEx(gdi);
+            if (mem != IntPtr.Zero) Marshal.FreeCoTaskMem(mem);
+            return null;
+        }
+    }
 
     public static class Glyphs
     {
-        public const string Back = "\uE76B";
-        public const string Forward = "\uE76C";
-        public const string Reload = "\uE72C";
-        public const string Layout = "\uE89F";
-        public const string NewTab = "\uE710";
-        public const string Close = "\uE711";
-        public const string Share = "\uE72D";
-        public const string Update = "\uE896";
+        // Phosphor Regular (@phosphor-icons/web 2.1.2) with Segoe Fluent Icons fallback.
+        public static readonly string Back = PhosphorLoaded ? "\uE058" : "\uE76B";       // arrow-left
+        public static readonly string Forward = PhosphorLoaded ? "\uE06C" : "\uE76C";    // arrow-right
+        public static readonly string Reload = PhosphorLoaded ? "\uE036" : "\uE72C";     // arrow-clockwise
+        public static readonly string NewTab = PhosphorLoaded ? "\uE3D4" : "\uE710";     // plus
+        public static readonly string Close = PhosphorLoaded ? "\uE4F6" : "\uE711";      // x
+        public static readonly string Share = PhosphorLoaded ? "\uE406" : "\uE72D";      // share
+        public static readonly string Update = PhosphorLoaded ? "\uE20C" : "\uE896";     // download-simple
+        public static readonly string Settings = PhosphorLoaded ? "\uE272" : "\uE713";   // gear-six
+
+        // Window caption buttons stay on Segoe Fluent Icons to match native Windows chrome.
         public const string Minimize = "\uE921";
         public const string Maximize = "\uE922";
         public const string Restore = "\uE923";
         public const string ChromeClose = "\uE8BB";
     }
 
-    static readonly string IconFamily = FontFamily.Families.Any(f => f.Name.Equals("Segoe Fluent Icons", StringComparison.OrdinalIgnoreCase))
-        ? "Segoe Fluent Icons" : "Segoe MDL2 Assets";
-
-    public static readonly Font IconFont = new(IconFamily, 9.5f, FontStyle.Regular);
-    public static readonly Font SmallIconFont = new(IconFamily, 8f, FontStyle.Regular);
-    public static readonly Font CaptionIconFont = new(IconFamily, 7.5f, FontStyle.Regular);
-    public static readonly Font CloseIconFont = new(IconFamily, 6f, FontStyle.Regular);
+    public static readonly Font IconFont = Phosphor is { } p
+        ? new(p.Family, 11.5f, FontStyle.Regular)
+        : new(CaptionIconFamily, 9.5f, FontStyle.Regular);
+    public static readonly Font SmallIconFont = Phosphor is { } p2
+        ? new(p2.Family, 9.5f, FontStyle.Regular)
+        : new(CaptionIconFamily, 8f, FontStyle.Regular);
+    public static readonly Font CaptionIconFont = new(CaptionIconFamily, 7.5f, FontStyle.Regular);
+    public static readonly Font CloseIconFont = Phosphor is { } p3
+        ? new(p3.Family, 7.5f, FontStyle.Regular)
+        : new(CaptionIconFamily, 6f, FontStyle.Regular);
     public static readonly Font UiFont = new("Segoe UI", 9.5f, FontStyle.Regular);
+    public static readonly Font SectionFont = new("Segoe UI Semibold", 9f, FontStyle.Regular);
+    public static readonly Font HintFont = new("Segoe UI", 8.25f, FontStyle.Regular);
     public static readonly Font BadgeFont = new("Segoe UI Semibold", 7f, FontStyle.Regular);
     public static readonly Font PinFont = new("Segoe UI Semibold", 9.5f, FontStyle.Regular);
     public static readonly Font StripPinFont = new("Segoe UI Semibold", 9f, FontStyle.Regular);

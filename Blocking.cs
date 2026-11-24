@@ -227,11 +227,18 @@ static class Shield
             """;
     }
 
-    public static async Task<Func<int>> AttachAsync(CoreWebView2 core, CoreWebView2Environment environment, Func<Uri?> pageUri, Func<Uri?> pendingMainFrameUri)
+    public static async Task<(Func<int> BlockedCount, Func<bool, Task> SetEnabledAsync)> AttachAsync(
+        CoreWebView2 core,
+        CoreWebView2Environment environment,
+        Func<Uri?> pageUri,
+        Func<Uri?> pendingMainFrameUri,
+        Func<bool> isEnabled)
     {
         // Profile-wide and idempotent. Balanced (Edge default) adds Edge's tracker list; Strict breaks embedded sign-ins and pre-empts this handler.
         if (core.Profile is not null)
-            core.Profile.PreferredTrackingPreventionLevel = CoreWebView2TrackingPreventionLevel.Balanced;
+            core.Profile.PreferredTrackingPreventionLevel = isEnabled()
+                ? CoreWebView2TrackingPreventionLevel.Balanced
+                : CoreWebView2TrackingPreventionLevel.None;
 
         foreach (var d in BlockedDomains)
         {
@@ -242,7 +249,7 @@ static class Shield
         var blocked = 0;
         core.WebResourceRequested += (_, e) =>
         {
-            if (e.Response is not null || !Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var req)) return;
+            if (!isEnabled() || e.Response is not null || !Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var req)) return;
             var secFetchDest = e.Request.Headers.Contains("Sec-Fetch-Dest") ? e.Request.Headers.GetHeader("Sec-Fetch-Dest") : null;
             if (ShouldBlock(req, pageUri(), e.ResourceContext, pendingMainFrameUri(), e.RequestedSourceKind, secFetchDest))
             {
@@ -251,7 +258,41 @@ static class Shield
             }
         };
 
-        await core.AddScriptToExecuteOnDocumentCreatedAsync(CosmeticScript);
-        return () => Volatile.Read(ref blocked);
+        string? cosmeticScriptId = null;
+        if (isEnabled())
+            cosmeticScriptId = await core.AddScriptToExecuteOnDocumentCreatedAsync(CosmeticScript);
+
+        async Task SetEnabledAsync(bool enabled)
+        {
+            try
+            {
+                if (core.Profile is not null)
+                    core.Profile.PreferredTrackingPreventionLevel = enabled
+                        ? CoreWebView2TrackingPreventionLevel.Balanced
+                        : CoreWebView2TrackingPreventionLevel.None;
+                if (enabled)
+                {
+                    if (cosmeticScriptId is null)
+                    {
+                        var id = await core.AddScriptToExecuteOnDocumentCreatedAsync(CosmeticScript);
+                        if (!isEnabled()) { core.RemoveScriptToExecuteOnDocumentCreated(id); return; }
+                        cosmeticScriptId = id;
+                    }
+                    if (!core.IsSuspended) await core.ExecuteScriptAsync(CosmeticScript);
+                }
+                else
+                {
+                    if (cosmeticScriptId is not null)
+                    {
+                        core.RemoveScriptToExecuteOnDocumentCreated(cosmeticScriptId);
+                        cosmeticScriptId = null;
+                    }
+                    if (!core.IsSuspended) await core.ExecuteScriptAsync("document.getElementById('search-shield-css')?.remove()");
+                }
+            }
+            catch { }
+        }
+
+        return (() => Volatile.Read(ref blocked), SetEnabledAsync);
     }
 }

@@ -22,7 +22,9 @@
     <None Include="$(PkgMicrosoft_Web_WebView2)/NOTICE.txt" Link="WebView2-NOTICE.txt" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <!-- MIT notice of the Search project this port is based on; travels with every build. -->
     <None Include="LICENSE-Search" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="Phosphor-LICENSE.txt" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
     <None Include="LICENSE" Condition="Exists('LICENSE')" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <EmbeddedResource Include="Phosphor.ttf" LogicalName="Phosphor.ttf" />
   </ItemGroup>
   <!-- The SDK injects a WPF reference even for WinForms hosts. It is unused here. -->
   <Target Name="RemoveUnusedWebView2Wpf" BeforeTargets="ResolveAssemblyReferences">

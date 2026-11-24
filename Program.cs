@@ -77,18 +77,23 @@ static class Program
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { return 2; }
 
         if (!opts.Smoke) Updater.StartCleanupOldBinary();
+        var profileRoot = Path.GetDirectoryName(profile)!;
+        var settingsFile = Path.Combine(profileRoot, "settings.json");
+        var (initialSettings, settingsExisted) = !opts.Smoke || opts.SmokePhase is "restore" or "perf"
+            ? SettingsStore.Load(settingsFile)
+            : (new AppSettings(), false);
         ApplicationConfiguration.Initialize();
 #pragma warning disable WFO5001 // experimental in .NET 10; gives native menus, scrollbars, text boxes and title bar the system theme
-        Application.SetColorMode(SystemColorMode.System);
+        Application.SetColorMode(SettingsStore.ToColorMode(initialSettings.Theme));
 #pragma warning restore WFO5001
         var sessionLock = Session.TryAcquireLock(profile);
         try
         {
             var envTask = CreateEnvironment(profile);
-            var sessionFile = Path.Combine(Path.GetDirectoryName(profile)!, "session.json");
+            var sessionFile = Path.Combine(profileRoot, "session.json");
             var sessionTask = !opts.Smoke || opts.SmokePhase is "restore" or "perf" ? Task.Run(() => Session.Load(sessionFile)) : null;
             using var browser = new BrowserWindow(
-                sessionFile, envTask, sessionTask, sessionLock is not null,
+                sessionFile, settingsFile, initialSettings, settingsExisted, envTask, sessionTask, sessionLock is not null,
                 opts.SmokeReport, opts.Fixture, opts.SmokePhase,
                 opts.NoUpdateCheck, args, () => { sessionLock?.Dispose(); sessionLock = null; });
             Application.Run(browser);
@@ -139,9 +144,9 @@ sealed class BrowserWindow : Form
     readonly IconButton backBtn;
     readonly IconButton forwardBtn;
     readonly IconButton reloadBtn;
-    readonly IconButton layoutBtn;
     readonly IconButton shareBtn;
     readonly IconButton updateBtn;
+    readonly IconButton settingsBtn;
     readonly IconButton stripNewTabBtn;
     readonly CaptionButton minBtn;
     readonly CaptionButton maxBtn;
@@ -156,6 +161,8 @@ sealed class BrowserWindow : Form
     readonly Stack<string> closedUrls = new();
     Hairline? stripHairline;
     readonly string sessionFile;
+    readonly string settingsFile;
+    readonly ThemePreference startupTheme;
     readonly Task<CoreWebView2Environment> envTask;
     readonly Task<SessionState?>? sessionTask;
     readonly bool canSaveSession;
@@ -165,6 +172,9 @@ sealed class BrowserWindow : Form
     readonly bool noUpdateCheck;
     readonly string[] launchArgs;
     readonly Action releaseSessionLock;
+    AppSettings settings;
+    bool settingsExisted;
+    SettingsDialog? settingsDialog;
     CancellationTokenSource? updateCts = new();
     CoreWebView2Environment? environment;
     BrowserTab? selected;
@@ -270,14 +280,19 @@ sealed class BrowserWindow : Form
         public bool Suspending { get; set; }
         public bool Navigating => ActiveNavigationId is not null;
         public Func<int> BlockedCount { get; set; } = () => 0;
+        public Func<bool, Task> SetShieldEnabledAsync { get; set; } = _ => Task.CompletedTask;
         public string? Url => View is { IsDisposed: false, CoreWebView2.Source: { } s } && PageHandoff.Allowed(s) ? s : SavedUrl;
         public string Title => Loaded && View is { IsDisposed: false, CoreWebView2.DocumentTitle: { } t } && !string.IsNullOrWhiteSpace(t) && t != "about:blank"
             ? t : (string.IsNullOrWhiteSpace(SavedTitle) ? "New tab" : SavedTitle);
     }
 
-    public BrowserWindow(string sessionFile, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, bool canSaveSession, string? smokeReport, string? fixture, string? smokePhase = null, bool noUpdateCheck = false, string[]? launchArgs = null, Action? releaseSessionLock = null)
+    public BrowserWindow(string sessionFile, string settingsFile, AppSettings initialSettings, bool settingsExisted, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, bool canSaveSession, string? smokeReport, string? fixture, string? smokePhase = null, bool noUpdateCheck = false, string[]? launchArgs = null, Action? releaseSessionLock = null)
     {
         this.sessionFile = sessionFile;
+        this.settingsFile = settingsFile;
+        settings = initialSettings;
+        this.settingsExisted = settingsExisted;
+        startupTheme = initialSettings.Theme;
         this.envTask = envTask;
         this.sessionTask = sessionTask;
         this.canSaveSession = canSaveSession;
@@ -299,11 +314,12 @@ sealed class BrowserWindow : Form
         backBtn = MakeIcon(Theme.Glyphs.Back, "Back", GoBack);
         forwardBtn = MakeIcon(Theme.Glyphs.Forward, "Forward", GoForward);
         reloadBtn = MakeIcon(Theme.Glyphs.Reload, "Reload", ReloadCurrent);
-        layoutBtn = MakeIcon(Theme.Glyphs.Layout, "Switch tab layout", () => SetOrientation(!vertical));
         shareBtn = MakeIcon(Theme.Glyphs.Share, "Share page text once with a local agent", () => _ = SharePage());
+        shareBtn.Visible = settings.ShareEnabled;
         updateBtn = MakeIcon(Theme.Glyphs.Update, "Update available", () => _ = ApplyUpdate());
         updateBtn.Visible = false;
         updateBtn.SetActive(true);
+        settingsBtn = MakeIcon(Theme.Glyphs.Settings, "Settings", OpenSettings);
         stripNewTabBtn = MakeIcon(Theme.Glyphs.NewTab, "New tab", NewTab);
         stripNewTabBtn.SetSurface(Theme.Ground, Theme.StripHover, Theme.StripActive);
         sideNewTab = new QuietRow("New tab", NewTab);
@@ -340,7 +356,7 @@ sealed class BrowserWindow : Form
         maxBtn.BringToFront();
         closeBtn.BringToFront();
 
-        SetOrientation(true);
+        SetOrientation(settings.VerticalTabs, persistSettings: false);
         UpdateNavButtons();
 
         address.Input.KeyDown += (_, e) => {
@@ -348,13 +364,13 @@ sealed class BrowserWindow : Form
             e.SuppressKeyPress = true;
             _ = Go(address.Input.Text);
         };
-        sleepTimer.Tick += (_, _) => _ = SleepIdleTabs(IdleSleepThreshold);
+        sleepTimer.Tick += (_, _) => { if (settings.SleepingTabsEnabled) _ = SleepIdleTabs(IdleSleepThreshold); };
         sleepTimer.Start();
         Activated += (_, _) => SetCaptionWindowActive(true);
         Deactivate += (_, _) => { ClearCaptionInteraction(); SetCaptionWindowActive(false); };
         Load += async (_, _) => await Start();
         FormClosing += (_, _) => SaveSession();
-        FormClosed += (_, _) => { closed = true; pending?.Cancel(); updateCts?.Cancel(); sleepTimer.Stop(); sleepTimer.Dispose(); };
+        FormClosed += (_, _) => { closed = true; settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); sleepTimer.Stop(); sleepTimer.Dispose(); };
     }
 
     int S(int px) => LogicalToDeviceUnits(px);
@@ -690,9 +706,10 @@ sealed class BrowserWindow : Form
         backBtn.SetBounds(0, y, btn, btn);
         forwardBtn.SetBounds(btn + gap, y, btn, btn);
         reloadBtn.SetBounds((btn + gap) * 2, y, btn, btn);
-        layoutBtn.SetBounds(w - btn, y, btn, btn);
-        shareBtn.SetBounds(w - btn * 2 - gap, y, btn, btn);
-        if (updateBtn.Visible) updateBtn.SetBounds(w - btn * 3 - gap * 2, y, btn, btn);
+        var rx = w - btn;
+        settingsBtn.SetBounds(rx, y, btn, btn);
+        if (shareBtn.Visible) { rx -= btn + gap; shareBtn.SetBounds(rx, y, btn, btn); }
+        if (updateBtn.Visible) { rx -= btn + gap; updateBtn.SetBounds(rx, y, btn, btn); }
     }
 
     void LayoutTopStrip()
@@ -712,13 +729,14 @@ sealed class BrowserWindow : Form
         reloadBtn.SetBounds(x, yBtn, btn, btn); x += btn + S(8);
 
         var captionW = S(46) * 3;
-        var rightCount = updateBtn.Visible ? 3 : 2;
-        var rightW = btn * rightCount + gap * (rightCount - 1);
+        var rightBtns = new List<IconButton>(3);
+        if (updateBtn.Visible) rightBtns.Add(updateBtn);
+        if (shareBtn.Visible) rightBtns.Add(shareBtn);
+        rightBtns.Add(settingsBtn);
+        var rightW = btn * rightBtns.Count + gap * (rightBtns.Count - 1);
         var rightStart = w - captionW - S(8) - rightW;
         var rx = rightStart;
-        if (updateBtn.Visible) { updateBtn.SetBounds(rx, yBtn, btn, btn); rx += btn + gap; }
-        layoutBtn.SetBounds(rx, yBtn, btn, btn);
-        shareBtn.SetBounds(rx + btn + gap, yBtn, btn, btn);
+        foreach (var rb in rightBtns) { rb.SetBounds(rx, yBtn, btn, btn); rx += btn + gap; }
 
         var maxAddr = Math.Max(0, rightStart - x - S(8) - btn - S(8));
         var addrW = Math.Min(Math.Clamp((w - pad * 2) * 26 / 100, S(160), S(340)), maxAddr);
@@ -818,7 +836,7 @@ sealed class BrowserWindow : Form
                 if (closed) return;
                 if (selected?.Url is null) address.FocusInput(); else selected.View?.Focus(); // a focused address bar ignores redirects
                 ExitCode = 0;
-                if (!noUpdateCheck) _ = CheckForUpdateAsync();
+                if (!noUpdateCheck && settings.AutoUpdateCheck) _ = CheckForUpdateAsync();
             }
         }
         catch (Exception ex)
@@ -865,7 +883,11 @@ sealed class BrowserWindow : Form
         sidebar.Enabled = topStrip.Enabled = false;
         try
         {
-            if (state is not null && state.Vertical != vertical) SetOrientation(state.Vertical);
+            if (!settingsExisted && state is not null && state.Vertical != vertical)
+            {
+                settings = settings with { VerticalTabs = state.Vertical };
+                SetOrientation(state.Vertical, persistSettings: false);
+            }
             if (state is not { Tabs.Length: > 0 }) await Open();
             else
             {
@@ -923,13 +945,17 @@ sealed class BrowserWindow : Form
                 core.Settings.IsPasswordAutosaveEnabled = false;
                 core.Settings.IsGeneralAutofillEnabled = false;
                 core.Settings.AreBrowserAcceleratorKeysEnabled = true;
-                var blocked = await Shield.AttachAsync(
+                if (core.Profile is not null)
+                    core.Profile.PreferredColorScheme = SettingsStore.ToWebViewColorScheme(startupTheme);
+                var (blocked, setShieldEnabled) = await Shield.AttachAsync(
                     core,
                     environment!,
                     () => !view.IsDisposed && Uri.TryCreate(core.Source, UriKind.Absolute, out var u) ? u : null,
-                    () => tab.PendingPageUri);
+                    () => tab.PendingPageUri,
+                    () => settings.BlockingEnabled);
                 if (closed || tab.Closed || view.IsDisposed) { CleanupView(view); return; }
                 tab.BlockedCount = blocked;
+                tab.SetShieldEnabledAsync = setShieldEnabled;
                 var recentCleaned = new List<(string Url, long At)>(8);
                 void TrackNavigation(CoreWebView2NavigationStartingEventArgs e)
                 {
@@ -943,7 +969,7 @@ sealed class BrowserWindow : Form
                         else { tab.ActiveNavigationId = e.NavigationId; tab.PendingPageUri = null; }
                         return;
                     }
-                    if (e.NavigationKind is CoreWebView2NavigationKind.BackOrForward or CoreWebView2NavigationKind.Reload)
+                    if (!settings.CleanLinksEnabled || e.NavigationKind is CoreWebView2NavigationKind.BackOrForward or CoreWebView2NavigationKind.Reload)
                     {
                         TrackNavigation(e);
                         return;
@@ -1018,7 +1044,7 @@ sealed class BrowserWindow : Form
         opened.Add(tab);
         SelectTab(tab);
         if (target is null) core.NavigateToString(Home);
-        else core.Navigate(CleanLink.Clean(target));
+        else core.Navigate(settings.CleanLinksEnabled ? CleanLink.Clean(target) : target);
         SaveSession();
         return tab;
     }
@@ -1028,7 +1054,7 @@ sealed class BrowserWindow : Form
     {
         var target = Resolve(text);
         if (target is null) return Task.CompletedTask;
-        target = CleanLink.Clean(target);
+        if (settings.CleanLinksEnabled) target = CleanLink.Clean(target);
         if (selected is not { } tab) return OpenInteractive(target);
         if (tab.View is { IsDisposed: false, CoreWebView2: { } core })
         {
@@ -1077,7 +1103,11 @@ sealed class BrowserWindow : Form
             view.BringToFront();
             if (view.CoreWebView2 is { } core)
             {
-                if (core.IsSuspended) core.Resume();
+                if (core.IsSuspended)
+                {
+                    core.Resume();
+                    if (!settings.BlockingEnabled) _ = tab.SetShieldEnabledAsync(false);
+                }
                 core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal;
             }
             if (tab.PendingUrl is { } url)
@@ -1155,7 +1185,7 @@ sealed class BrowserWindow : Form
 
     List<BrowserTab> DisplayTabs() => [.. opened.OrderByDescending(t => t.Pinned)];
 
-    void SetOrientation(bool sidebarMode)
+    void SetOrientation(bool sidebarMode, bool persistSettings = true)
     {
         vertical = sidebarMode;
         SuspendLayout();
@@ -1163,13 +1193,13 @@ sealed class BrowserWindow : Form
         var hover = sidebarMode ? Theme.SideHover : Theme.StripHover;
         var activeFill = sidebarMode ? Theme.SideActive : Theme.StripActive;
 
-        foreach (var b in new[] { backBtn, forwardBtn, reloadBtn, layoutBtn, shareBtn, updateBtn })
+        foreach (var b in new[] { backBtn, forwardBtn, reloadBtn, shareBtn, updateBtn, settingsBtn })
             b.SetSurface(surface, hover, activeFill);
         address.SetSurface(surface, hover);
 
         if (sidebarMode)
         {
-            sideTopBand.Controls.AddRange([backBtn, forwardBtn, reloadBtn, updateBtn, shareBtn, layoutBtn]);
+            sideTopBand.Controls.AddRange([backBtn, forwardBtn, reloadBtn, updateBtn, shareBtn, settingsBtn]);
             sideAddressWrap.Controls.Add(address);
             ApplyChromeVisibility();
             LayoutSideTopBand();
@@ -1178,12 +1208,19 @@ sealed class BrowserWindow : Form
         else
         {
             stripScroll = 0;
-            topStrip.Controls.AddRange([backBtn, forwardBtn, reloadBtn, address, updateBtn, shareBtn, layoutBtn]);
+            topStrip.Controls.AddRange([backBtn, forwardBtn, reloadBtn, address, updateBtn, shareBtn, settingsBtn]);
             stripTabs.SendToBack();
             ApplyChromeVisibility();
         }
         ResumeLayout(true);
         RebuildTabs();
+        if (persistSettings && (settings.VerticalTabs != sidebarMode || !settingsExisted))
+        {
+            settings = settings with { VerticalTabs = sidebarMode };
+            settingsExisted = true;
+            SaveSettings();
+            settingsDialog?.SyncFrom(settings);
+        }
         SaveSession();
     }
 
@@ -1386,6 +1423,7 @@ sealed class BrowserWindow : Form
             case Keys.Control | Keys.W: CloseCurrent(); return true;
             case Keys.Control | Keys.Shift | Keys.T: ReopenClosedTab(); return true;
             case Keys.Control | Keys.Shift | Keys.S: SetOrientation(!vertical); return true;
+            case Keys.Control | Keys.Oemcomma: OpenSettings(); return true;
             case Keys.Alt | Keys.Left: GoBack(); return true;
             case Keys.Alt | Keys.Right: GoForward(); return true;
             case Keys.Control | Keys.R:
@@ -1408,9 +1446,83 @@ sealed class BrowserWindow : Form
         return base.ProcessCmdKey(ref msg, keyData);
     }
 
+    void SaveSettings()
+    {
+        if (closed) return;
+        try { SettingsStore.Save(settingsFile, settings); }
+        catch { }
+    }
+
+    void OpenSettings()
+    {
+        if (closed || IsDisposed) return;
+        if (settingsDialog is { IsDisposed: false })
+        {
+            if (settingsDialog.WindowState == FormWindowState.Minimized)
+                settingsDialog.WindowState = FormWindowState.Normal;
+            settingsDialog.Activate();
+            return;
+        }
+        settingsDialog = new SettingsDialog(settings, noUpdateCheck, ApplySettings, ClearBrowsingDataAsync);
+        settingsDialog.FormClosed += (_, _) => { settingsDialog = null; };
+        settingsDialog.Show(this);
+    }
+
+    Task ApplyBlockingAsync(bool enabled) =>
+        Task.WhenAll(opened.ToArray()
+            .Where(t => !t.Closed && t.View is { IsDisposed: false })
+            .Select(t => t.SetShieldEnabledAsync(enabled)));
+
+    void ApplySettings(AppSettings next)
+    {
+        var prev = settings;
+        settings = next;
+        settingsExisted = true;
+        SaveSettings();
+
+        if (next.VerticalTabs != vertical)
+            SetOrientation(next.VerticalTabs, persistSettings: false);
+
+        if (next.ShareEnabled != prev.ShareEnabled)
+        {
+            shareBtn.Visible = next.ShareEnabled;
+            if (!next.ShareEnabled) pending?.Cancel();
+            if (vertical) LayoutSideTopBand();
+            else LayoutTopStrip();
+        }
+
+        if (next.BlockingEnabled != prev.BlockingEnabled)
+            _ = ApplyBlockingAsync(next.BlockingEnabled);
+
+        if (!next.SleepingTabsEnabled && prev.SleepingTabsEnabled)
+        {
+            foreach (var tab in opened.ToArray())
+                if (!tab.Closed && tab.View is { IsDisposed: false, CoreWebView2: { IsSuspended: true } c })
+                    c.Resume();
+        }
+
+        if (!next.AutoUpdateCheck && prev.AutoUpdateCheck && !updating)
+            updateCts?.Cancel();
+    }
+
+    async Task ClearBrowsingDataAsync()
+    {
+        var profile = opened
+            .Select(t => t.View is { IsDisposed: false } v ? v.CoreWebView2?.Profile : null)
+            .FirstOrDefault(p => p is not null);
+        if (profile is null && selected is not null)
+        {
+            await EnsureView(selected);
+            profile = selected.View is { IsDisposed: false } v ? v.CoreWebView2?.Profile : null;
+        }
+        if (profile is null)
+            throw new InvalidOperationException("Browser profile is not ready yet.");
+        await profile.ClearBrowsingDataAsync();
+    }
+
     async Task SharePage()
     {
-        if (selected is null || busy) return;
+        if (!settings.ShareEnabled || selected is null || busy) return;
         var tab = selected;
         if (tab.View is not { IsDisposed: false, CoreWebView2: { } core } || !PageHandoff.Allowed(core.Source))
         {
@@ -1632,7 +1744,7 @@ sealed class BrowserWindow : Form
 
     internal async Task SleepIdleTabs(TimeSpan threshold)
     {
-        if (closed) return;
+        if (closed || !settings.SleepingTabsEnabled) return;
         var now = Environment.TickCount64;
         var minAgeMs = (long)Math.Max(0, threshold.TotalMilliseconds);
         foreach (var tab in opened.ToArray())
@@ -1788,7 +1900,7 @@ sealed class BrowserWindow : Form
         SetOrientation(false);
         PerformLayout();
         var horizontal = CheckHorizontalLayout();
-        var stripEmptyHit = HitTestAt(topStrip.PointToScreen(new Point((stripNewTabBtn.Right + layoutBtn.Left) / 2, topStrip.Height / 2)));
+        var stripEmptyHit = HitTestAt(topStrip.PointToScreen(new Point((stripNewTabBtn.Right + shareBtn.Left) / 2, topStrip.Height / 2)));
         SetOrientation(true);
         PerformLayout();
         var orientations = horizontal && CheckVerticalLayout();
@@ -1835,15 +1947,15 @@ sealed class BrowserWindow : Form
         var winClient = ClientRectangle;
         var stripRect = BoundsInForm(stripTabs);
         var plusRect = BoundsInForm(stripNewTabBtn);
-        var layoutRect = BoundsInForm(layoutBtn);
+        var settingsRect = BoundsInForm(settingsBtn);
         var shareRect = BoundsInForm(shareBtn);
         var minRect = minBtn.Bounds;
         var maxRect = maxBtn.Bounds;
         var closeRect = closeBtn.Bounds;
-        var chromeButtons = new[] { plusRect, layoutRect, shareRect, minRect, maxRect, closeRect };
+        var chromeButtons = new[] { plusRect, settingsRect, shareRect, minRect, maxRect, closeRect };
         var stripOverflowSafe = chromeButtons.All(r => r.Width > 0 && r.Height > 0 && winClient.Contains(r) && !stripRect.IntersectsWith(r))
-            && !plusRect.IntersectsWith(layoutRect) && !plusRect.IntersectsWith(shareRect)
-            && topStrip.Controls.GetChildIndex(layoutBtn) < topStrip.Controls.GetChildIndex(stripTabs)
+            && !plusRect.IntersectsWith(settingsRect) && !plusRect.IntersectsWith(shareRect)
+            && topStrip.Controls.GetChildIndex(settingsBtn) < topStrip.Controls.GetChildIndex(stripTabs)
             && topStrip.Controls.GetChildIndex(shareBtn) < topStrip.Controls.GetChildIndex(stripTabs)
             && Controls.GetChildIndex(minBtn) < Controls.GetChildIndex(topStrip);
         var firstStripPill = stripTabs.Controls.OfType<TabPill>().First();
@@ -1984,6 +2096,75 @@ sealed class BrowserWindow : Form
         CloseTab(loopTab);
 
         var updaterSelfCheck = Updater.SelfCheck();
+        var settingsRoundTrip = SettingsStore.SelfCheck(Path.GetDirectoryName(settingsFile)!);
+        var phosphorLoaded = Theme.PhosphorLoaded;
+        var iconFontFamily = Theme.IconFont.FontFamily.Name;
+        var captionFontFamily = Theme.CaptionIconFont.FontFamily.Name;
+
+        OpenSettings();
+        var dlg1 = settingsDialog;
+        OpenSettings();
+        var dlg2 = settingsDialog;
+        var settingsDialogOk = dlg1 is { IsDisposed: false, Visible: true }
+            && ReferenceEquals(dlg1, dlg2)
+            && dlg1.AccessibleName == "Settings"
+            && settingsBtn.AccessibleName == "Settings";
+        dlg1?.Close();
+
+        ApplySettings(settings with { ShareEnabled = false });
+        var shareHiddenWhenOff = !shareBtn.Visible;
+        ApplySettings(settings with { ShareEnabled = true });
+        var shareToggleWorks = shareHiddenWhenOff && shareBtn.Visible;
+
+        // Verify blocking toggle: off lets a fixture ad request through and leaves #ad visible; back on blocks and hides it.
+        ApplySettings(settings with { BlockingEnabled = false });
+        await ApplyBlockingAsync(false);
+        var adsToggleTab = await Open();
+        var adsToggleCore = adsToggleTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Ads toggle tab view is not ready.");
+        adsToggleCore.WebResourceRequested += (_, e) => {
+            if (e.Response is null && e.Request.Uri.Contains("doubleclick.net", StringComparison.OrdinalIgnoreCase))
+                e.Response = environment!.CreateWebResourceResponse(null, 200, "FixtureOK", "Access-Control-Allow-Origin: *");
+        };
+        adsToggleTab.Loaded = false;
+        adsToggleCore.Navigate(fixture + "/ads");
+        await WaitForLoad(adsToggleTab);
+        var adOffRaw = "null";
+        var adOffWatch = Stopwatch.StartNew();
+        while (adOffWatch.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            adOffRaw = await adsToggleCore.ExecuteScriptAsync("window.__adStatus ?? null");
+            if (adOffRaw != "null") break;
+            await Task.Delay(50);
+        }
+        using var adOffDoc = JsonDocument.Parse(adOffRaw);
+        var adStatusWhenBlockingOff = adOffDoc.RootElement.Clone();
+        var adVisibleWhenBlockingOff = await adsToggleCore.ExecuteScriptAsync("getComputedStyle(document.getElementById('ad')).display !== 'none'") == "true";
+
+        ApplySettings(settings with { BlockingEnabled = true });
+        await ApplyBlockingAsync(true);
+        var adHiddenAfterBlockingOn = await adsToggleCore.ExecuteScriptAsync("getComputedStyle(document.getElementById('ad')).display === 'none'") == "true";
+        await adsToggleCore.ExecuteScriptAsync("window.__reblockStatus = null; fetch('http://doubleclick.net/pixel.js').then(r => window.__reblockStatus = r.status).catch(() => window.__reblockStatus = 'error');");
+        var adOnRaw = "null";
+        var adOnWatch = Stopwatch.StartNew();
+        while (adOnWatch.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            adOnRaw = await adsToggleCore.ExecuteScriptAsync("window.__reblockStatus ?? null");
+            if (adOnRaw != "null") break;
+            await Task.Delay(50);
+        }
+        using var adOnDoc = JsonDocument.Parse(adOnRaw);
+        var adStatusAfterBlockingOn = adOnDoc.RootElement.Clone();
+        CloseTab(adsToggleTab);
+
+        // Verify link cleaning toggle: off keeps utm_source and fbclid params intact.
+        ApplySettings(settings with { CleanLinksEnabled = false });
+        var keepUtmUrl = fixture + "/first?id=7&utm_source=keepme&fbclid=keep123#frag";
+        var keepUtmTab = await Open(keepUtmUrl);
+        await WaitForLoad(keepUtmTab);
+        var urlWhenCleanOff = keepUtmTab.View?.CoreWebView2?.Source;
+        CloseTab(keepUtmTab);
+        ApplySettings(settings with { CleanLinksEnabled = true });
+
         var cliFlags = Program.ParseArgs(["--no-update-check"]) is { NoUpdateCheck: true, ProfileDir: null, Smoke: false }
             && Program.ParseArgs(["--profile", @"C:\tmp\p", "--no-update-check"]) is { NoUpdateCheck: true, ProfileDir: @"C:\tmp\p", Smoke: false }
             && Program.ParseArgs(["--no-update-check", "--profile", @"C:\tmp\p"]) is { NoUpdateCheck: true, ProfileDir: @"C:\tmp\p", Smoke: false }
@@ -1996,7 +2177,10 @@ sealed class BrowserWindow : Form
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
             verticalAndHorizontal = orientations, captionHidden, hitTests, maximizeToggles, chromeHiddenWorks,
             stripOverflowSafe, stripWheelScrolled, sideWheelStep, menuDeferredDispose, ncTrackedOnDown, captionNoTooltips,
-            updaterSelfCheck, cliFlags,
+            updaterSelfCheck, settingsRoundTrip, phosphorLoaded, iconFontFamily, captionFontFamily,
+            settingsDialogOk, shareToggleWorks,
+            adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
+            urlWhenCleanOff, cliFlags,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
             rejectsLocalFiles = Resolve("file:///C:/Windows/win.ini") == null && !PageHandoff.Allowed("file:///C:/Windows/win.ini"),
             // Must match RESOLVE in test_smoke.py.
