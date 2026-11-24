@@ -60,6 +60,7 @@ python test_smoke.py publish/browse.exe
 | `Ctrl+9` | Switch to last tab |
 | `Alt+Left` / `Alt+Right` | Back / Forward |
 | `Ctrl+R` or `F5` | Reload |
+| `Ctrl+J` | Show downloads |
 
 ## Updates
 

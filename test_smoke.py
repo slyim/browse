@@ -51,6 +51,10 @@ RESOLVE = {
     'hello world': search('hello world'),
     'how to type http:// links': search('how to type http:// links'),
     'user@example.com': search('user@example.com'),
+    'site:github.com': search('site:github.com'),
+    'std::vector': search('std::vector'),
+    'filetype:pdf': search('filetype:pdf'),
+    'define:x': search('define:x'),
     'javascript:alert(1)': None,
     ' JavaScript:alert(1) ': None,
     'data:text/html,hi': None,
@@ -59,6 +63,9 @@ RESOLVE = {
     'mailto:a@example.com': None,
     'ftp://example.com': None,
     'http://': None,
+    'about:blank': None,
+    'edge://settings': None,
+    'blob:https://example.com/123': None,
     'https://user:pw@example.com': None,
     'user:pw@example.com': None,
     '': None,
@@ -83,10 +90,39 @@ CLEAN_LINK = {
 
 class Fixture(BaseHTTPRequestHandler):
     requested = []
+    post_requests = []
     loop_seq = 0
+
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length') or '0')
+        raw = self.rfile.read(length).decode('utf-8', errors='replace')
+        type(self).post_requests.append((self.path, raw))
+        safe = raw.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        body = f'<!doctype html><title>Post received</title><main id="echo">{safe}</main>'.encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (ConnectionAbortedError, BrokenPipeError):
+            pass
 
     def do_GET(self):
         type(self).requested.append(self.path)
+        if self.path.startswith('/download/'):
+            filename = self.path.rsplit('/', 1)[-1]
+            data = b'MZ-fake-smoke-test' if filename.endswith('.exe') else b'hello-download'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except (ConnectionAbortedError, BrokenPipeError):
+                pass
+            return
         if self.path == '/favicon.ico':
             self.send_response(200)
             self.send_header('Content-Type', 'image/png')
@@ -141,6 +177,35 @@ class Fixture(BaseHTTPRequestHandler):
                 '<!doctype html><title>Popup child</title>'
                 '<script>const m=new URLSearchParams(location.search).get(\'msg\')||\'ok\';'
                 'if(window.opener)window.opener.postMessage(m,\'*\');window.close();</script>'
+            ).encode()
+        elif self.path.startswith('/post-form'):
+            body = (
+                '<!doctype html><title>Post form</title>'
+                '<form id="f" method="post" action="/post-target?utm_source=email&id=1">'
+                '<input name="msg" value="hello-post"></form>'
+            ).encode()
+        elif self.path.startswith('/blob-page'):
+            body = (
+                '<!doctype html><title>Blob page</title>'
+                '<button id="open-blob" style="position:fixed;left:0;top:0;width:120px;height:40px"'
+                ' onclick="openBlob()">Blob</button>'
+                '<script>function openBlob(){'
+                'window.__blobClicked=true;'
+                'const b=new Blob(["<!doctype html><title>Blob doc</title><main id=b>blob-ok</main>"],{type:"text/html"});'
+                'window.__blobUrl=URL.createObjectURL(b);'
+                'window.open(window.__blobUrl,"blob_win");'
+                '}</script>'
+            ).encode()
+        elif self.path.startswith('/download-page'):
+            body = (
+                '<!doctype html><title>Download page</title>'
+                '<a id="dl-exe" href="/download/tool.exe" download="tool.exe"'
+                ' style="position:fixed;left:0;top:0;width:120px;height:40px;display:block">Download</a>'
+            ).encode()
+        elif self.path.startswith('/geo'):
+            body = (
+                '<!doctype html><title>Geo</title>'
+                '<script>navigator.geolocation.getCurrentPosition(()=>{},()=>{});</script>'
             ).encode()
         elif self.path.startswith('/ads'):
             body = (
@@ -273,6 +338,35 @@ def run():
                     'keyboardReorder': True,
                     'sessionOrderMatches': True,
                 }, report.get('tabDrag')
+                assert report.get('postClean') == {
+                    'url': base + '/post-target?utm_source=email&id=1',
+                    'echo': 'msg=hello-post',
+                }, report.get('postClean')
+                assert ('/post-target?utm_source=email&id=1', 'msg=hello-post') in Fixture.post_requests, Fixture.post_requests
+                assert report.get('blobUrl') == {
+                    'openedOk': True,
+                    'notShareableOrSaved': True,
+                    'helperOk': True,
+                }, report.get('blobUrl')
+                assert report.get('permissions') == {
+                    'geoObserved': True,
+                    'geoSavesInProfileFalse': True,
+                    'policyOk': True,
+                }, report.get('permissions')
+                assert report.get('downloads') == {
+                    'bgCancelled': True,
+                    'exeDenied': True,
+                    'exeAllowed': True,
+                    'ctrlJOpened': True,
+                    'extCheckOk': True,
+                }, report.get('downloads')
+                assert report.get('processCrash') == {
+                    'sawRenderExit': True,
+                    'navReset': True,
+                    'recoveredAlive': True,
+                    'tryCoreGuards': True,
+                    'recoveryPreservesUrl': True,
+                }, report.get('processCrash')
                 favicon_files = list((path / 'Favicons').glob('*.png'))
                 assert len(favicon_files) == 1, favicon_files
                 assert favicon_files[0].read_bytes().startswith(b'\x89PNG\r\n\x1a\n')

@@ -200,6 +200,8 @@ sealed class BrowserWindow : Form
     bool restoring;
     bool busy;
     bool closed;
+    bool recoveringBrowser;
+    Func<string, string, bool>? confirmDownloadOverride;
     long envMs;
     long drawTabsTicks;
     public int ExitCode { get; private set; } = 1;
@@ -286,7 +288,10 @@ sealed class BrowserWindow : Form
         public string? PendingUrl { get; set; } = saved?.Url;
         public string? SavedUrl { get; set; } = saved?.Url;
         public string? SavedTitle { get; set; } = saved?.Title;
+        public string? LastUrl { get; set; }
+        public string? LastTitle { get; set; }
         public bool Loaded { get; set; }
+        public bool CrashRecovered { get; set; }
         public long? HiddenSince { get; set; }
         public ulong? ActiveNavigationId { get; set; }
         public Uri? PendingPageUri { get; set; }
@@ -296,9 +301,32 @@ sealed class BrowserWindow : Form
         public bool Navigating => ActiveNavigationId is not null;
         public Func<int> BlockedCount { get; set; } = () => 0;
         public Func<bool, Task> SetShieldEnabledAsync { get; set; } = _ => Task.CompletedTask;
-        public string? Url => View is { IsDisposed: false, CoreWebView2.Source: { } s } && PageHandoff.Allowed(s) ? s : SavedUrl;
-        public string Title => Loaded && View is { IsDisposed: false, CoreWebView2.DocumentTitle: { } t } && !string.IsNullOrWhiteSpace(t) && t != "about:blank"
-            ? t : (string.IsNullOrWhiteSpace(SavedTitle) ? "New tab" : SavedTitle);
+        public string? Url
+        {
+            get
+            {
+                try { if (View is { IsDisposed: false, CoreWebView2.Source: { } s } && PageHandoff.Allowed(s)) return s; }
+                catch (Exception ex) when (ex is COMException or InvalidOperationException) { }
+                return SavedUrl ?? LastUrl;
+            }
+        }
+        public string Title
+        {
+            get
+            {
+                if (Loaded)
+                {
+                    try
+                    {
+                        if (View is { IsDisposed: false, CoreWebView2.DocumentTitle: { } t } && !string.IsNullOrWhiteSpace(t) && t != "about:blank")
+                            return t;
+                    }
+                    catch (Exception ex) when (ex is COMException or InvalidOperationException) { }
+                }
+                var fallback = string.IsNullOrWhiteSpace(SavedTitle) ? LastTitle : SavedTitle;
+                return string.IsNullOrWhiteSpace(fallback) ? "New tab" : fallback;
+            }
+        }
     }
 
     public BrowserWindow(string sessionFile, string settingsFile, AppSettings initialSettings, bool settingsExisted, Task<CoreWebView2Environment> envTask, Task<SessionState?>? sessionTask, bool canSaveSession, string? smokeReport, string? fixture, string? smokePhase = null, bool noUpdateCheck = false, string[]? launchArgs = null, Action? releaseSessionLock = null)
@@ -841,20 +869,22 @@ sealed class BrowserWindow : Form
         ScrollStripBy(-e.Delta / 3);
     }
 
-    void GoBack() { if (selected is { View: { IsDisposed: false, CanGoBack: true } view }) view.GoBack(); }
-    void GoForward() { if (selected is { View: { IsDisposed: false, CanGoForward: true } view }) view.GoForward(); }
+    void GoBack() => TryCore(() => { if (selected is { View: { IsDisposed: false, CanGoBack: true } view }) view.GoBack(); });
+    void GoForward() => TryCore(() => { if (selected is { View: { IsDisposed: false, CanGoForward: true } view }) view.GoForward(); });
     void ReloadCurrent()
     {
         if (selected is not { } tab) return;
-        if (tab.View is not { } view) { if (tab.Url is not null) _ = EnsureViewAndNavigate(tab); return; }
-        if (!tab.Loaded && tab.SavedUrl is { } url) view.CoreWebView2?.Navigate(url); // first load never committed
-        else if (tab.Url is not null && !view.IsDisposed) view.Reload();
+        if (tab.View is not { IsDisposed: false } view) { if (tab.Url is not null) _ = EnsureViewAndNavigate(tab); return; }
+        TryCore(() => {
+            if (!tab.Loaded && tab.SavedUrl is { } url) view.CoreWebView2?.Navigate(url); // first load never committed
+            else if (tab.Url is not null) view.Reload();
+        });
     }
 
     void UpdateNavButtons()
     {
-        backBtn.Enabled = selected is { View: { IsDisposed: false, CanGoBack: true } };
-        forwardBtn.Enabled = selected is { View: { IsDisposed: false, CanGoForward: true } };
+        backBtn.Enabled = TryCore(() => selected is { View: { IsDisposed: false, CanGoBack: true } });
+        forwardBtn.Enabled = TryCore(() => selected is { View: { IsDisposed: false, CanGoForward: true } });
         reloadBtn.Enabled = selected is { Url: not null };
     }
 
@@ -884,6 +914,13 @@ sealed class BrowserWindow : Form
         }
     }
 
+    static readonly HashSet<string> RefusedSchemes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "javascript", "vbscript", "data", "blob", "file", "about", "edge", "chrome",
+        "mailto", "tel", "sms", "ftp", "ftps", "ws", "wss", "view-source", "filesystem",
+        "ms-settings", "ms-windows-store", "intent", "urn", "magnet", "http", "https",
+    };
+
     public static string? Resolve(string raw)
     {
         var text = raw.Trim();
@@ -891,13 +928,26 @@ sealed class BrowserWindow : Form
         if (PageHandoff.Allowed(text)) return new Uri(text).AbsoluteUri;
         if (!text.Any(char.IsWhiteSpace))
         {
-            if (Uri.TryCreate("https://" + text, UriKind.Absolute, out var url) && url.UserInfo.Length == 0 && IsHost(url, text))
-                return url.IsLoopback ? new Uri("http://" + text).AbsoluteUri : url.AbsoluteUri;
-            // Any other explicit scheme (javascript:, file:, C:\, user:pw@…) is refused rather than searched; "name:123" stays a search.
-            var colon = text.IndexOf(':');
-            if (colon > 0 && Uri.CheckSchemeName(text[..colon]) && !(colon + 1 < text.Length && char.IsAsciiDigit(text[colon + 1]))) return null;
+            if (Uri.TryCreate("https://" + text, UriKind.Absolute, out var url))
+            {
+                if (url.UserInfo.Length == 0 && IsHost(url, text))
+                    return url.IsLoopback ? new Uri("http://" + text).AbsoluteUri : url.AbsoluteUri;
+                if (url.UserInfo.Contains(':')) return null;
+            }
+            if (IsRefusedAddress(text)) return null;
         }
         return "https://duckduckgo.com/?q=" + Uri.EscapeDataString(text);
+    }
+
+    static bool IsRefusedAddress(string text)
+    {
+        if (text.StartsWith(@"\\", StringComparison.Ordinal)) return true;
+        if (text.Length >= 3 && char.IsAsciiLetter(text[0]) && text[1] == ':' && text[2] is '\\' or '/') return true;
+        var colon = text.IndexOf(':');
+        if (colon <= 0) return false;
+        var scheme = text[..colon];
+        if (!Uri.CheckSchemeName(scheme)) return false;
+        return text.AsSpan(colon).StartsWith("://", StringComparison.Ordinal) || RefusedSchemes.Contains(scheme);
     }
 
     // Typed text is an address only if it names a real-looking host: a dotted name with a non-numeric last label, localhost, or a literal IP.
@@ -1011,7 +1061,7 @@ sealed class BrowserWindow : Form
                 var (blocked, setShieldEnabled) = await Shield.AttachAsync(
                     core,
                     environment!,
-                    () => !view.IsDisposed && Uri.TryCreate(core.Source, UriKind.Absolute, out var u) ? u : null,
+                    () => TryCore(() => !view.IsDisposed && Uri.TryCreate(core.Source, UriKind.Absolute, out var u) ? u : null),
                     () => tab.PendingPageUri,
                     () => settings.BlockingEnabled);
                 if (closed || tab.Closed || view.IsDisposed) { CleanupView(view); return; }
@@ -1024,14 +1074,22 @@ sealed class BrowserWindow : Form
                     tab.PendingPageUri = Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u : null;
                 }
                 core.NavigationStarting += (_, e) => {
-                    if (!PageHandoff.Allowed(e.Uri))
+                    if (!IsNavigable(e.Uri))
                     {
-                        if (!string.Equals(e.Uri, "about:blank", StringComparison.OrdinalIgnoreCase)) e.Cancel = true;
-                        else { tab.ActiveNavigationId = e.NavigationId; tab.PendingPageUri = null; }
+                        e.Cancel = true;
                         return;
                     }
-                    // Re-navigating a popup can sever window.opener mid-OAuth, so popups are never link-cleaned.
-                    if (!settings.CleanLinksEnabled || tab.IsPopup || e.NavigationKind is CoreWebView2NavigationKind.BackOrForward or CoreWebView2NavigationKind.Reload)
+                    if (!PageHandoff.Allowed(e.Uri))
+                    {
+                        tab.ActiveNavigationId = e.NavigationId;
+                        tab.PendingPageUri = e.Uri.StartsWith("blob:", StringComparison.OrdinalIgnoreCase)
+                            && Uri.TryCreate(e.Uri[5..], UriKind.Absolute, out var blobOrigin)
+                                ? blobOrigin
+                                : null;
+                        return;
+                    }
+                    // Re-navigating a popup can sever window.opener mid-OAuth, and Navigate() would turn a POST into a bodyless GET.
+                    if (!settings.CleanLinksEnabled || tab.IsPopup || IsPostNavigation(e) || e.NavigationKind is CoreWebView2NavigationKind.BackOrForward or CoreWebView2NavigationKind.Reload)
                     {
                         TrackNavigation(e);
                         return;
@@ -1050,7 +1108,7 @@ sealed class BrowserWindow : Form
                         recentCleaned.Add((cleaned, now));
                         e.Cancel = true;
                         if (!closed && !IsDisposed && IsHandleCreated)
-                            BeginInvoke(() => { if (!closed && !IsDisposed && !tab.Closed && !view.IsDisposed) view.CoreWebView2?.Navigate(cleaned); });
+                            BeginInvoke(() => { if (!closed && !IsDisposed && !tab.Closed && !view.IsDisposed) TryCore(() => view.CoreWebView2?.Navigate(cleaned)); });
                         return;
                     }
                     TrackNavigation(e);
@@ -1061,7 +1119,41 @@ sealed class BrowserWindow : Form
                         tab.ActiveNavigationId = null;
                         tab.PendingPageUri = null;
                     }
+                    if (e.IsSuccess) tab.CrashRecovered = false;
                 };
+                core.PermissionRequested += (_, e) => {
+                    var (state, savesInProfile) = DecidePermission(e.PermissionKind, e.IsUserInitiated);
+                    e.SavesInProfile = savesInProfile;
+                    if (state != CoreWebView2PermissionState.Default) e.State = state;
+                };
+                core.DownloadStarting += (_, e) => {
+                    if (tab != selected || closed || tab.Closed)
+                    {
+                        e.Cancel = true;
+                        return;
+                    }
+                    var filePath = e.ResultFilePath;
+                    if (!IsDangerousDownload(filePath)) return;
+                    if (IsDisposed || !IsHandleCreated) { e.Cancel = true; return; }
+                    var deferral = e.GetDeferral();
+                    BeginInvoke(() => {
+                        try
+                        {
+                            if (closed || tab.Closed || IsDisposed || tab != selected)
+                            {
+                                e.Cancel = true;
+                                return;
+                            }
+                            var name = Path.GetFileName(filePath);
+                            if (string.IsNullOrEmpty(name)) name = filePath;
+                            var host = Uri.TryCreate(e.DownloadOperation?.Uri, UriKind.Absolute, out var u) && u.IdnHost.Length > 0 ? u.IdnHost : "this site";
+                            e.Cancel = !ConfirmDangerousDownload(name, host);
+                        }
+                        catch { e.Cancel = true; }
+                        finally { deferral.Complete(); }
+                    });
+                };
+                core.ProcessFailed += (_, e) => HandleProcessFailed(tab, view, e.ProcessFailedKind);
                 core.LaunchingExternalUriScheme += (_, e) => e.Cancel = true;
                 core.NewWindowRequested += (_, e) => {
                     e.Handled = true;
@@ -1075,7 +1167,23 @@ sealed class BrowserWindow : Form
                 };
                 core.SourceChanged += (_, _) => {
                     if (!opened.Contains(tab)) return;
-                    if (PageHandoff.Allowed(core.Source)) { tab.Loaded = true; tab.SavedUrl = null; }
+                    var src = TryCore(() => core.Source);
+                    if (src is not null && PageHandoff.Allowed(src))
+                    {
+                        tab.Loaded = true;
+                        tab.SavedUrl = null;
+                        tab.LastUrl = src;
+                    }
+                    else if (src is not null && src.StartsWith("blob:", StringComparison.OrdinalIgnoreCase) && IsNavigable(src))
+                    {
+                        tab.Loaded = true;
+                        tab.SavedUrl = null;
+                        tab.LastUrl = null;
+                    }
+                    else if (src is not null)
+                    {
+                        tab.LastUrl = null;
+                    }
                     if (selected == tab && !address.InputFocused) UpdateAddress();
                     if (selected == tab) { UpdateNavButtons(); UpdateWindowTitle(); }
                     RefreshTab(tab);
@@ -1084,7 +1192,11 @@ sealed class BrowserWindow : Form
                 core.HistoryChanged += (_, _) => { if (selected == tab) UpdateNavButtons(); };
                 core.DocumentTitleChanged += (_, _) => {
                     if (!opened.Contains(tab)) return;
-                    if (tab.Loaded) tab.SavedTitle = null; // the restored title must not stick to later pages
+                    if (tab.Loaded)
+                    {
+                        tab.SavedTitle = null; // the restored title must not stick to later pages
+                        tab.LastTitle = TryCore(() => core.DocumentTitle);
+                    }
                     if (selected == tab) UpdateWindowTitle();
                     RefreshTab(tab);
                     SaveSession();
@@ -1101,10 +1213,179 @@ sealed class BrowserWindow : Form
         }
     }
 
+    string ProfileDir => Path.Combine(Path.GetDirectoryName(sessionFile)!, "WebView");
+
+    static bool TryCore(Action action)
+    {
+        try { action(); return true; }
+        catch (Exception ex) when (ex is COMException or InvalidOperationException) { return false; }
+    }
+
+    static T TryCore<T>(Func<T> func, T fallback = default!)
+    {
+        try { return func(); }
+        catch (Exception ex) when (ex is COMException or InvalidOperationException) { return fallback; }
+    }
+
+    internal static bool IsNavigable(string? uri)
+    {
+        if (string.IsNullOrEmpty(uri)) return false;
+        if (PageHandoff.Allowed(uri)) return true;
+        if (string.Equals(uri, "about:blank", StringComparison.OrdinalIgnoreCase)) return true;
+        return uri.StartsWith("blob:", StringComparison.OrdinalIgnoreCase)
+            && uri.Length > 5 && !char.IsWhiteSpace(uri[5])
+            && PageHandoff.Allowed(uri[5..]);
+    }
+
+    static bool IsPostNavigation(CoreWebView2NavigationStartingEventArgs e) =>
+        e.RequestHeaders is { } h && (h.Contains("Content-Type") || h.Contains("Content-Length"));
+
+    internal static (CoreWebView2PermissionState State, bool SavesInProfile) DecidePermission(
+        CoreWebView2PermissionKind kind, bool isUserInitiated)
+    {
+        if (!isUserInitiated && kind is
+            CoreWebView2PermissionKind.ClipboardRead or
+            CoreWebView2PermissionKind.MultipleAutomaticDownloads or
+            CoreWebView2PermissionKind.LocalFonts or
+            CoreWebView2PermissionKind.WindowManagement or
+            CoreWebView2PermissionKind.MidiSystemExclusiveMessages)
+            return (CoreWebView2PermissionState.Deny, false);
+
+        var savesInProfile = kind is not (
+            CoreWebView2PermissionKind.Camera or
+            CoreWebView2PermissionKind.Microphone or
+            CoreWebView2PermissionKind.Geolocation or
+            CoreWebView2PermissionKind.FileReadWrite or
+            CoreWebView2PermissionKind.ClipboardRead);
+
+        return (CoreWebView2PermissionState.Default, savesInProfile);
+    }
+
+    static readonly HashSet<string> DangerousDownloadExtensions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".exe", ".msi", ".msix", ".appx", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jse",
+        ".wsf", ".scr", ".com", ".lnk", ".reg", ".hta", ".cpl", ".dll", ".jar",
+    };
+
+    internal static bool IsDangerousDownload(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        return DangerousDownloadExtensions.Contains(Path.GetExtension(path.TrimEnd(' ', '.')));
+    }
+
+    bool ConfirmDangerousDownload(string fileName, string host) =>
+        confirmDownloadOverride is not null
+            ? confirmDownloadOverride(fileName, host)
+            : MessageBox.Show(this,
+                $"Allow downloading \"{fileName}\" from {host}?\n\nExecutable and script files can harm your computer. Only download files you trust.",
+                "Confirm download",
+                MessageBoxButtons.OKCancel,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) == DialogResult.OK;
+
+    void OpenDownloads()
+    {
+        if (selected is not { View: { IsDisposed: false, CoreWebView2: { } core } }) return;
+        TryCore(() => core.OpenDefaultDownloadDialog());
+    }
+
+    void ResetTabForRecovery(BrowserTab tab, bool preserveCrashFlag = false)
+    {
+        var url = tab.Url;
+        var title = tab.Title;
+        tab.SavedUrl = url;
+        tab.PendingUrl = url;
+        tab.SavedTitle = string.IsNullOrWhiteSpace(title) || title == "New tab" ? tab.LastTitle : title;
+        tab.Loaded = false;
+        tab.ActiveNavigationId = null;
+        tab.PendingPageUri = null;
+        tab.Suspending = false;
+        if (!preserveCrashFlag) tab.CrashRecovered = false;
+        tab.BlockedCount = () => 0;
+        tab.SetShieldEnabledAsync = _ => Task.CompletedTask;
+        tab.ViewTask = null;
+        if (tab.View is { } oldView)
+        {
+            tab.View = null;
+            CleanupView(oldView);
+        }
+    }
+
+    void RecreateTabView(BrowserTab tab)
+    {
+        if (closed || tab.Closed || IsDisposed || !opened.Contains(tab)) return;
+        ResetTabForRecovery(tab, preserveCrashFlag: true);
+        if (selected == tab && environment is not null) _ = EnsureViewAndNavigate(tab);
+        UpdateNavButtons();
+    }
+
+    void HandleProcessFailed(BrowserTab tab, WebView2 view, CoreWebView2ProcessFailedKind kind)
+    {
+        tab.ActiveNavigationId = null;
+        tab.PendingPageUri = null;
+        if (closed || IsDisposed) return;
+
+        if (kind == CoreWebView2ProcessFailedKind.BrowserProcessExited)
+        {
+            if (recoveringBrowser || !IsHandleCreated) return;
+            recoveringBrowser = true;
+            BeginInvoke(() => _ = RecoverBrowserProcessAsync());
+            return;
+        }
+
+        if (tab.Closed || tab.View != view) return;
+        if (kind is not (CoreWebView2ProcessFailedKind.RenderProcessExited or CoreWebView2ProcessFailedKind.RenderProcessUnresponsive))
+            return;
+        if (tab.CrashRecovered || !IsHandleCreated) return;
+        tab.CrashRecovered = true;
+
+        BeginInvoke(() => {
+            if (closed || tab.Closed || IsDisposed || tab.View != view) return;
+            if (kind == CoreWebView2ProcessFailedKind.RenderProcessExited
+                && !view.IsDisposed && view.CoreWebView2 is { } c
+                && TryCore(() => {
+                    if (!tab.Loaded && tab.SavedUrl is { } saved) c.Navigate(saved);
+                    else c.Reload();
+                }))
+                return;
+            RecreateTabView(tab);
+        });
+    }
+
+    async Task RecoverBrowserProcessAsync()
+    {
+        try
+        {
+            foreach (var t in opened.ToArray()) ResetTabForRecovery(t);
+            environment = null;
+            UpdateNavButtons();
+            UpdateAddress();
+            UpdateWindowTitle();
+
+            CoreWebView2Environment? recreated = null;
+            for (var attempt = 0; attempt < 3 && !closed && !IsDisposed; attempt++)
+            {
+                try
+                {
+                    recreated = await CoreWebView2Environment.CreateAsync(userDataFolder: ProfileDir);
+                    break;
+                }
+                catch when (attempt < 2)
+                {
+                    await Task.Delay(250);
+                }
+            }
+            if (closed || IsDisposed || recreated is null) return;
+            environment = recreated;
+            if (selected is { Closed: false, View: null } active)
+                await EnsureViewAndNavigate(active);
+        }
+        catch { }
+        finally { recoveringBrowser = false; }
+    }
+
     static bool IsPopupAllowed(string? uri) =>
-        string.IsNullOrEmpty(uri)
-        || string.Equals(uri, "about:blank", StringComparison.OrdinalIgnoreCase)
-        || PageHandoff.Allowed(uri);
+        string.IsNullOrEmpty(uri) || IsNavigable(uri);
 
     async Task OpenPopup(BrowserTab opener, CoreWebView2NewWindowRequestedEventArgs e)
     {
@@ -1159,8 +1440,8 @@ sealed class BrowserWindow : Form
         if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return tab;
         opened.Add(tab);
         SelectTab(tab);
-        if (target is null) core.NavigateToString(Home);
-        else core.Navigate(settings.CleanLinksEnabled ? CleanLink.Clean(target) : target);
+        if (target is null) TryCore(() => core.NavigateToString(Home));
+        else TryCore(() => core.Navigate(settings.CleanLinksEnabled ? CleanLink.Clean(target) : target));
         SaveSession();
         return tab;
     }
@@ -1174,7 +1455,7 @@ sealed class BrowserWindow : Form
         if (selected is not { } tab) return OpenInteractive(target);
         if (tab.View is { IsDisposed: false, CoreWebView2: { } core })
         {
-            core.Navigate(target);
+            TryCore(() => core.Navigate(target));
             tab.View.Focus();
             return Task.CompletedTask;
         }
@@ -1208,7 +1489,7 @@ sealed class BrowserWindow : Form
             {
                 prevView.Visible = false;
                 if (prevView.CoreWebView2 is { } prevCore)
-                    prevCore.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low;
+                    TryCore(() => prevCore.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low);
             }
         }
         selected = tab;
@@ -1219,17 +1500,17 @@ sealed class BrowserWindow : Form
             view.BringToFront();
             if (view.CoreWebView2 is { } core)
             {
-                if (core.IsSuspended)
+                if (TryCore(() => core.IsSuspended))
                 {
-                    core.Resume();
+                    TryCore(() => core.Resume());
                     if (!settings.BlockingEnabled) _ = tab.SetShieldEnabledAsync(false);
                 }
-                core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal;
+                TryCore(() => core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal);
             }
             if (tab.PendingUrl is { } url)
             {
                 tab.PendingUrl = null;
-                view.CoreWebView2?.Navigate(url);
+                TryCore(() => view.CoreWebView2?.Navigate(url));
             }
         }
         else _ = EnsureViewAndNavigate(tab);
@@ -1252,18 +1533,22 @@ sealed class BrowserWindow : Form
             {
                 tab.View.Visible = false;
                 tab.HiddenSince ??= Environment.TickCount64;
-                core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low;
+                TryCore(() => core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low);
                 return;
             }
             tab.HiddenSince = null;
             tab.View.Visible = true;
             tab.View.BringToFront();
-            if (core.IsSuspended) core.Resume();
-            core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal;
+            if (TryCore(() => core.IsSuspended)) TryCore(() => core.Resume());
+            TryCore(() => core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal);
             if (tab.PendingUrl is { } url)
             {
                 tab.PendingUrl = null;
-                core.Navigate(url);
+                TryCore(() => core.Navigate(url));
+            }
+            else if (!tab.Loaded && tab.SavedUrl is null)
+            {
+                TryCore(() => core.NavigateToString(Home));
             }
             UpdateNavButtons();
             if (!address.InputFocused) tab.View.Focus();
@@ -1341,8 +1626,8 @@ sealed class BrowserWindow : Form
         opened.AddRange(pinned);
         opened.AddRange(loose);
 
-        if (tab.Pinned && tab.View is { IsDisposed: false, CoreWebView2.IsSuspended: true } v)
-            v.CoreWebView2.Resume();
+        if (tab.Pinned && tab.View is { IsDisposed: false, CoreWebView2: { } vCore } && TryCore(() => vCore.IsSuspended))
+            TryCore(() => vCore.Resume());
 
         SyncTabs();
         SaveSession();
@@ -1914,6 +2199,7 @@ sealed class BrowserWindow : Form
             case Keys.Alt | Keys.Right: GoForward(); return true;
             case Keys.Control | Keys.R:
             case Keys.F5: ReloadCurrent(); return true;
+            case Keys.Control | Keys.J: OpenDownloads(); return true;
         }
         if ((keyData & Keys.Modifiers) == Keys.Control)
         {
@@ -1983,8 +2269,8 @@ sealed class BrowserWindow : Form
         if (!next.SleepingTabsEnabled && prev.SleepingTabsEnabled)
         {
             foreach (var tab in opened.ToArray())
-                if (!tab.Closed && tab.View is { IsDisposed: false, CoreWebView2: { IsSuspended: true } c })
-                    c.Resume();
+                if (!tab.Closed && tab.View is { IsDisposed: false, CoreWebView2: { } c } && TryCore(() => c.IsSuspended))
+                    TryCore(() => c.Resume());
         }
 
         if (!next.AutoUpdateCheck && prev.AutoUpdateCheck && !updating)
@@ -2022,7 +2308,7 @@ sealed class BrowserWindow : Form
         shareBtn.Enabled = false;
         try
         {
-            if (core.IsSuspended) core.Resume();
+            if (TryCore(() => core.IsSuspended)) TryCore(() => core.Resume());
             var snapshot = await PageHandoff.Capture(core);
             if (closed) return;
             if (selected != tab || tab.View is not { IsDisposed: false, CoreWebView2: { } current } || source != current.Source)
@@ -2239,13 +2525,13 @@ sealed class BrowserWindow : Form
             if (tab == selected || tab.Closed || tab.Pinned || tab.Navigating || tab.Suspending) continue;
             if (tab.HiddenSince is not { } hiddenSince || now - hiddenSince < minAgeMs) continue;
             if (tab.View is not { IsDisposed: false, Visible: false, CoreWebView2: { } core }) continue;
-            if (core.IsSuspended || core.IsDocumentPlayingAudio) continue;
+            if (TryCore(() => core.IsSuspended || core.IsDocumentPlayingAudio, true)) continue;
             tab.Suspending = true;
             try
             {
                 await core.TrySuspendAsync();
-                if (!closed && !tab.Closed && (selected == tab || tab.Pinned) && tab.View is { IsDisposed: false, CoreWebView2.IsSuspended: true } v)
-                    v.CoreWebView2.Resume();
+                if (!closed && !tab.Closed && (selected == tab || tab.Pinned) && tab.View is { IsDisposed: false, CoreWebView2: { } vc } && TryCore(() => vc.IsSuspended))
+                    TryCore(() => vc.Resume());
             }
             catch { }
             finally { tab.Suspending = false; }
@@ -2884,6 +3170,233 @@ sealed class BrowserWindow : Form
             sessionOrderMatches,
         };
 
+        // #29: POST form on a utm_* URL keeps its body and is not converted to a GET.
+        var postTab = await Open(fixture + "/post-form");
+        await WaitForLoad(postTab);
+        var postCore = postTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Post tab view is not ready.");
+        await postCore.ExecuteScriptAsync("document.getElementById('f').submit()");
+        var postWait = Stopwatch.StartNew();
+        while (postWait.Elapsed < TimeSpan.FromSeconds(5) && (postTab.Title != "Post received" || postTab.Navigating))
+            await Task.Delay(50);
+        var postClean = new
+        {
+            url = postCore.Source,
+            echo = JsonSerializer.Deserialize<string>(await postCore.ExecuteScriptAsync("document.getElementById('echo')?.textContent ?? null")),
+        };
+        CloseTab(postTab, recordClosed: false);
+
+        // #35: blob:http(s) URLs open while PageHandoff.Allowed stays strict for Share/session.
+        var blobTab = await Open(fixture + "/blob-page");
+        await WaitForLoad(blobTab);
+        var blobCore = blobTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Blob tab view is not ready.");
+        var baseBlobTabs = opened.Count;
+        await Task.Delay(150);
+        await DispatchClick(blobCore, 60, 20);
+        var blobWait = Stopwatch.StartNew();
+        while (blobWait.Elapsed < TimeSpan.FromSeconds(5)
+            && (opened.Count != baseBlobTabs + 1 || selected == blobTab || !(selected?.View?.CoreWebView2?.Source?.StartsWith("blob:", StringComparison.OrdinalIgnoreCase) ?? false)))
+            await Task.Delay(50);
+        var blobChild = selected != blobTab ? selected : null;
+        string? blobChildSource = null;
+        string? blobChildText = null;
+        if (blobChild?.View?.CoreWebView2 is { } blobChildCore)
+        {
+            blobChildSource = blobChildCore.Source;
+            blobWait.Restart();
+            while (blobWait.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                blobChildText = JsonSerializer.Deserialize<string>(await blobChildCore.ExecuteScriptAsync("document.getElementById('b')?.textContent ?? null"));
+                if (blobChildText == "blob-ok") break;
+                await Task.Delay(50);
+            }
+        }
+        var blobUrl = new
+        {
+            openedOk = blobChild is not null
+                && (blobChildSource?.StartsWith("blob:" + fixture, StringComparison.OrdinalIgnoreCase) ?? false)
+                && blobChildText == "blob-ok"
+                && blobChild.Title == "Blob doc",
+            notShareableOrSaved = blobChild is { Url: null }
+                && blobChildSource is not null
+                && !PageHandoff.Allowed(blobChildSource),
+            helperOk = IsNavigable("https://example.com")
+                && IsNavigable("http://localhost:3000")
+                && IsNavigable("about:blank")
+                && IsNavigable("blob:https://example.com/123")
+                && IsNavigable("blob:http://127.0.0.1:80/a")
+                && !IsNavigable("blob:file:///C:/a")
+                && !IsNavigable("blob:null/123")
+                && !IsNavigable("blob: https://example.com/123")
+                && !IsNavigable("file:///C:/a")
+                && !IsNavigable("javascript:alert(1)")
+                && !IsNavigable("data:text/html,hi")
+                && !PageHandoff.Allowed("blob:https://example.com/123")
+                && !PageHandoff.Allowed("about:blank"),
+        };
+        if (blobChild is not null) CloseTab(blobChild, recordClosed: false);
+        CloseTab(blobTab, recordClosed: false);
+
+        // #31: PermissionRequested denies non-user-initiated high-risk kinds and disables SavesInProfile for sensitive kinds.
+        var geoTab = await Open();
+        var geoCore = geoTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Geo tab view is not ready.");
+        var geoObserved = false;
+        var geoKind = CoreWebView2PermissionKind.UnknownPermission;
+        var geoSavesInProfile = true;
+        var geoState = CoreWebView2PermissionState.Deny;
+        geoCore.PermissionRequested += (_, e) => {
+            if (e.PermissionKind == CoreWebView2PermissionKind.Geolocation)
+            {
+                geoKind = e.PermissionKind;
+                geoSavesInProfile = e.SavesInProfile;
+                geoState = e.State;
+                geoObserved = true;
+                e.State = CoreWebView2PermissionState.Deny;
+            }
+        };
+        geoCore.Navigate(fixture + "/geo");
+        var geoWait = Stopwatch.StartNew();
+        while (geoWait.Elapsed < TimeSpan.FromSeconds(5) && !geoObserved)
+            await Task.Delay(50);
+        CloseTab(geoTab, recordClosed: false);
+        var permissions = new
+        {
+            geoObserved,
+            geoSavesInProfileFalse = geoKind == CoreWebView2PermissionKind.Geolocation && !geoSavesInProfile && geoState == CoreWebView2PermissionState.Default,
+            policyOk = DecidePermission(CoreWebView2PermissionKind.ClipboardRead, false) == (CoreWebView2PermissionState.Deny, false)
+                && DecidePermission(CoreWebView2PermissionKind.MultipleAutomaticDownloads, false) == (CoreWebView2PermissionState.Deny, false)
+                && DecidePermission(CoreWebView2PermissionKind.LocalFonts, false) == (CoreWebView2PermissionState.Deny, false)
+                && DecidePermission(CoreWebView2PermissionKind.WindowManagement, false) == (CoreWebView2PermissionState.Deny, false)
+                && DecidePermission(CoreWebView2PermissionKind.MidiSystemExclusiveMessages, false) == (CoreWebView2PermissionState.Deny, false)
+                && DecidePermission(CoreWebView2PermissionKind.ClipboardRead, true) == (CoreWebView2PermissionState.Default, false)
+                && DecidePermission(CoreWebView2PermissionKind.Camera, true) == (CoreWebView2PermissionState.Default, false)
+                && DecidePermission(CoreWebView2PermissionKind.Microphone, true) == (CoreWebView2PermissionState.Default, false)
+                && DecidePermission(CoreWebView2PermissionKind.Geolocation, true) == (CoreWebView2PermissionState.Default, false)
+                && DecidePermission(CoreWebView2PermissionKind.FileReadWrite, true) == (CoreWebView2PermissionState.Default, false)
+                && DecidePermission(CoreWebView2PermissionKind.Notifications, true) == (CoreWebView2PermissionState.Default, true),
+        };
+
+        // #32: Downloads — cancel from background tabs, confirm executables, Ctrl+J opens default download dialog.
+        var smokeDownloadsDir = Path.Combine(Path.GetDirectoryName(smokeReport!)!, "Downloads");
+        Directory.CreateDirectory(smokeDownloadsDir);
+        var dlBg = await Open(fixture + "/first");
+        await WaitForLoad(dlBg);
+        var dlFg = await Open(fixture + "/download-page");
+        await WaitForLoad(dlFg);
+        var dlBgCore = dlBg.View?.CoreWebView2 ?? throw new InvalidOperationException("Background download tab view is not ready.");
+        var dlFgCore = dlFg.View?.CoreWebView2 ?? throw new InvalidOperationException("Foreground download tab view is not ready.");
+        if (dlFgCore.Profile is not null) dlFgCore.Profile.DefaultDownloadFolderPath = smokeDownloadsDir;
+
+        var bgDownloadFired = false;
+        var bgDownloadCancelled = false;
+        dlBgCore.DownloadStarting += (_, e) => {
+            bgDownloadFired = true;
+            bgDownloadCancelled = e.Cancel;
+        };
+        await dlBgCore.ExecuteScriptAsync("const a=document.createElement('a');a.href='/download/note.txt';a.download='note.txt';a.click();");
+        var dlWait = Stopwatch.StartNew();
+        while (dlWait.Elapsed < TimeSpan.FromSeconds(5) && !bgDownloadFired)
+            await Task.Delay(50);
+
+        CoreWebView2DownloadOperation? fgOp = null;
+        dlFgCore.DownloadStarting += (_, e) => { fgOp = e.DownloadOperation; };
+
+        string? exeDenyName = null;
+        string? exeDenyHost = null;
+        confirmDownloadOverride = (name, host) => { exeDenyName = name; exeDenyHost = host; return false; };
+        await DispatchClick(dlFgCore, 60, 20);
+        dlWait.Restart();
+        while (dlWait.Elapsed < TimeSpan.FromSeconds(5)
+            && (exeDenyName is null || fgOp is null || fgOp.State == CoreWebView2DownloadState.InProgress))
+            await Task.Delay(50);
+        var exeDenied = exeDenyName is not null
+            && exeDenyName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            && exeDenyHost == "127.0.0.1"
+            && fgOp is { State: CoreWebView2DownloadState.Interrupted, InterruptReason: CoreWebView2DownloadInterruptReason.UserCanceled }
+            && !Directory.EnumerateFiles(smokeDownloadsDir, "*.exe").Any();
+
+        fgOp = null;
+        var exeAllowPrompted = false;
+        confirmDownloadOverride = (_, _) => { exeAllowPrompted = true; return true; };
+        await DispatchClick(dlFgCore, 60, 20);
+        dlWait.Restart();
+        while (dlWait.Elapsed < TimeSpan.FromSeconds(5)
+            && (!exeAllowPrompted || fgOp is null || (fgOp.State == CoreWebView2DownloadState.InProgress && fgOp.BytesReceived == 0 && !File.Exists(fgOp.ResultFilePath))))
+            await Task.Delay(50);
+        // Edge SmartScreen may hold unverified .exe downloads in InProgress after our handler allows them.
+        var exeAllowed = exeAllowPrompted
+            && fgOp is not null
+            && fgOp.State != CoreWebView2DownloadState.Interrupted
+            && (fgOp.State == CoreWebView2DownloadState.Completed || fgOp.BytesReceived > 0 || File.Exists(fgOp.ResultFilePath));
+        if (fgOp is { State: CoreWebView2DownloadState.InProgress }) fgOp.Cancel();
+        confirmDownloadOverride = null;
+
+        PressKey(Keys.Control | Keys.J);
+        dlWait.Restart();
+        while (dlWait.Elapsed < TimeSpan.FromSeconds(2) && !dlFgCore.IsDefaultDownloadDialogOpen)
+            await Task.Delay(50);
+        var ctrlJOpened = dlFgCore.IsDefaultDownloadDialogOpen;
+        if (ctrlJOpened) dlFgCore.CloseDefaultDownloadDialog();
+
+        CloseTab(dlFg, recordClosed: false);
+        CloseTab(dlBg, recordClosed: false);
+        var downloads = new
+        {
+            bgCancelled = bgDownloadFired && bgDownloadCancelled,
+            exeDenied,
+            exeAllowed,
+            ctrlJOpened,
+            extCheckOk = IsDangerousDownload(@"C:\Downloads\a.exe")
+                && IsDangerousDownload(@"C:\Downloads\A.PS1")
+                && IsDangerousDownload(@"C:\Downloads\run.bat.")
+                && IsDangerousDownload(@"C:\Downloads\app.jar")
+                && !IsDangerousDownload(@"C:\Downloads\doc.pdf")
+                && !IsDangerousDownload(@"C:\Downloads\note.txt"),
+        };
+
+        // #33: ProcessFailed resets navigation state, recovers renderer crash once, and TryCore guards COM/InvalidOperation exceptions.
+        var crashTab = await Open(fixture + "/third");
+        await WaitForLoad(crashTab);
+        var crashCore = crashTab.View?.CoreWebView2 ?? throw new InvalidOperationException("Crash tab view is not ready.");
+        crashTab.ActiveNavigationId = 99999;
+        crashTab.PendingPageUri = new Uri("https://stale.example/");
+        var crashSawExit = false;
+        var crashReloaded = false;
+        crashCore.ProcessFailed += (_, e) => {
+            if (e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessExited)
+                crashSawExit = true;
+        };
+        crashCore.NavigationCompleted += (_, e) => {
+            if (crashSawExit && e.IsSuccess) crashReloaded = true;
+        };
+        try { await crashCore.CallDevToolsProtocolMethodAsync("Page.crash", "{}"); }
+        catch { }
+        var crashWait = Stopwatch.StartNew();
+        while (crashWait.Elapsed < TimeSpan.FromSeconds(8) && !(crashSawExit && crashReloaded && crashTab.ActiveNavigationId is null && crashTab.PendingPageUri is null))
+            await Task.Delay(50);
+        string? crashTitleAfter = null;
+        if (crashTab.View is { IsDisposed: false, CoreWebView2: { } liveCore })
+        {
+            try { crashTitleAfter = JsonSerializer.Deserialize<string>(await liveCore.ExecuteScriptAsync("document.title")); }
+            catch { }
+        }
+        var dummyRecoveryTab = new BrowserTab { SavedUrl = fixture + "/first", SavedTitle = "Saved", ActiveNavigationId = 42, PendingPageUri = new Uri("https://stale.example/") };
+        ResetTabForRecovery(dummyRecoveryTab);
+        var processCrash = new
+        {
+            sawRenderExit = crashSawExit,
+            navReset = crashTab.ActiveNavigationId is null && crashTab.PendingPageUri is null,
+            recoveredAlive = crashReloaded && crashTitleAfter == "Third page marker" && !crashTab.CrashRecovered,
+            tryCoreGuards = !TryCore(() => throw new COMException("boom"))
+                && !TryCore(() => throw new InvalidOperationException("dead"))
+                && TryCore<string>(() => throw new COMException("boom"), "ok") == "ok",
+            recoveryPreservesUrl = dummyRecoveryTab.PendingUrl == fixture + "/first"
+                && dummyRecoveryTab.SavedUrl == fixture + "/first"
+                && dummyRecoveryTab.ActiveNavigationId is null
+                && dummyRecoveryTab.PendingPageUri is null,
+        };
+        CloseTab(crashTab, recordClosed: false);
+        SelectTab(first);
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -2894,13 +3407,16 @@ sealed class BrowserWindow : Form
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
             urlWhenCleanOff, cliFlags,
             faviconCached, addressDisplayOk, tabDrag,
+            postClean, blobUrl, permissions, downloads, processCrash,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
             rejectsLocalFiles = Resolve("file:///C:/Windows/win.ini") == null && !PageHandoff.Allowed("file:///C:/Windows/win.ini"),
             // Must match RESOLVE in test_smoke.py.
             resolve = new[] { "example.com", "example.com/a?b=c", "Example.COM:8443/x", "localhost", "localhost:3000", "localhost/app",
                 "127.0.0.1:8080/x", "[::1]:5173", "https://example.com/path", "HTTP://Example.com", "3.14", "hello world",
-                "how to type http:// links", "user@example.com", "javascript:alert(1)", " JavaScript:alert(1) ", "data:text/html,hi",
+                "how to type http:// links", "user@example.com", "site:github.com", "std::vector", "filetype:pdf", "define:x",
+                "javascript:alert(1)", " JavaScript:alert(1) ", "data:text/html,hi",
                 "file:///C:/Windows/win.ini", @"C:\Windows\win.ini", "mailto:a@example.com", "ftp://example.com", "http://",
+                "about:blank", "edge://settings", "blob:https://example.com/123",
                 "https://user:pw@example.com", "user:pw@example.com", "", "   " }.ToDictionary(s => s, Resolve),
             noTabNavigation,
             sessionLockName = Session.LockName(Path.Combine(Path.GetDirectoryName(sessionFile)!, "WebView")),
