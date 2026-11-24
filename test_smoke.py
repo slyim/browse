@@ -237,6 +237,14 @@ class Fixture(BaseHTTPRequestHandler):
                 '<!doctype html><title>Find page</title>'
                 '<main>alpha Alpha alpha beta alphabet</main>'
             ).encode()
+        elif self.path.startswith('/fullscreen'):
+            body = (
+                '<!doctype html><title>Fullscreen page</title>'
+                '<div id="box" style="position:fixed;inset:0;background:#111;color:#fff">'
+                '<button id="enter-fs" style="position:fixed;left:0;top:0;width:160px;height:48px"'
+                ' onclick="document.getElementById(\'box\').requestFullscreen().catch(e=>window.__fsErr=String(e))">Fullscreen</button>'
+                '</div>'
+            ).encode()
         elif self.path.startswith('/slow'):
             type(self).stop_event.wait(3.0)
             body = b'<!doctype html><title>Slow page</title><main>Slow page done</main>'
@@ -484,6 +492,27 @@ def run_checks():
                     'tryCoreGuards': True,
                     'recoveryPreservesUrl': True,
                 }, report.get('processCrash')
+                assert report.get('crashUi') == {
+                    'firstCrashSilent': True,
+                    'panelShownOnSecondCrash': True,
+                    'preservedOnSwitchBack': True,
+                    'reloadRecovered': True,
+                    'subframeNoticeOk': True,
+                    'unresponsiveAutoCleared': True,
+                    'unresponsiveReloaded': True,
+                }, report.get('crashUi')
+                assert report.get('fullscreen') == {
+                    'elementCoversScreen': True,
+                    'elementChromeHidden': True,
+                    'elementNoResizeBorder': True,
+                    'elementExitRestores': True,
+                    'maximizedRestores': True,
+                    'switchTabExits': True,
+                    'closeTabExits': True,
+                    'f11OffRestores': True,
+                    'elementInF11ReturnsToF11': True,
+                    'f11FinalRestores': True,
+                }, report.get('fullscreen')
                 debounce = report.get('sessionDebounce')
                 assert debounce is not None, report
                 assert debounce['titleEvents'] >= 5, debounce

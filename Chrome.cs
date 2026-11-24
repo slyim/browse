@@ -112,6 +112,7 @@ static class Theme
         public static readonly string Settings = PhosphorLoaded ? "\uE272" : "\uE713";   // gear-six
         public static readonly string ChevronUp = PhosphorLoaded ? "\uE13C" : "\uE70E";  // caret-up
         public static readonly string ChevronDown = PhosphorLoaded ? "\uE136" : "\uE70D"; // caret-down
+        public static readonly string Warning = PhosphorLoaded ? "\uE4E0" : "\uE7BA";    // warning
 
         // Window caption buttons stay on Segoe Fluent Icons to match native Windows chrome.
         public const string Minimize = "\uE921";
