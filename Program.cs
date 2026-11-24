@@ -243,6 +243,7 @@ sealed class BrowserWindow : Form
     readonly IconButton updateBtn;
     readonly IconButton settingsBtn;
     readonly IconButton stripNewTabBtn;
+    readonly FindBar findBar;
     readonly CaptionButton minBtn;
     readonly CaptionButton maxBtn;
     readonly CaptionButton closeBtn;
@@ -266,8 +267,10 @@ sealed class BrowserWindow : Form
     bool pinDropPlaceholder;
     readonly string sessionFile;
     readonly string settingsFile;
+    readonly string sitePrefsFile;
     readonly ThemePreference startupTheme;
     readonly FaviconCache favicons;
+    SitePrefs sitePrefs;
     readonly Task<CoreWebView2Environment> envTask;
     readonly Task<SessionState?>? sessionTask;
     readonly string? smokeReport;
@@ -424,6 +427,8 @@ sealed class BrowserWindow : Form
         public bool IsPopup { get; init; }
         public bool PlayingAudio { get; set; }
         public bool Muted { get; set; }
+        public string? ZoomOrigin { get; set; }
+        public bool ApplyingZoom { get; set; }
         public bool Navigating => ActiveNavigationId is not null;
         public Func<int> BlockedCount { get; set; } = () => 0;
         public Func<bool, Task> SetShieldEnabledAsync { get; set; } = _ => Task.CompletedTask;
@@ -468,6 +473,10 @@ sealed class BrowserWindow : Form
     {
         this.sessionFile = sessionFile;
         this.settingsFile = settingsFile;
+        sitePrefsFile = Path.Combine(Path.GetDirectoryName(settingsFile)!, "site-prefs.json");
+        sitePrefs = smokeReport is null || smokePhase is "restore" or "perf" or "takeover"
+            ? SitePrefsStore.Load(sitePrefsFile)
+            : new SitePrefs();
         settings = initialSettings;
         this.settingsExisted = settingsExisted;
         startupTheme = initialSettings.Theme;
@@ -506,6 +515,8 @@ sealed class BrowserWindow : Form
         stripNewTabBtn = MakeIcon(Theme.Glyphs.NewTab, "New tab", NewTab);
         stripNewTabBtn.SetSurface(Theme.Ground, Theme.StripHover, Theme.StripActive);
         sideNewTab = new QuietRow("New tab", NewTab);
+        findBar = new FindBar(tips, ReturnFocusFromFind);
+        address.ZoomResetRequested += ResetZoom;
 
         minBtn = MakeCaption(Theme.Glyphs.Minimize, "Minimize", isClose: false, () => WindowState = FormWindowState.Minimized);
         maxBtn = MakeCaption(Theme.Glyphs.Maximize, "Maximize", isClose: false, ToggleMaximize);
@@ -526,6 +537,8 @@ sealed class BrowserWindow : Form
         stripTabs.MouseWheel += HandleStripWheel;
         topStrip.Resize += (_, _) => { if (!vertical) LayoutTopStrip(); };
 
+        pages.Controls.Add(findBar);
+        pages.Resize += (_, _) => { if (findBar.Visible) findBar.PositionIn(pages); };
         cardBorder.Controls.Add(pages);
         cardFrame.Controls.Add(cardBorder);
         cardFrame.Controls.Add(sessionNotice);
@@ -830,6 +843,7 @@ sealed class BrowserWindow : Form
             address.PerformLayout();
         }
         RebuildTabs();
+        if (findBar.Visible) findBar.PositionIn(pages);
         Invalidate(true);
     }
 
@@ -1407,6 +1421,7 @@ sealed class BrowserWindow : Form
                     BeginInvoke(() => { if (!closed && !IsDisposed) HandleShortcut(keyData); });
             };
             pages.Controls.Add(view);
+            view.ZoomFactorChanged += (_, _) => HandleZoomFactorChanged(tab, view);
             try
             {
                 await view.EnsureCoreWebView2Async(environment);
@@ -1431,6 +1446,7 @@ sealed class BrowserWindow : Form
                 var recentCleaned = new List<(string Url, long At)>(8);
                 void TrackNavigation(CoreWebView2NavigationStartingEventArgs e)
                 {
+                    findBar.StopIfBoundTo(core);
                     SetNavigationState(tab, e.NavigationId, Uri.TryCreate(e.Uri, UriKind.Absolute, out var u) ? u : null);
                 }
                 core.NavigationStarting += (_, e) => {
@@ -1447,6 +1463,7 @@ sealed class BrowserWindow : Form
                             && Uri.TryCreate(e.Uri[5..], UriKind.Absolute, out var bo)
                                 ? bo
                                 : null;
+                        findBar.StopIfBoundTo(core);
                         SetNavigationState(tab, e.NavigationId, blobOrigin);
                         return;
                     }
@@ -1550,6 +1567,7 @@ sealed class BrowserWindow : Form
                     {
                         tab.LastUrl = null;
                     }
+                    ApplyOriginZoomForTab(tab, view, src);
                     if (selected == tab && !address.InputFocused) UpdateAddress();
                     if (selected == tab) { UpdateNavButtons(); UpdateWindowTitle(); }
                     RefreshTab(tab);
@@ -1949,6 +1967,7 @@ sealed class BrowserWindow : Form
     void SelectTab(BrowserTab tab, bool focusView = true)
     {
         var prev = selected;
+        if (prev is not null && prev != tab) findBar.Close(returnFocus: false);
         selected = tab;
         tab.HiddenSince = null;
         if (tab.View is { IsDisposed: false } view)
@@ -1987,6 +2006,7 @@ sealed class BrowserWindow : Form
             }
         }
         if (focusView || !address.InputFocused) UpdateAddress();
+        UpdateZoomIndicator();
         UpdateNavButtons();
         UpdateWindowTitle();
         if (prev is not null && prev != tab) RefreshTab(prev);
@@ -2023,6 +2043,7 @@ sealed class BrowserWindow : Form
             {
                 TryCore(() => core.NavigateToString(Home));
             }
+            UpdateZoomIndicator();
             UpdateNavButtons();
             if (!address.InputFocused) FocusView(tab.View);
         }
@@ -2067,6 +2088,7 @@ sealed class BrowserWindow : Form
         foreach (var t in opened) if (t.Opener == tab) t.Opener = null;
         if (tab.View is { } view)
         {
+            if (!view.IsDisposed && view.CoreWebView2 is { } detCore) findBar.StopIfBoundTo(detCore);
             tab.View = null;
             CleanupView(view);
         }
@@ -2607,6 +2629,9 @@ sealed class BrowserWindow : Form
             MoveTab(tab, !tab.Pinned, tab.Pinned ? 0 : int.MaxValue));
         var muteItem = menu.Items.Add(tab.Muted ? "Unmute tab" : "Mute tab", null, (_, _) => ToggleMuteTab(tab));
         menu.Items.Add(new ToolStripSeparator());
+        var printItem = menu.Items.Add("Print...", null, (_, _) => { if (tab != selected) SelectTab(tab); PrintTab(tab); });
+        var saveItem = menu.Items.Add("Save page as...", null, (_, _) => { if (tab != selected) SelectTab(tab); _ = SaveTabAsync(tab); });
+        menu.Items.Add(new ToolStripSeparator());
         var closeItem = menu.Items.Add("Close tab", null, (_, _) => CloseTab(tab));
         var closeOthersItem = menu.Items.Add("Close other tabs", null, (_, _) => CloseOtherTabs(tab));
         var closeBelowItem = menu.Items.Add("Close tabs below", null, (_, _) => CloseTabsBelow(tab));
@@ -2617,6 +2642,9 @@ sealed class BrowserWindow : Form
             copyLinkItem.Enabled = tab.Url is not null;
             pinItem.Text = tab.Pinned ? "Unpin tab" : "Pin tab";
             muteItem.Text = tab.Muted ? "Unmute tab" : "Mute tab";
+            var pageReady = tab.View is { IsDisposed: false, CoreWebView2: not null } && tab.Url is not null;
+            printItem.Enabled = pageReady;
+            saveItem.Enabled = pageReady;
             closeItem.Enabled = !tab.Pinned;
             closeOthersItem.Enabled = opened.Any(t => t != tab && !t.Pinned);
             closeBelowItem.Enabled = TabsBelow(tab).Count > 0;
@@ -2793,12 +2821,144 @@ sealed class BrowserWindow : Form
         finally { drawTabsTicks += Stopwatch.GetTimestamp() - t0; }
     }
 
+    static bool IsPdfTab(BrowserTab? tab) =>
+        tab?.Url is { } url
+        && Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && uri.AbsolutePath.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase);
+
+    void OpenFindBar()
+    {
+        if (closed || IsDisposed || environment is null || selected is not { View: { IsDisposed: false, CoreWebView2: { } core } }) return;
+        findBar.PositionIn(pages);
+        findBar.Open(core, environment);
+    }
+
+    void ReturnFocusFromFind()
+    {
+        if (closed || IsDisposed) return;
+        if (selected?.View is { IsDisposed: false } view) FocusView(view);
+        else ActiveControl = null;
+    }
+
+    void RememberZoom(string origin, double factor)
+    {
+        if (closed) return;
+        // Re-read first so another window's zoom changes in the same profile aren't overwritten.
+        var fresh = SitePrefsStore.Load(sitePrefsFile);
+        fresh.SetZoom(origin, factor);
+        sitePrefs = fresh;
+        try { SitePrefsStore.Save(sitePrefsFile, sitePrefs); }
+        catch { }
+    }
+
+    void UpdateZoomIndicator()
+    {
+        var factor = selected is { View: { IsDisposed: false } view }
+            ? TryCore(() => view.ZoomFactor, ZoomLevels.Default)
+            : ZoomLevels.Default;
+        address.SetZoom(factor);
+    }
+
+    void ApplyZoomFactor(BrowserTab tab, WebView2 view, double target)
+    {
+        var current = TryCore(() => view.ZoomFactor, ZoomLevels.Default);
+        if (Math.Abs(current - target) >= 0.005)
+        {
+            tab.ApplyingZoom = true;
+            try { TryCore(() => view.ZoomFactor = target); }
+            finally { tab.ApplyingZoom = false; }
+        }
+        if (tab == selected) address.SetZoom(TryCore(() => view.ZoomFactor, target));
+    }
+
+    void ApplyOriginZoomForTab(BrowserTab tab, WebView2 view, string? url)
+    {
+        if (closed || tab.Closed || view.IsDisposed) return;
+        var origin = SitePrefsStore.OriginOf(url);
+        if (string.Equals(origin, tab.ZoomOrigin, StringComparison.OrdinalIgnoreCase))
+        {
+            if (tab == selected) UpdateZoomIndicator();
+            return;
+        }
+        tab.ZoomOrigin = origin;
+        var target = origin is not null ? sitePrefs.GetZoom(origin) : ZoomLevels.Default;
+        ApplyZoomFactor(tab, view, target);
+    }
+
+    void HandleZoomFactorChanged(BrowserTab tab, WebView2 view)
+    {
+        if (closed || tab.Closed || view.IsDisposed || !opened.Contains(tab)) return;
+        var actual = TryCore(() => view.ZoomFactor, ZoomLevels.Default);
+        if (!tab.ApplyingZoom && SitePrefsStore.OriginOf(tab.Url) is { } origin)
+        {
+            tab.ZoomOrigin = origin;
+            if (sitePrefs.SetZoom(origin, actual))
+                RememberZoom(origin, actual);
+        }
+        if (tab == selected) address.SetZoom(actual);
+    }
+
+    void SetSelectedZoom(double target)
+    {
+        if (selected is not { Closed: false, View: { IsDisposed: false } view } tab) return;
+        var normalized = ZoomLevels.Normalize(target);
+        if (SitePrefsStore.OriginOf(tab.Url) is { } origin)
+        {
+            tab.ZoomOrigin = origin;
+            if (sitePrefs.SetZoom(origin, normalized))
+                RememberZoom(origin, normalized);
+        }
+        ApplyZoomFactor(tab, view, normalized);
+    }
+
+    void ZoomIn()
+    {
+        if (selected is not { Closed: false, View: { IsDisposed: false } view }) return;
+        SetSelectedZoom(ZoomLevels.StepIn(TryCore(() => view.ZoomFactor, ZoomLevels.Default)));
+    }
+
+    void ZoomOut()
+    {
+        if (selected is not { Closed: false, View: { IsDisposed: false } view }) return;
+        SetSelectedZoom(ZoomLevels.StepOut(TryCore(() => view.ZoomFactor, ZoomLevels.Default)));
+    }
+
+    void ResetZoom() => SetSelectedZoom(ZoomLevels.Default);
+
+    void PrintTab(BrowserTab tab, CoreWebView2PrintDialogKind kind = CoreWebView2PrintDialogKind.Browser)
+    {
+        if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return;
+        TryCore(() => core.ShowPrintUI(kind));
+    }
+
+    async Task SaveTabAsync(BrowserTab tab)
+    {
+        if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return;
+        try { await core.ShowSaveAsUIAsync(); }
+        catch (Exception ex) when (ex is COMException or InvalidOperationException or ObjectDisposedException) { }
+    }
+
     bool IsHandledShortcut(Keys keyData)
     {
         if (keyData == Keys.Escape)
-            return dragTab is not null || address.InputFocused || selected is { Navigating: true };
+            return dragTab is not null || findBar.Visible || address.InputFocused || selected is { Navigating: true };
         switch (keyData)
         {
+            case Keys.Control | Keys.F:
+            case Keys.F3:
+            case Keys.Shift | Keys.F3:
+                return !IsPdfTab(selected);
+            case Keys.Control | Keys.Oemplus:
+            case Keys.Control | Keys.Shift | Keys.Oemplus:
+            case Keys.Control | Keys.Add:
+            case Keys.Control | Keys.OemMinus:
+            case Keys.Control | Keys.Shift | Keys.OemMinus:
+            case Keys.Control | Keys.Subtract:
+            case Keys.Control | Keys.D0:
+            case Keys.Control | Keys.NumPad0:
+            case Keys.Control | Keys.P:
+            case Keys.Control | Keys.Shift | Keys.P:
+            case Keys.Control | Keys.S:
             case Keys.Control | Keys.L:
             case Keys.Control | Keys.N:
             case Keys.Control | Keys.T:
@@ -2830,6 +2990,11 @@ sealed class BrowserWindow : Form
             CancelTabDrag();
             return true;
         }
+        if (keyData == Keys.Escape && findBar.Visible)
+        {
+            findBar.Close(returnFocus: true);
+            return true;
+        }
         if (keyData == Keys.Escape && address.InputFocused)
         {
             UpdateAddress();
@@ -2844,6 +3009,43 @@ sealed class BrowserWindow : Form
         }
         switch (keyData)
         {
+            case Keys.Control | Keys.F:
+                if (IsPdfTab(selected)) return false;
+                OpenFindBar();
+                return true;
+            case Keys.F3:
+                if (IsPdfTab(selected)) return false;
+                if (findBar.Visible) findBar.FindNext();
+                else OpenFindBar();
+                return true;
+            case Keys.Shift | Keys.F3:
+                if (IsPdfTab(selected)) return false;
+                if (findBar.Visible) findBar.FindPrevious();
+                else OpenFindBar();
+                return true;
+            case Keys.Control | Keys.Oemplus:
+            case Keys.Control | Keys.Shift | Keys.Oemplus:
+            case Keys.Control | Keys.Add:
+                ZoomIn();
+                return true;
+            case Keys.Control | Keys.OemMinus:
+            case Keys.Control | Keys.Shift | Keys.OemMinus:
+            case Keys.Control | Keys.Subtract:
+                ZoomOut();
+                return true;
+            case Keys.Control | Keys.D0:
+            case Keys.Control | Keys.NumPad0:
+                ResetZoom();
+                return true;
+            case Keys.Control | Keys.P:
+                if (selected is { } pt) PrintTab(pt, CoreWebView2PrintDialogKind.Browser);
+                return true;
+            case Keys.Control | Keys.Shift | Keys.P:
+                if (selected is { } spt) PrintTab(spt, CoreWebView2PrintDialogKind.System);
+                return true;
+            case Keys.Control | Keys.S:
+                if (selected is { } st) _ = SaveTabAsync(st);
+                return true;
             case Keys.Control | Keys.L: address.FocusInput(); return true;
             case Keys.Control | Keys.N: if (!restoring) OpenNewWindow(); return true;
             case Keys.Control | Keys.T: if (!restoring) NewTab(); return true;
@@ -5045,6 +5247,219 @@ sealed class BrowserWindow : Form
             newWindowArgsOk,
         };
 
+        // #9: Find-in-page bar (Ctrl+F, incremental MatchCount, F3/Shift+F3 wrap, case & whole-word, Esc/tab-switch/nav stop).
+        var findTab = await Open(fixture + "/find-page");
+        await WaitForLoad(findTab);
+        PressKey(Keys.Control | Keys.F);
+        var findOpenedOk = findBar.Visible
+            && ReferenceEquals(findBar.Parent, pages)
+            && pages.ClientRectangle.Contains(findBar.Bounds)
+            && (!ContainsFocus || findBar.InputFocused);
+        var findPageShortcutOk = findTab.View is not null && PageKey(Keys.Control | Keys.F);
+        await Task.Delay(50);
+
+        async Task<bool> WaitFindAsync(Func<bool> pred)
+        {
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed < TimeSpan.FromSeconds(5))
+            {
+                if (pred()) return true;
+                await Task.Delay(25);
+            }
+            return pred();
+        }
+
+        findBar.SetQuery("alpha");
+        var findCountOk = await WaitFindAsync(() => findBar.MatchCount == 4 && findBar.ActiveMatchIndex == 1)
+            && findBar.CounterText == "1 / 4";
+
+        var nextSeq = new List<int>();
+        foreach (var expected in new[] { 2, 3, 4, 1 })
+        {
+            PressKey(Keys.F3);
+            await WaitFindAsync(() => findBar.ActiveMatchIndex == expected);
+            nextSeq.Add(findBar.ActiveMatchIndex);
+        }
+        var findNextWrapOk = nextSeq.SequenceEqual([2, 3, 4, 1]);
+
+        var prevSeq = new List<int>();
+        foreach (var expected in new[] { 4, 3 })
+        {
+            PressKey(Keys.Shift | Keys.F3);
+            await WaitFindAsync(() => findBar.ActiveMatchIndex == expected);
+            prevSeq.Add(findBar.ActiveMatchIndex);
+        }
+        var findPrevWrapOk = prevSeq.SequenceEqual([4, 3]);
+
+        findBar.ToggleCaseSensitive();
+        var findCaseOk = await WaitFindAsync(() => findBar.MatchCount == 3);
+        findBar.ToggleWholeWord();
+        var findWholeWordOk = await WaitFindAsync(() => findBar.MatchCount == 2);
+        findBar.ToggleWholeWord();
+        findBar.ToggleCaseSensitive();
+        await WaitFindAsync(() => findBar.MatchCount == 4);
+
+        PressKey(Keys.Escape);
+        var findEscOk = !findBar.Visible
+            && !findBar.HasSession
+            && ReferenceEquals(ActiveControl, findTab.View);
+
+        PressKey(Keys.Control | Keys.F);
+        await WaitFindAsync(() => findBar.Visible && findBar.HasSession);
+        SelectTab(first);
+        var findTabSwitchStops = !findBar.Visible && !findBar.HasSession;
+
+        SelectTab(findTab);
+        PressKey(Keys.Control | Keys.F);
+        await WaitFindAsync(() => findBar.Visible && findBar.HasSession);
+        findTab.Loaded = false;
+        findTab.View!.CoreWebView2!.Navigate(fixture + "/second");
+        await WaitForLoad(findTab);
+        var findNavStops = !findBar.Visible && !findBar.HasSession;
+
+        findBar.SetQuery("");
+        CloseTab(findTab, recordClosed: false);
+        SelectTab(first);
+
+        var findInPage = new
+        {
+            openedOk = findOpenedOk,
+            pageShortcutOk = findPageShortcutOk,
+            countOk = findCountOk,
+            nextWrapOk = findNextWrapOk,
+            prevWrapOk = findPrevWrapOk,
+            caseOk = findCaseOk,
+            wholeWordOk = findWholeWordOk,
+            escOk = findEscOk,
+            tabSwitchStops = findTabSwitchStops,
+            navStops = findNavStops,
+        };
+
+        // #13: Per-origin zoom steps, pill reset, persistence across origin switch & reload, corrupt/missing site-prefs, Print/Save shortcuts & menu.
+        var sitePrefsSelfCheck = SitePrefsStore.SelfCheck(Path.GetDirectoryName(sitePrefsFile)!);
+        var zoomTab = await Open(fixture + "/first");
+        await WaitForLoad(zoomTab);
+        var zoomView = zoomTab.View ?? throw new InvalidOperationException("Zoom tab view not ready.");
+        var zoomInitialOk = Math.Abs(zoomView.ZoomFactor - 1.0) < 0.005 && !address.ZoomPillVisible;
+
+        PressKey(Keys.Control | Keys.Oemplus);
+        var zoomStep1Ok = Math.Abs(zoomView.ZoomFactor - 1.10) < 0.005 && address.ZoomPillVisible && address.ZoomPillText == "110%";
+        PressKey(Keys.Control | Keys.Add);
+        var zoomStep2Ok = Math.Abs(zoomView.ZoomFactor - 1.25) < 0.005 && address.ZoomPillText == "125%";
+        PressKey(Keys.Control | Keys.OemMinus);
+        var zoomStepOutOk = Math.Abs(zoomView.ZoomFactor - 1.10) < 0.005 && address.ZoomPillText == "110%";
+        PressKey(Keys.Control | Keys.Oemplus);
+        var zoomStepsOk = zoomInitialOk && zoomStep1Ok && zoomStep2Ok && zoomStepOutOk && Math.Abs(zoomView.ZoomFactor - 1.25) < 0.005;
+
+        var zoomSavedOnDisk = File.Exists(sitePrefsFile) && Math.Abs(SitePrefsStore.Load(sitePrefsFile).GetZoom(fixture) - 1.25) < 0.005;
+
+        // Second loopback origin on an ephemeral port to verify ZoomFactor does not stick across origins.
+        var otherListener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        otherListener.Start();
+        var otherPort = ((System.Net.IPEndPoint)otherListener.LocalEndpoint).Port;
+        var otherOrigin = $"http://127.0.0.1:{otherPort}";
+        using var otherCts = new CancellationTokenSource();
+        var otherServerTask = Task.Run(async () =>
+        {
+            var html = Encoding.UTF8.GetBytes("<!doctype html><title>Other origin</title><main>other</main>");
+            var resp = Encoding.ASCII.GetBytes($"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {html.Length}\r\nConnection: close\r\n\r\n");
+            while (!otherCts.IsCancellationRequested)
+            {
+                try
+                {
+                    using var client = await otherListener.AcceptTcpClientAsync(otherCts.Token);
+                    using var ns = client.GetStream();
+                    var buf = new byte[1024];
+                    _ = await ns.ReadAsync(buf, otherCts.Token);
+                    await ns.WriteAsync(resp, otherCts.Token);
+                    await ns.WriteAsync(html, otherCts.Token);
+                }
+                catch { break; }
+            }
+        });
+
+        var otherOriginResetOk = false;
+        var backOriginRestoredOk = false;
+        try
+        {
+            zoomTab.Loaded = false;
+            zoomView.CoreWebView2!.Navigate(otherOrigin + "/other");
+            var zWait = Stopwatch.StartNew();
+            while (zWait.Elapsed < TimeSpan.FromSeconds(10) && (zoomTab.Url != otherOrigin + "/other" || zoomTab.Navigating))
+                await Task.Delay(50);
+            otherOriginResetOk = Math.Abs(zoomView.ZoomFactor - 1.0) < 0.005 && !address.ZoomPillVisible;
+
+            zoomTab.Loaded = false;
+            zoomView.CoreWebView2!.Navigate(fixture + "/first");
+            zWait.Restart();
+            while (zWait.Elapsed < TimeSpan.FromSeconds(10) && (zoomTab.Url != fixture + "/first" || zoomTab.Navigating))
+                await Task.Delay(50);
+            backOriginRestoredOk = Math.Abs(zoomView.ZoomFactor - 1.25) < 0.005 && address.ZoomPillVisible && address.ZoomPillText == "125%";
+        }
+        finally
+        {
+            otherCts.Cancel();
+            otherListener.Stop();
+            try { await otherServerTask; } catch { }
+        }
+
+        // Survives reloading site-prefs.json from disk.
+        sitePrefs = SitePrefsStore.Load(sitePrefsFile);
+        var zoomReloadTab = await Open(fixture + "/second");
+        await WaitForLoad(zoomReloadTab);
+        var zoomSurvivesReload = Math.Abs(zoomReloadTab.View!.ZoomFactor - 1.25) < 0.005 && address.ZoomPillText == "125%";
+        CloseTab(zoomReloadTab, recordClosed: false);
+        SelectTab(zoomTab);
+
+        // Ctrl+0 resets zoom to 1.0 and clears persisted entry.
+        PressKey(Keys.Control | Keys.D0);
+        var zoomResetKeyOk = Math.Abs(zoomView.ZoomFactor - 1.0) < 0.005
+            && !address.ZoomPillVisible
+            && Math.Abs(SitePrefsStore.Load(sitePrefsFile).GetZoom(fixture) - 1.0) < 0.005;
+
+        // Clicking zoom pill in address bar resets to 1.0.
+        PressKey(Keys.Control | Keys.Oemplus);
+        var pillRect = address.ZoomPillBounds;
+        var pillCenter = new Point(pillRect.Left + pillRect.Width / 2, pillRect.Top + pillRect.Height / 2);
+        SendMessage(address.Handle, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, MakeLParam(pillCenter.X, pillCenter.Y));
+        SendMessage(address.Handle, WM_LBUTTONUP, IntPtr.Zero, MakeLParam(pillCenter.X, pillCenter.Y));
+        var zoomPillResetOk = !pillRect.IsEmpty && Math.Abs(zoomView.ZoomFactor - 1.0) < 0.005 && !address.ZoomPillVisible;
+
+        // External zoom change (as from Ctrl+wheel) reaches the app via WebView2's ZoomFactorChanged callback.
+        zoomView.ZoomFactor = 1.50;
+        var onZoomChanged = typeof(WebView2).GetMethod("_coreWebView2Controller_ZoomFactorChanged",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        onZoomChanged.Invoke(zoomView, [null, EventArgs.Empty]);
+        var wheelZoomCapturedOk = address.ZoomPillText == "150%"
+            && Math.Abs(SitePrefsStore.Load(sitePrefsFile).GetZoom(fixture) - 1.50) < 0.005;
+        PressKey(Keys.Control | Keys.NumPad0);
+
+        var printItem = OpenAndGetMenuItem(zoomTab, "Print...");
+        var saveItem = OpenAndGetMenuItem(zoomTab, "Save page as...");
+        var printSaveWiredOk = IsHandledShortcut(Keys.Control | Keys.P)
+            && IsHandledShortcut(Keys.Control | Keys.Shift | Keys.P)
+            && IsHandledShortcut(Keys.Control | Keys.S)
+            && printItem.Enabled
+            && saveItem.Enabled;
+
+        CloseTab(zoomTab, recordClosed: false);
+        SelectTab(first);
+        ApplyZoomFactor(first, first.View!, ZoomLevels.Default);
+
+        var zoomAndPrint = new
+        {
+            sitePrefsSelfCheck,
+            zoomStepsOk,
+            zoomSavedOnDisk,
+            otherOriginResetOk,
+            backOriginRestoredOk,
+            zoomSurvivesReload,
+            zoomResetKeyOk,
+            zoomPillResetOk,
+            wheelZoomCapturedOk,
+            printSaveWiredOk,
+        };
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -5055,7 +5470,7 @@ sealed class BrowserWindow : Form
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
             urlWhenCleanOff, cliFlags, cliUrl, browserRegistration, externalSchemes,
             faviconCached, addressDisplayOk, tabDrag, tabFixes, highDpi, shareTimeout,
-            tabCycle, loadingStop, tabMenuAndNewWindow,
+            tabCycle, loadingStop, tabMenuAndNewWindow, findInPage, zoomAndPrint,
             postClean, blobUrl, permissions, downloads, processCrash,
             sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
