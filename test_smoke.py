@@ -10,7 +10,7 @@ from statistics import median
 import struct
 import subprocess
 from tempfile import mkdtemp
-from threading import Thread
+from threading import Event, Thread
 from time import sleep
 from urllib.parse import quote
 import zlib
@@ -94,6 +94,7 @@ class Fixture(BaseHTTPRequestHandler):
     requested = []
     post_requests = []
     loop_seq = 0
+    stop_event = Event()
 
     def do_POST(self):
         length = int(self.headers.get('Content-Length') or '0')
@@ -220,6 +221,9 @@ class Fixture(BaseHTTPRequestHandler):
                 '<!doctype html><title>Hung page</title><main>Hung page</main>'
                 '<script>window.addEventListener("load", () => setTimeout(() => { while (true) {} }, 50));</script>'
             ).encode()
+        elif self.path.startswith('/slow'):
+            type(self).stop_event.wait(3.0)
+            body = b'<!doctype html><title>Slow page</title><main>Slow page done</main>'
         elif self.path.startswith('/ads'):
             body = (
                 '<!doctype html><title>Ads</title>'
@@ -469,6 +473,32 @@ def run():
                     'reEnabledAfter': True,
                     'shareWorksAfterTimeout': True,
                 }, report.get('shareTimeout')
+                assert report.get('tabCycle') == {
+                    'ctrlTabOrderAndWrap': True,
+                    'ctrlShiftTabOrderAndWrap': True,
+                    'ctrlPageDownOrderAndWrap': True,
+                    'ctrlPageUpOrderAndWrap': True,
+                    'pageCtrlTabCycles': True,
+                }, report.get('tabCycle')
+                assert report.get('loadingStop') == {
+                    'buttonSwappedToStop': True,
+                    'tabShowsLoading': True,
+                    'timerActiveWhileLoading': True,
+                    'stopReturnedToReload': True,
+                    'escStoppedLoading': True,
+                    'escIdleNotConsumed': True,
+                }, report.get('loadingStop')
+                assert report.get('tabMenuAndNewWindow') == {
+                    'copyLinkOk': True,
+                    'duplicateOk': True,
+                    'reloadOk': True,
+                    'muteUnmuteOk': True,
+                    'audioIndicatorOk': True,
+                    'closeBelowOk': True,
+                    'closeOthersOk': True,
+                    'ctrlNLaunched': True,
+                    'newWindowArgsOk': True,
+                }, report.get('tabMenuAndNewWindow')
                 favicon_files = list((path / 'Favicons').glob('*.png'))
                 assert len(favicon_files) == 1, favicon_files
                 assert favicon_files[0].read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
@@ -725,6 +755,7 @@ def run():
                         fwd_proc.kill()
                         fwd_proc.wait(timeout=5)
             finally:
+                Fixture.stop_event.set()
                 server.shutdown()
                 thread.join()
         assert file_state(real_session) == real_before, 'Smoke test modified real session.json'
