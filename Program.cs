@@ -257,8 +257,11 @@ sealed class BrowserWindow : Form
     const int WM_MOUSEMOVE = 0x0200;
     const int WM_LBUTTONDOWN = 0x0201;
     const int WM_LBUTTONUP = 0x0202;
+    const int WM_MBUTTONDOWN = 0x0207;
+    const int WM_MBUTTONUP = 0x0208;
     const int WM_MOUSEWHEEL = 0x020A;
     const int MK_LBUTTON = 0x0001;
+    const int MK_MBUTTON = 0x0010;
 
     const int HTCLIENT = 1;
     const int HTCAPTION = 2;
@@ -908,9 +911,16 @@ sealed class BrowserWindow : Form
 
     void EnsureStripVisible(Control item)
     {
-        if (vertical || item.Parent != stripTabs || stripContentWidth <= stripTabs.Width) return;
+        if (vertical || item.Parent != stripTabs || stripTabs.Width <= 0 || stripContentWidth <= stripTabs.Width) return;
         if (item.Left < 0) ScrollStripBy(item.Left);
         else if (item.Right > stripTabs.Width) ScrollStripBy(item.Right - stripTabs.Width);
+    }
+
+    void EnsureTabVisible(BrowserTab? tab)
+    {
+        if (tab is null || !tabControls.TryGetValue(tab, out var ctrl) || ctrl.IsDisposed) return;
+        if (vertical) { if (!tab.Pinned) sideTabs.EnsureVisible(ctrl); }
+        else EnsureStripVisible(ctrl);
     }
 
     void HandleStripWheel(object? sender, MouseEventArgs e)
@@ -925,7 +935,11 @@ sealed class BrowserWindow : Form
     void ReloadCurrent()
     {
         if (selected is not { } tab) return;
-        if (tab.View is not { IsDisposed: false } view) { if (tab.Url is not null) _ = EnsureViewAndNavigate(tab); return; }
+        if (tab.View is not { IsDisposed: false } view)
+        {
+            if (tab.Url is { } pendingUrl) { tab.PendingUrl ??= pendingUrl; _ = EnsureViewAndNavigate(tab); }
+            return;
+        }
         TryCore(() => {
             if (!tab.Loaded && tab.SavedUrl is { } url) view.CoreWebView2?.Navigate(url); // first load never committed
             else if (tab.Url is not null) view.Reload();
@@ -960,7 +974,8 @@ sealed class BrowserWindow : Form
             {
                 await Restore();
                 if (closed) return;
-                if (selected?.Url is null) address.FocusInput(); else selected.View?.Focus(); // a focused address bar ignores redirects
+                if (selected?.Url is null) address.FocusInput();
+                else if (selected.View is { IsDisposed: false } view) FocusView(view); // a focused address bar ignores redirects
                 ExitCode = 0;
                 if (!noUpdateCheck && settings.AutoUpdateCheck) _ = CheckForUpdateAsync();
             }
@@ -1531,13 +1546,14 @@ sealed class BrowserWindow : Form
 
     async Task<BrowserTab> Open(string? target = null)
     {
-        var tab = new BrowserTab();
+        var cleaned = target is null ? null : (settings.CleanLinksEnabled ? CleanLink.Clean(target) : target);
+        var tab = new BrowserTab { SavedUrl = cleaned };
         await EnsureView(tab);
         if (closed || tab.Closed || tab.View is not { IsDisposed: false, CoreWebView2: { } core }) return tab;
         opened.Add(tab);
-        SelectTab(tab);
-        if (target is null) TryCore(() => core.NavigateToString(Home));
-        else TryCore(() => core.Navigate(settings.CleanLinksEnabled ? CleanLink.Clean(target) : target));
+        SelectTab(tab, focusView: !address.InputFocused);
+        if (cleaned is null) TryCore(() => core.NavigateToString(Home));
+        else TryCore(() => core.Navigate(cleaned));
         SaveSession();
         return tab;
     }
@@ -1548,16 +1564,31 @@ sealed class BrowserWindow : Form
         var target = Resolve(text);
         if (target is null) return Task.CompletedTask;
         if (settings.CleanLinksEnabled) target = CleanLink.Clean(target);
-        if (selected is not { } tab) return OpenInteractive(target);
+        if (selected is not { } tab)
+        {
+            if (address.InputFocused) ActiveControl = null;
+            return OpenInteractive(target);
+        }
         if (tab.View is { IsDisposed: false, CoreWebView2: { } core })
         {
+            tab.PendingUrl = null;
+            if (!tab.Loaded)
+            {
+                tab.SavedUrl = target;
+                tab.SavedTitle = null;
+            }
             TryCore(() => core.Navigate(target));
-            tab.View.Focus();
+            FocusView(tab.View);
+            if (!tab.Loaded) { UpdateAddress(); UpdateNavButtons(); RefreshTab(tab); }
             return Task.CompletedTask;
         }
         tab.PendingUrl = target;
         tab.SavedUrl = target;
+        tab.SavedTitle = null;
+        if (address.InputFocused) ActiveControl = null;
         UpdateAddress();
+        UpdateNavButtons();
+        RefreshTab(tab);
         return EnsureViewAndNavigate(tab);
     }
 
@@ -1565,6 +1596,7 @@ sealed class BrowserWindow : Form
     async Task OpenInteractive(string? url)
     {
         if (environment is null || closed || restoring) return; // Ctrl+T skips the disabled UI during restore
+        if (url is not null && address.InputFocused) ActiveControl = null;
         try { await Open(url); if (url is null) address.FocusInput(); }
         catch (Exception ex) { if (!closed) MessageBox.Show(this, ex.Message, "Could not open tab"); }
     }
@@ -1575,19 +1607,16 @@ sealed class BrowserWindow : Form
         address.Input.PlaceholderText = "Search or enter address";
     }
 
-    void SelectTab(BrowserTab tab)
+    void FocusView(WebView2 view)
+    {
+        if (view.IsDisposed || !view.Visible) return;
+        ActiveControl = view;
+        view.Focus();
+    }
+
+    void SelectTab(BrowserTab tab, bool focusView = true)
     {
         var prev = selected;
-        if (prev is not null && prev != tab)
-        {
-            prev.HiddenSince = Environment.TickCount64;
-            if (prev.View is { IsDisposed: false } prevView)
-            {
-                prevView.Visible = false;
-                if (prevView.CoreWebView2 is { } prevCore)
-                    TryCore(() => prevCore.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low);
-            }
-        }
         selected = tab;
         tab.HiddenSince = null;
         if (tab.View is { IsDisposed: false } view)
@@ -1603,18 +1632,34 @@ sealed class BrowserWindow : Form
                 }
                 TryCore(() => core.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Normal);
             }
+            if (focusView) FocusView(view);
             if (tab.PendingUrl is { } url)
             {
                 tab.PendingUrl = null;
                 TryCore(() => view.CoreWebView2?.Navigate(url));
             }
         }
-        else _ = EnsureViewAndNavigate(tab);
-        UpdateAddress();
+        else
+        {
+            if (focusView) ActiveControl = null;
+            _ = EnsureViewAndNavigate(tab);
+        }
+        if (prev is not null && prev != tab)
+        {
+            prev.HiddenSince = Environment.TickCount64;
+            if (prev.View is { IsDisposed: false } prevView)
+            {
+                prevView.Visible = false;
+                if (prevView.CoreWebView2 is { } prevCore)
+                    TryCore(() => prevCore.MemoryUsageTargetLevel = CoreWebView2MemoryUsageTargetLevel.Low);
+            }
+        }
+        if (focusView || !address.InputFocused) UpdateAddress();
         UpdateNavButtons();
         UpdateWindowTitle();
         if (prev is not null && prev != tab) RefreshTab(prev);
         RefreshTab(tab);
+        EnsureTabVisible(tab);
         SaveSession();
     }
 
@@ -1647,7 +1692,7 @@ sealed class BrowserWindow : Form
                 TryCore(() => core.NavigateToString(Home));
             }
             UpdateNavButtons();
-            if (!address.InputFocused) tab.View.Focus();
+            if (!address.InputFocused) FocusView(tab.View);
         }
         catch (Exception ex)
         {
@@ -1662,6 +1707,8 @@ sealed class BrowserWindow : Form
         var index = opened.IndexOf(tab);
         if (index < 0) return;
         if (tab == dragTab) CancelTabDrag();
+        var display = DisplayTabs();
+        var displayIndex = display.IndexOf(tab);
         tab.Closed = true;
         if (recordClosed && tab.Url is { } url && PageHandoff.Allowed(url)) closedUrls.Push(url);
         opened.RemoveAt(index);
@@ -1678,7 +1725,8 @@ sealed class BrowserWindow : Form
         {
             var next = tab.Opener is { Closed: false } opener && opened.Contains(opener)
                 ? opener
-                : opened[Math.Min(index, opened.Count - 1)];
+                : displayIndex + 1 < display.Count ? display[displayIndex + 1]
+                : display[displayIndex - 1];
             SyncTabs();
             SelectTab(next);
         }
@@ -1739,11 +1787,7 @@ sealed class BrowserWindow : Form
         var next = Math.Clamp(index + delta, 0, group.Count - 1);
         if (next == index) return;
         if (!MoveTab(tab, tab.Pinned, next)) return;
-        if (tabControls.TryGetValue(tab, out var ctrl) && !ctrl.IsDisposed)
-        {
-            if (vertical && !tab.Pinned) sideTabs.EnsureVisible(ctrl);
-            else if (!vertical) EnsureStripVisible(ctrl);
-        }
+        EnsureTabVisible(tab);
     }
 
     (int cols, int tileW, int tileH, int gap) PinGridMetrics(int count)
@@ -2186,6 +2230,7 @@ sealed class BrowserWindow : Form
             drawTabsTicks += Stopwatch.GetTimestamp() - t0;
         }
         SyncTabs();
+        EnsureTabVisible(selected);
     }
 
     void PruneStaleControls()
@@ -2278,7 +2323,8 @@ sealed class BrowserWindow : Form
         if (keyData == Keys.Escape && address.InputFocused)
         {
             UpdateAddress();
-            selected?.View?.Focus();
+            if (selected?.View is { IsDisposed: false } view) FocusView(view);
+            else ActiveControl = null;
             return true;
         }
         switch (keyData)
@@ -3640,6 +3686,155 @@ sealed class BrowserWindow : Form
         SelectTab(first);
         var restoreShortcuts = new { restoringDuringEnv, shortcutsIgnored };
 
+        // Regression smoke checks for #30 (focus + redirects), #39 (stale SavedUrl reload), #40 (close neighbor + scroll), #46 (middle-click drag-off).
+        var focusTab = await Open(fixture + "/second");
+        await WaitForLoad(focusTab);
+        PressKey(Keys.Control | Keys.L);
+        SelectTab(first);
+        var switchFocusesWebView = !address.InputFocused && !address.Input.Visible
+            && ReferenceEquals(ActiveControl, first.View)
+            && (!ContainsFocus || first.View!.ContainsFocus);
+        PressKey(Keys.Control | Keys.D2);
+        var ctrl2FocusesWebView = selected == focusTab && !address.InputFocused && !address.Input.Visible
+            && ReferenceEquals(ActiveControl, focusTab.View)
+            && (!ContainsFocus || focusTab.View!.ContainsFocus);
+        PressKey(Keys.Control | Keys.L);
+        address.Input.Text = "http://typing.invalid";
+        PressKey(Keys.Escape);
+        var escReturnsToWebView = !address.InputFocused && !address.Input.Visible
+            && address.Input.Text == focusTab.Url
+            && ReferenceEquals(ActiveControl, focusTab.View)
+            && (!ContainsFocus || focusTab.View!.ContainsFocus);
+        PressKey(Keys.Control | Keys.L);
+        await Go(fixture + "/redirect-tracked");
+        var redirWatch = Stopwatch.StartNew();
+        while (redirWatch.Elapsed < TimeSpan.FromSeconds(10)
+            && (focusTab.Url != fixture + "/second" || focusTab.Navigating))
+            await Task.Delay(50);
+        var redirectUpdatesAddress = focusTab.Url == fixture + "/second"
+            && address.Input.Text == fixture + "/second"
+            && !address.InputFocused
+            && ReferenceEquals(ActiveControl, focusTab.View);
+        CloseTab(focusTab);
+
+        // #39: Reload on a not-yet-loaded tab after Go() uses the new URL (both View==null and uncommitted View!=null).
+        var reloadUnloaded = new BrowserTab(new SessionTab(fixture + "/first", "Stale title", false));
+        opened.Add(reloadUnloaded);
+        selected = reloadUnloaded;
+        SyncTabs();
+        var goUnloaded = Go(fixture + "/third");
+        var unloadedSavedUpdated = reloadUnloaded.SavedUrl == fixture + "/third"
+            && reloadUnloaded.SavedTitle is null
+            && address.Input.Text == fixture + "/third";
+        ReloadCurrent();
+        await goUnloaded;
+        await WaitForLoad(reloadUnloaded);
+        var unloadedReloadUsesNewUrl = unloadedSavedUpdated
+            && reloadUnloaded.Url == fixture + "/third"
+            && reloadUnloaded.Title == "Third page marker"
+            && !address.InputFocused
+            && ReferenceEquals(ActiveControl, reloadUnloaded.View)
+            && (!ContainsFocus || reloadUnloaded.View!.ContainsFocus);
+        CloseTab(reloadUnloaded);
+
+        var reloadUncommitted = new BrowserTab(new SessionTab(fixture + "/first", "Stale title", false));
+        opened.Add(reloadUncommitted);
+        await EnsureView(reloadUncommitted);
+        reloadUncommitted.PendingUrl = null;
+        SelectTab(reloadUncommitted);
+        await Go(fixture + "/third");
+        var uncommittedSavedUpdated = !reloadUncommitted.Loaded
+            && reloadUncommitted.SavedUrl == fixture + "/third"
+            && reloadUncommitted.SavedTitle is null;
+        ReloadCurrent();
+        await WaitForLoad(reloadUncommitted);
+        var uncommittedReloadUsesNewUrl = uncommittedSavedUpdated
+            && reloadUncommitted.Url == fixture + "/third"
+            && reloadUncommitted.Title == "Third page marker";
+        CloseTab(reloadUncommitted);
+
+        // #40: Closing B in [C(pinned), A, B, D] (created as A, B, C, D) selects D, then closing D selects A; off-screen tabs scroll into view.
+        var tabA = new BrowserTab { SavedTitle = "Tab A" };
+        var tabB = new BrowserTab { SavedTitle = "Tab B" };
+        var tabC = new BrowserTab { SavedTitle = "Tab C", Pinned = true };
+        var tabD = new BrowserTab { SavedTitle = "Tab D" };
+        opened.AddRange([tabA, tabB, tabC, tabD]);
+        var displayBeforeClose = DisplayTabs().SkipWhile(t => t == first).SequenceEqual([tabC, tabA, tabB, tabD]);
+        SelectTab(tabB);
+        CloseTab(tabB);
+        var closeBSelectsD = displayBeforeClose && selected == tabD;
+        CloseTab(tabD);
+        var closeDSelectsA = selected == tabA;
+        tabC.Pinned = false;
+        foreach (var t in new[] { tabA, tabC }) CloseTab(t);
+        SelectTab(first);
+
+        var scrollTabs = Enumerable.Range(1, 30).Select(i => new BrowserTab { SavedTitle = $"Scroll {i}" }).ToList();
+        opened.AddRange(scrollTabs);
+        SetOrientation(true);
+        PerformLayout();
+        SelectTab(scrollTabs[^1]);
+        var sideLastCtrl = tabControls[scrollTabs[^1]];
+        var sidebarScrollsSelected = sideTabs.ScrollOffset > 0
+            && sideLastCtrl.Top - sideTabs.ScrollOffset >= 0
+            && sideLastCtrl.Bottom - sideTabs.ScrollOffset <= sideTabs.ClientSize.Height;
+        SetOrientation(false);
+        PerformLayout();
+        SelectTab(scrollTabs[0]);
+        SelectTab(scrollTabs[^1]);
+        var stripLastCtrl = tabControls[scrollTabs[^1]];
+        var stripScrollsSelected = stripScroll > 0
+            && stripLastCtrl.Left >= 0
+            && stripLastCtrl.Right <= stripTabs.Width;
+        foreach (var t in scrollTabs)
+        {
+            t.Closed = true;
+            if (t.View is { } v) { t.View = null; CleanupView(v); }
+            opened.Remove(t);
+        }
+        SetOrientation(true);
+        SelectTab(first);
+        PerformLayout();
+
+        // #46: Middle-release outside the tab does not close it; middle-click inside does; left press on title released on close dot does not close.
+        var midTab = new BrowserTab { SavedTitle = "Middle test" };
+        opened.Add(midTab);
+        SyncTabs();
+        PerformLayout();
+        var midCtrl = tabControls[midTab];
+        var midIn = new Point(midCtrl.Width / 2, midCtrl.Height / 2);
+        var midOut = new Point(-20, -20);
+        SendMessage(midCtrl.Handle, WM_MBUTTONDOWN, (IntPtr)MK_MBUTTON, MakeLParam(midIn.X, midIn.Y));
+        SendMessage(midCtrl.Handle, WM_MBUTTONUP, IntPtr.Zero, MakeLParam(midOut.X, midOut.Y));
+        var middleReleaseOutsideKeepsTab = opened.Contains(midTab);
+        SendMessage(midCtrl.Handle, WM_LBUTTONDOWN, (IntPtr)MK_LBUTTON, MakeLParam(Math.Max(2, midCtrl.Width - S(30)), midCtrl.Height / 2));
+        SendMessage(midCtrl.Handle, WM_LBUTTONUP, IntPtr.Zero, MakeLParam(midCtrl.Width - S(10), midCtrl.Height / 2));
+        var leftTitleToCloseDotKeepsTab = opened.Contains(midTab);
+        SendMessage(midCtrl.Handle, WM_MBUTTONDOWN, (IntPtr)MK_MBUTTON, MakeLParam(midIn.X, midIn.Y));
+        SendMessage(midCtrl.Handle, WM_MBUTTONUP, IntPtr.Zero, MakeLParam(midIn.X, midIn.Y));
+        var middleClickInsideClosesTab = !opened.Contains(midTab);
+        if (opened.Contains(midTab)) CloseTab(midTab);
+        SelectTab(first);
+        SyncTabs();
+        PerformLayout();
+
+        var tabFixes = new
+        {
+            switchFocusesWebView,
+            ctrl2FocusesWebView,
+            escReturnsToWebView,
+            redirectUpdatesAddress,
+            unloadedReloadUsesNewUrl,
+            uncommittedReloadUsesNewUrl,
+            closeBSelectsD,
+            closeDSelectsA,
+            sidebarScrollsSelected,
+            stripScrollsSelected,
+            middleReleaseOutsideKeepsTab,
+            leftTitleToCloseDotKeepsTab,
+            middleClickInsideClosesTab,
+        };
+
         using var parsed = JsonDocument.Parse(received);
         File.WriteAllText(smokeReport!, JsonSerializer.Serialize(new {
             first = first.Title, second = secondTitle, restored, pinnedSurvivesClose = kept,
@@ -3649,7 +3844,7 @@ sealed class BrowserWindow : Form
             settingsDialogOk, shareToggleWorks,
             adStatusWhenBlockingOff, adVisibleWhenBlockingOff, adHiddenAfterBlockingOn, adStatusAfterBlockingOn,
             urlWhenCleanOff, cliFlags,
-            faviconCached, addressDisplayOk, tabDrag,
+            faviconCached, addressDisplayOk, tabDrag, tabFixes,
             postClean, blobUrl, permissions, downloads, processCrash,
             sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
