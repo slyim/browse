@@ -524,6 +524,17 @@ def run_checks():
                     'elementInF11ReturnsToF11': True,
                     'f11FinalRestores': True,
                 }, report.get('fullscreen')
+                assert report.get('collapsibleTabBar') == {
+                    'railWidthOk': True,
+                    'railItemsOk': True,
+                    'peekOpenOk': True,
+                    'peekCloseOk': True,
+                    'peekAnimOk': True,
+                    'ctrlShiftBTogglesOk': True,
+                    'orientSwitchCollapsedOk': True,
+                    'f11RestoresCollapsedOk': True,
+                    'chromeHiddenAndAnchorOk': True,
+                }, report.get('collapsibleTabBar')
                 debounce = report.get('sessionDebounce')
                 assert debounce is not None, report
                 assert debounce['titleEvents'] >= 5, debounce
@@ -687,6 +698,7 @@ def run_checks():
                 assert saved_settings == {
                     'theme': 'system',
                     'verticalTabs': False,
+                    'tabBarCollapsed': True,
                     'blockingEnabled': True,
                     'cleanLinksEnabled': True,
                     'sleepingTabsEnabled': True,
@@ -699,6 +711,10 @@ def run_checks():
                 restore = run_phase(exe, path / 'restore.json', base, 'restore')
                 assert restore['selectedIndex'] == 1, restore
                 assert restore['vertical'] is False, restore
+                assert restore['tabBarCollapsed'] is True, restore
+                assert restore['collapsedAtStartup'] is True, restore
+                assert restore['stripTabsVisible'] is False, restore
+                assert restore['stripActiveTitleVisible'] is True, restore
                 assert restore['horizontalLayout'] is True, restore
                 assert restore['pinnedSurvivesClose'] is True, restore
                 assert restore['pinnedFirst'] is True, restore
@@ -714,6 +730,17 @@ def run_checks():
                 assert restore['restoringDuringEnv'] is True, restore
                 assert restore['restoringCleared'] is True, restore
                 assert not list(path.glob('*.tmp')), list(path.glob('*.tmp'))
+
+                # Also verify vertical collapsed startup restores directly to the rail width without expanding.
+                vert_collapsed_settings = dict(saved_settings, verticalTabs=True, tabBarCollapsed=True)
+                settings_path.write_text(json.dumps(vert_collapsed_settings), encoding='utf-8')
+                Fixture.requested.clear()
+                vert_restore = run_phase(exe, path / 'restore-vertical-collapsed.json', base, 'restore')
+                assert vert_restore['vertical'] is True, vert_restore
+                assert vert_restore['tabBarCollapsed'] is True, vert_restore
+                assert vert_restore['collapsedAtStartup'] is True, vert_restore
+                assert vert_restore['sidebarWidth'] == vert_restore['railWidth'], vert_restore
+                settings_path.write_text(json.dumps(saved_settings), encoding='utf-8')
 
                 # Second instance while another process holds the profile mutex must restore normally without writing session.json.
                 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)

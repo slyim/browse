@@ -12,6 +12,7 @@ sealed record AppSettings
 {
     public ThemePreference Theme { get; init; } = ThemePreference.System;
     public bool VerticalTabs { get; init; } = true;
+    public bool TabBarCollapsed { get; init; } = false;
     public bool BlockingEnabled { get; init; } = true;
     public bool CleanLinksEnabled { get; init; } = true;
     public bool SleepingTabsEnabled { get; init; } = true;
@@ -23,6 +24,7 @@ sealed record AppSettings
         other is not null
         && Theme == other.Theme
         && VerticalTabs == other.VerticalTabs
+        && TabBarCollapsed == other.TabBarCollapsed
         && BlockingEnabled == other.BlockingEnabled
         && CleanLinksEnabled == other.CleanLinksEnabled
         && SleepingTabsEnabled == other.SleepingTabsEnabled
@@ -35,6 +37,7 @@ sealed record AppSettings
         var hash = new HashCode();
         hash.Add(Theme);
         hash.Add(VerticalTabs);
+        hash.Add(TabBarCollapsed);
         hash.Add(BlockingEnabled);
         hash.Add(CleanLinksEnabled);
         hash.Add(SleepingTabsEnabled);
@@ -120,13 +123,14 @@ static class SettingsStore
 
             File.WriteAllText(file, """{"theme":"dark","blockingEnabled":false}""");
             var (partial, partialExists) = Load(file);
-            if (!partialExists || partial.Theme != ThemePreference.Dark || partial.BlockingEnabled || !partial.VerticalTabs || !partial.CleanLinksEnabled)
+            if (!partialExists || partial.Theme != ThemePreference.Dark || partial.BlockingEnabled || !partial.VerticalTabs || partial.TabBarCollapsed || !partial.CleanLinksEnabled)
                 return false;
 
             var custom = new AppSettings
             {
                 Theme = ThemePreference.Light,
                 VerticalTabs = false,
+                TabBarCollapsed = true,
                 BlockingEnabled = false,
                 CleanLinksEnabled = false,
                 SleepingTabsEnabled = false,
@@ -136,7 +140,7 @@ static class SettingsStore
             };
             Save(file, custom);
             var raw = File.ReadAllText(file);
-            if (!raw.Contains("\"theme\"", StringComparison.Ordinal) || !raw.Contains("\"light\"", StringComparison.Ordinal) || !raw.Contains("\"verticalTabs\"", StringComparison.Ordinal) || !raw.Contains("\"allowedExternalApps\"", StringComparison.Ordinal))
+            if (!raw.Contains("\"theme\"", StringComparison.Ordinal) || !raw.Contains("\"light\"", StringComparison.Ordinal) || !raw.Contains("\"verticalTabs\"", StringComparison.Ordinal) || !raw.Contains("\"tabBarCollapsed\"", StringComparison.Ordinal) || !raw.Contains("\"allowedExternalApps\"", StringComparison.Ordinal))
                 return false;
             var (loaded, loadedExists) = Load(file);
             if (!loadedExists || loaded != custom) return false;
@@ -160,6 +164,7 @@ sealed class SettingsDialog : Form
     readonly List<Label> hintLabels = [];
     readonly ComboBox themeBox;
     readonly ComboBox layoutBox;
+    readonly CheckBox collapseTabsCheck;
     readonly CheckBox blockingCheck;
     readonly CheckBox cleanLinksCheck;
     readonly CheckBox sleepingCheck;
@@ -348,6 +353,7 @@ sealed class SettingsDialog : Form
         AddSection("Appearance", first: true);
         themeBox = AddChoiceRow("Theme", ["System", "Light", "Dark"], "Theme", "Applies on next launch.");
         layoutBox = AddChoiceRow("Tab layout", ["Sidebar", "Top tabs"], "Tab layout");
+        collapseTabsCheck = AddToggle("Collapse tab bar", "Collapse tab bar");
 
         AddDivider();
         AddSection("Privacy & features");
@@ -504,6 +510,7 @@ sealed class SettingsDialog : Form
 
         themeBox.SelectedIndexChanged += (_, _) => Emit();
         layoutBox.SelectedIndexChanged += (_, _) => Emit();
+        collapseTabsCheck.CheckedChanged += (_, _) => Emit();
         blockingCheck.CheckedChanged += (_, _) => Emit();
         cleanLinksCheck.CheckedChanged += (_, _) => Emit();
         sleepingCheck.CheckedChanged += (_, _) => Emit();
@@ -662,6 +669,7 @@ sealed class SettingsDialog : Form
                 _ => 0,
             };
             layoutBox.SelectedIndex = next.VerticalTabs ? 0 : 1;
+            collapseTabsCheck.Checked = next.TabBarCollapsed;
             blockingCheck.Checked = next.BlockingEnabled;
             cleanLinksCheck.Checked = next.CleanLinksEnabled;
             sleepingCheck.Checked = next.SleepingTabsEnabled;
@@ -686,6 +694,7 @@ sealed class SettingsDialog : Form
                 _ => ThemePreference.System,
             },
             VerticalTabs = layoutBox.SelectedIndex == 0,
+            TabBarCollapsed = collapseTabsCheck.Checked,
             BlockingEnabled = blockingCheck.Checked,
             CleanLinksEnabled = cleanLinksCheck.Checked,
             SleepingTabsEnabled = sleepingCheck.Checked,
