@@ -273,6 +273,21 @@ def run():
                     'keyboardReorder': True,
                     'sessionOrderMatches': True,
                 }, report.get('tabDrag')
+                assert report.get('tabFixes') == {
+                    'switchFocusesWebView': True,
+                    'ctrl2FocusesWebView': True,
+                    'escReturnsToWebView': True,
+                    'redirectUpdatesAddress': True,
+                    'unloadedReloadUsesNewUrl': True,
+                    'uncommittedReloadUsesNewUrl': True,
+                    'closeBSelectsD': True,
+                    'closeDSelectsA': True,
+                    'sidebarScrollsSelected': True,
+                    'stripScrollsSelected': True,
+                    'middleReleaseOutsideKeepsTab': True,
+                    'leftTitleToCloseDotKeepsTab': True,
+                    'middleClickInsideClosesTab': True,
+                }, report.get('tabFixes')
                 favicon_files = list((path / 'Favicons').glob('*.png'))
                 assert len(favicon_files) == 1, favicon_files
                 assert favicon_files[0].read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
