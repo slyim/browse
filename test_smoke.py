@@ -119,7 +119,12 @@ class Fixture(BaseHTTPRequestHandler):
         type(self).requested.append(self.path)
         if self.path.startswith('/download/'):
             filename = self.path.rsplit('/', 1)[-1]
-            data = b'MZ-fake-smoke-test' if filename.endswith('.exe') else b'hello-download'
+            if filename.endswith('.exe'):
+                data = b'MZ-fake-smoke-test'
+            elif filename == 'sample.txt':
+                data = b'browse-download-smoke-payload-0123456789'
+            else:
+                data = b'hello-download'
             self.send_response(200)
             self.send_header('Content-Type', 'application/octet-stream')
             self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
@@ -208,6 +213,8 @@ class Fixture(BaseHTTPRequestHandler):
                 '<!doctype html><title>Download page</title>'
                 '<a id="dl-exe" href="/download/tool.exe" download="tool.exe"'
                 ' style="position:fixed;left:0;top:0;width:120px;height:40px;display:block">Download</a>'
+                '<a id="dl-safe" href="/download/sample.txt" download="sample.txt"'
+                ' style="position:fixed;left:140px;top:0;width:120px;height:40px;display:block">Safe</a>'
             ).encode()
         elif self.path.startswith('/external-scheme'):
             body = (
@@ -457,7 +464,12 @@ def run_checks():
                     'bgCancelled': True,
                     'exeDenied': True,
                     'exeAllowed': True,
+                    'defaultDialogSuppressed': True,
+                    'safeCompleted': True,
                     'ctrlJOpened': True,
+                    'historyRoundTrip': True,
+                    'removeDeletesEntry': True,
+                    'corruptLoadsEmpty': True,
                     'extCheckOk': True,
                 }, report.get('downloads')
                 assert report.get('processCrash') == {

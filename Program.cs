@@ -240,6 +240,7 @@ sealed class BrowserWindow : Form
     readonly IconButton forwardBtn;
     readonly IconButton reloadBtn;
     readonly IconButton shareBtn;
+    readonly DownloadsButton downloadsBtn;
     readonly IconButton updateBtn;
     readonly IconButton settingsBtn;
     readonly IconButton stripNewTabBtn;
@@ -268,6 +269,9 @@ sealed class BrowserWindow : Form
     readonly string settingsFile;
     readonly ThemePreference startupTheme;
     readonly FaviconCache favicons;
+    readonly DownloadManager downloads;
+    DownloadsFlyout? downloadsFlyout;
+    long downloadsFlyoutClosedAt;
     readonly Task<CoreWebView2Environment> envTask;
     readonly Task<SessionState?>? sessionTask;
     readonly string? smokeReport;
@@ -472,6 +476,7 @@ sealed class BrowserWindow : Form
         this.settingsExisted = settingsExisted;
         startupTheme = initialSettings.Theme;
         favicons = new FaviconCache(sessionFile);
+        downloads = new DownloadManager(Path.Combine(Path.GetDirectoryName(settingsFile)!, "downloads.json"));
         this.envTask = envTask;
         this.sessionTask = sessionTask;
         this.sessionLock = sessionLock;
@@ -499,6 +504,8 @@ sealed class BrowserWindow : Form
         reloadBtn = MakeIcon(Theme.Glyphs.Reload, "Reload", ReloadOrStopCurrent);
         shareBtn = MakeIcon(Theme.Glyphs.Share, "Share page text once with a local agent", () => _ = SharePage());
         shareBtn.Visible = settings.ShareEnabled;
+        downloadsBtn = new DownloadsButton(() => ToggleDownloads(fromButtonClick: true));
+        tips.SetToolTip(downloadsBtn, "Downloads");
         updateBtn = MakeIcon(Theme.Glyphs.Update, "Update available", () => _ = ApplyUpdate());
         updateBtn.Visible = false;
         updateBtn.SetActive(true);
@@ -541,6 +548,8 @@ sealed class BrowserWindow : Form
         closeBtn.BringToFront();
 
         SetOrientation(settings.VerticalTabs, persistSettings: false);
+        downloads.Changed += SyncDownloadsUi;
+        SyncDownloadsUi();
         UpdateNavButtons();
         UpdateWindowTitle();
         sidebar.Enabled = topStrip.Enabled = false;
@@ -557,9 +566,11 @@ sealed class BrowserWindow : Form
         loadingTimer.Tick += (_, _) => TickLoadingSpinner();
         Activated += (_, _) => SetCaptionWindowActive(true);
         Deactivate += (_, _) => { CancelTabDrag(); ClearCaptionInteraction(); SetCaptionWindowActive(false); };
+        LocationChanged += (_, _) => CloseDownloadsFlyout();
+        SizeChanged += (_, _) => CloseDownloadsFlyout();
         Load += async (_, _) => await Start();
-        FormClosing += (_, _) => FlushSession();
-        FormClosed += (_, _) => { closed = true; StopLaunchPipe(); CancelTabDrag(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); };
+        FormClosing += HandleFormClosing;
+        FormClosed += (_, _) => { closed = true; StopLaunchPipe(); CancelTabDrag(); CloseDownloadsFlyout(); settingsDialog?.Close(); pending?.Cancel(); updateCts?.Cancel(); saveTimer.Stop(); saveTimer.Dispose(); sleepTimer.Stop(); sleepTimer.Dispose(); dragScrollTimer.Stop(); dragScrollTimer.Dispose(); loadingTimer.Stop(); loadingTimer.Dispose(); };
     }
 
     int S(int px) => dpiOverride is { } dpi
@@ -583,6 +594,8 @@ sealed class BrowserWindow : Form
             closed = true;
             StopLaunchPipe();
             CancelTabDrag();
+            CloseDownloadsFlyout();
+            downloads.Dispose();
             pending?.Cancel();
             updateCts?.Cancel();
             updateCts?.Dispose();
@@ -923,6 +936,7 @@ sealed class BrowserWindow : Form
         var rx = w - btn;
         settingsBtn.SetBounds(rx, y, btn, btn);
         if (shareBtn.Visible) { rx -= btn + gap; shareBtn.SetBounds(rx, y, btn, btn); }
+        if (downloadsBtn.Visible) { rx -= btn + gap; downloadsBtn.SetBounds(rx, y, btn, btn); }
         if (updateBtn.Visible) { rx -= btn + gap; updateBtn.SetBounds(rx, y, btn, btn); }
     }
 
@@ -943,8 +957,9 @@ sealed class BrowserWindow : Form
         reloadBtn.SetBounds(x, yBtn, btn, btn); x += btn + S(8);
 
         var captionW = S(46) * 3;
-        var rightBtns = new List<IconButton>(3);
+        var rightBtns = new List<Control>(4);
         if (updateBtn.Visible) rightBtns.Add(updateBtn);
+        if (downloadsBtn.Visible) rightBtns.Add(downloadsBtn);
         if (shareBtn.Visible) rightBtns.Add(shareBtn);
         rightBtns.Add(settingsBtn);
         var rightW = btn * rightBtns.Count + gap * (rightBtns.Count - 1);
@@ -1486,13 +1501,18 @@ sealed class BrowserWindow : Form
                     if (state != CoreWebView2PermissionState.Default) e.State = state;
                 };
                 core.DownloadStarting += (_, e) => {
+                    e.Handled = true;
                     if (tab != selected || closed || tab.Closed)
                     {
                         e.Cancel = true;
                         return;
                     }
                     var filePath = e.ResultFilePath;
-                    if (!IsDangerousDownload(filePath)) return;
+                    if (!IsDangerousDownload(filePath))
+                    {
+                        if (e.DownloadOperation is { } safeOp) downloads.Track(safeOp, filePath);
+                        return;
+                    }
                     if (IsDisposed || !IsHandleCreated) { e.Cancel = true; return; }
                     var deferral = e.GetDeferral();
                     BeginInvoke(() => {
@@ -1506,7 +1526,9 @@ sealed class BrowserWindow : Form
                             var name = Path.GetFileName(filePath);
                             if (string.IsNullOrEmpty(name)) name = filePath;
                             var host = Uri.TryCreate(e.DownloadOperation?.Uri, UriKind.Absolute, out var u) && u.IdnHost.Length > 0 ? u.IdnHost : "this site";
-                            e.Cancel = !ConfirmDangerousDownload(name, host);
+                            var allowed = ConfirmDangerousDownload(name, host);
+                            e.Cancel = !allowed;
+                            if (allowed && e.DownloadOperation is { } allowedOp) downloads.Track(allowedOp, filePath);
                         }
                         catch { e.Cancel = true; }
                         finally { deferral.Complete(); }
@@ -1723,10 +1745,103 @@ sealed class BrowserWindow : Form
         settingsDialog?.SyncFrom(settings);
     }
 
-    void OpenDownloads()
+    void OpenDownloads() => ToggleDownloads(fromButtonClick: false);
+
+    void ToggleDownloads(bool fromButtonClick)
     {
-        if (selected is not { View: { IsDisposed: false, CoreWebView2: { } core } }) return;
-        TryCore(() => core.OpenDefaultDownloadDialog());
+        if (closed || IsDisposed) return;
+        if (downloadsFlyout is { IsDisposed: false, Visible: true })
+        {
+            CloseDownloadsFlyout();
+            return;
+        }
+        // Clicking the button while the flyout was open triggers Deactivate->Close first; don't immediately reopen.
+        if (fromButtonClick && Environment.TickCount64 - downloadsFlyoutClosedAt < 250)
+            return;
+        var anchor = downloadsBtn.Visible ? (Control)downloadsBtn : settingsBtn;
+        var flyout = new DownloadsFlyout(
+            downloads,
+            RetryDownload,
+            closedByDeactivate =>
+            {
+                if (closedByDeactivate && downloadsBtn.Visible && !downloadsBtn.IsDisposed && downloadsBtn.IsHandleCreated
+                    && downloadsBtn.RectangleToScreen(downloadsBtn.ClientRectangle).Contains(Cursor.Position))
+                    downloadsFlyoutClosedAt = Environment.TickCount64;
+                if (ReferenceEquals(downloadsFlyout, null)) return;
+                downloadsFlyout = null;
+                if (!closed && !IsDisposed && !downloadsBtn.IsDisposed) downloadsBtn.SetActive(false);
+            },
+            anchor);
+        downloadsFlyout = flyout;
+        downloadsBtn.SetActive(true);
+        flyout.Show(this);
+        flyout.RepositionToAnchor();
+    }
+
+    void CloseDownloadsFlyout()
+    {
+        if (downloadsFlyout is { IsDisposed: false } flyout)
+        {
+            downloadsFlyout = null;
+            flyout.Close();
+        }
+        if (!closed && !IsDisposed && !downloadsBtn.IsDisposed) downloadsBtn.SetActive(false);
+    }
+
+    void SyncDownloadsUi()
+    {
+        if (closed || IsDisposed || downloadsBtn.IsDisposed) return;
+        var shouldShow = downloads.Count > 0;
+        var visChanged = downloadsBtn.Visible != shouldShow;
+        downloadsBtn.Visible = shouldShow;
+        var active = downloads.ActiveCount;
+        var progress = downloads.OverallProgress;
+        downloadsBtn.SetProgress(progress, active > 0, downloads.HasIndeterminateActive);
+        var tip = active > 0
+            ? (progress is { } frac ? $"Downloads ({active} active · {(int)Math.Round(frac * 100)}%)" : $"Downloads ({active} active)")
+            : "Downloads";
+        if (tips.GetToolTip(downloadsBtn) != tip) tips.SetToolTip(downloadsBtn, tip);
+        if (visChanged)
+        {
+            if (vertical) LayoutSideTopBand();
+            else LayoutTopStrip();
+        }
+        if (downloadsFlyout is { IsDisposed: false, Visible: true } flyout)
+            flyout.RefreshEntries();
+    }
+
+    void RetryDownload(string url)
+    {
+        if (closed || IsDisposed || !PageHandoff.Allowed(url)) return;
+        if (selected is { View: { IsDisposed: false, CoreWebView2: { } core } })
+            TryCore(() => core.Navigate(url));
+        else
+            _ = Open(url);
+    }
+
+    void HandleFormClosing(object? sender, FormClosingEventArgs e)
+    {
+        if (downloads.ActiveCount > 0 && smokeReport is null && e.CloseReason == CloseReason.UserClosing)
+        {
+            if (!ConfirmCancelActiveDownloads(downloads.ActiveCount))
+            {
+                e.Cancel = true;
+                return;
+            }
+        }
+        downloads.CancelActive();
+        FlushSession();
+    }
+
+    bool ConfirmCancelActiveDownloads(int activeCount)
+    {
+        var noun = activeCount == 1 ? "1 download is" : $"{activeCount} downloads are";
+        return MessageBox.Show(this,
+            $"{noun} still in progress.\n\nClose browse and cancel active downloads?",
+            "Downloads in progress",
+            MessageBoxButtons.OKCancel,
+            MessageBoxIcon.Warning,
+            MessageBoxDefaultButton.Button2) == DialogResult.OK;
     }
 
     void ResetTabForRecovery(BrowserTab tab, bool preserveCrashFlag = false)
@@ -2556,6 +2671,7 @@ sealed class BrowserWindow : Form
     void SetOrientation(bool sidebarMode, bool persistSettings = true)
     {
         CancelTabDrag();
+        CloseDownloadsFlyout();
         vertical = sidebarMode;
         SuspendLayout();
         var surface = sidebarMode ? Theme.Frame : Theme.Ground;
@@ -2564,11 +2680,12 @@ sealed class BrowserWindow : Form
 
         foreach (var b in new[] { backBtn, forwardBtn, reloadBtn, shareBtn, updateBtn, settingsBtn })
             b.SetSurface(surface, hover, activeFill);
+        downloadsBtn.SetSurface(surface, hover, activeFill);
         address.SetSurface(surface, hover);
 
         if (sidebarMode)
         {
-            sideTopBand.Controls.AddRange([backBtn, forwardBtn, reloadBtn, updateBtn, shareBtn, settingsBtn]);
+            sideTopBand.Controls.AddRange([backBtn, forwardBtn, reloadBtn, updateBtn, downloadsBtn, shareBtn, settingsBtn]);
             sideAddressWrap.Controls.Add(address);
             ApplyChromeVisibility();
             LayoutSideTopBand();
@@ -2577,7 +2694,7 @@ sealed class BrowserWindow : Form
         else
         {
             stripScroll = 0;
-            topStrip.Controls.AddRange([backBtn, forwardBtn, reloadBtn, address, updateBtn, shareBtn, settingsBtn]);
+            topStrip.Controls.AddRange([backBtn, forwardBtn, reloadBtn, address, updateBtn, downloadsBtn, shareBtn, settingsBtn]);
             stripTabs.SendToBack();
             ApplyChromeVisibility();
         }
@@ -2796,7 +2913,7 @@ sealed class BrowserWindow : Form
     bool IsHandledShortcut(Keys keyData)
     {
         if (keyData == Keys.Escape)
-            return dragTab is not null || address.InputFocused || selected is { Navigating: true };
+            return dragTab is not null || downloadsFlyout is { IsDisposed: false, Visible: true } || address.InputFocused || selected is { Navigating: true };
         switch (keyData)
         {
             case Keys.Control | Keys.L:
@@ -2828,6 +2945,11 @@ sealed class BrowserWindow : Form
         if (keyData == Keys.Escape && dragTab is not null)
         {
             CancelTabDrag();
+            return true;
+        }
+        if (keyData == Keys.Escape && downloadsFlyout is { IsDisposed: false, Visible: true })
+        {
+            CloseDownloadsFlyout();
             return true;
         }
         if (keyData == Keys.Escape && address.InputFocused)
@@ -4075,7 +4197,7 @@ sealed class BrowserWindow : Form
                 && DecidePermission(CoreWebView2PermissionKind.Notifications, true) == (CoreWebView2PermissionState.Default, true),
         };
 
-        // #32: Downloads — cancel from background tabs, confirm executables, Ctrl+J opens default download dialog.
+        // #32 & #10: Downloads — cancel from background tabs, confirm executables, custom downloads manager, flyout, persistence, and corrupt-file safety.
         var smokeDownloadsDir = Path.Combine(Path.GetDirectoryName(smokeReport!)!, "Downloads");
         Directory.CreateDirectory(smokeDownloadsDir);
         var dlBg = await Open(fixture + "/first");
@@ -4098,7 +4220,8 @@ sealed class BrowserWindow : Form
             await Task.Delay(50);
 
         CoreWebView2DownloadOperation? fgOp = null;
-        dlFgCore.DownloadStarting += (_, e) => { fgOp = e.DownloadOperation; };
+        var fgHandled = false;
+        dlFgCore.DownloadStarting += (_, e) => { fgOp = e.DownloadOperation; fgHandled = e.Handled; };
 
         string? exeDenyName = null;
         string? exeDenyHost = null;
@@ -4111,10 +4234,13 @@ sealed class BrowserWindow : Form
         var exeDenied = exeDenyName is not null
             && exeDenyName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
             && exeDenyHost == "127.0.0.1"
+            && fgHandled
             && fgOp is { State: CoreWebView2DownloadState.Interrupted, InterruptReason: CoreWebView2DownloadInterruptReason.UserCanceled }
-            && !Directory.EnumerateFiles(smokeDownloadsDir, "*.exe").Any();
+            && !Directory.EnumerateFiles(smokeDownloadsDir, "*.exe").Any()
+            && !downloads.Entries.Any(d => d.Name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
 
         fgOp = null;
+        fgHandled = false;
         var exeAllowPrompted = false;
         confirmDownloadOverride = (_, _) => { exeAllowPrompted = true; return true; };
         await DispatchClick(dlFgCore, 60, 20);
@@ -4124,27 +4250,83 @@ sealed class BrowserWindow : Form
             await Task.Delay(50);
         // Edge SmartScreen may hold unverified .exe downloads in InProgress after our handler allows them.
         var exeAllowed = exeAllowPrompted
+            && fgHandled
             && fgOp is not null
             && fgOp.State != CoreWebView2DownloadState.Interrupted
             && (fgOp.State == CoreWebView2DownloadState.Completed || fgOp.BytesReceived > 0 || File.Exists(fgOp.ResultFilePath));
         if (fgOp is { State: CoreWebView2DownloadState.InProgress }) fgOp.Cancel();
         confirmDownloadOverride = null;
+        foreach (var d in downloads.Entries.ToArray()) downloads.Remove(d.Id);
+
+        // Safe attachment download: suppresses default dialog (Handled), completes with exact size, appears in UI, persists, and removes cleanly.
+        fgOp = null;
+        fgHandled = false;
+        await DispatchClick(dlFgCore, 200, 20);
+        dlWait.Restart();
+        DownloadEntry? safeEntry = null;
+        while (dlWait.Elapsed < TimeSpan.FromSeconds(5))
+        {
+            safeEntry = downloads.Entries.FirstOrDefault(d => d.Name.Equals("sample.txt", StringComparison.OrdinalIgnoreCase));
+            if (safeEntry is { State: DownloadItemState.Completed }) break;
+            await Task.Delay(50);
+        }
+        var defaultDialogSuppressed = fgHandled && !dlFgCore.IsDefaultDownloadDialogOpen;
+        var safeCompleted = safeEntry is { State: DownloadItemState.Completed, Size: 40, Host: "127.0.0.1" }
+            && File.Exists(safeEntry.FilePath)
+            && new FileInfo(safeEntry.FilePath).Length == 40
+            && downloadsBtn.Visible;
 
         PressKey(Keys.Control | Keys.J);
-        dlWait.Restart();
-        while (dlWait.Elapsed < TimeSpan.FromSeconds(2) && !dlFgCore.IsDefaultDownloadDialogOpen)
-            await Task.Delay(50);
-        var ctrlJOpened = dlFgCore.IsDefaultDownloadDialogOpen;
-        if (ctrlJOpened) dlFgCore.CloseDefaultDownloadDialog();
+        var flyoutOpened = downloadsFlyout is { IsDisposed: false, Visible: true }
+            && downloadsFlyout.VerifyLayoutInsideClient()
+            && !dlFgCore.IsDefaultDownloadDialogOpen;
+        PressKey(Keys.Control | Keys.J);
+        var ctrlJOpened = flyoutOpened && downloadsFlyout is null;
 
+        var historyRoundTrip = false;
+        var removeDeletesEntry = false;
+        if (safeEntry is not null)
+        {
+            using var reloaded = new DownloadManager(downloads.HistoryFile);
+            historyRoundTrip = File.Exists(downloads.HistoryFile)
+                && reloaded.Entries.Any(d => d.Id == safeEntry.Id
+                    && d.Name == safeEntry.Name
+                    && string.Equals(d.FilePath, safeEntry.FilePath, StringComparison.OrdinalIgnoreCase)
+                    && d.State == DownloadItemState.Completed
+                    && d.Size == 40);
+
+            var removed = downloads.Remove(safeEntry.Id);
+            using var afterRemove = new DownloadManager(downloads.HistoryFile);
+            removeDeletesEntry = removed
+                && !downloads.Entries.Any(d => d.Id == safeEntry.Id)
+                && !afterRemove.Entries.Any(d => d.Id == safeEntry.Id);
+        }
+
+        var corruptHistoryPath = Path.Combine(Path.GetDirectoryName(settingsFile)!, $"corrupt-downloads-{Guid.NewGuid():N}.json");
+        bool corruptLoadsEmpty;
+        try
+        {
+            File.WriteAllText(corruptHistoryPath, "{broken-json");
+            using var corruptMgr = new DownloadManager(corruptHistoryPath);
+            corruptLoadsEmpty = corruptMgr.Count == 0;
+        }
+        finally { try { if (File.Exists(corruptHistoryPath)) File.Delete(corruptHistoryPath); } catch { } }
+        var storeSelfCheckOk = DownloadStore.SelfCheck(Path.GetDirectoryName(settingsFile)!);
+
+        downloads.ClearFinished();
         CloseTab(dlFg, recordClosed: false);
         CloseTab(dlBg, recordClosed: false);
-        var downloads = new
+        var downloadsReport = new
         {
             bgCancelled = bgDownloadFired && bgDownloadCancelled,
             exeDenied,
             exeAllowed,
+            defaultDialogSuppressed,
+            safeCompleted,
             ctrlJOpened,
+            historyRoundTrip,
+            removeDeletesEntry,
+            corruptLoadsEmpty = corruptLoadsEmpty && storeSelfCheckOk,
             extCheckOk = IsDangerousDownload(@"C:\Downloads\a.exe")
                 && IsDangerousDownload(@"C:\Downloads\A.PS1")
                 && IsDangerousDownload(@"C:\Downloads\run.bat.")
@@ -5056,7 +5238,7 @@ sealed class BrowserWindow : Form
             urlWhenCleanOff, cliFlags, cliUrl, browserRegistration, externalSchemes,
             faviconCached, addressDisplayOk, tabDrag, tabFixes, highDpi, shareTimeout,
             tabCycle, loadingStop, tabMenuAndNewWindow,
-            postClean, blobUrl, permissions, downloads, processCrash,
+            postClean, blobUrl, permissions, downloads = downloadsReport, processCrash,
             sessionDebounce, restoreShortcuts,
             snapshot = parsed.RootElement, pipeOneUse = oneUse,
             rejectsLocalFiles = Resolve("file:///C:/Windows/win.ini") == null && !PageHandoff.Allowed("file:///C:/Windows/win.ini"),
