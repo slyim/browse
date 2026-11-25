@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.28.0.schema.json
 
 PackageIdentifier: slyim.browse
-PackageVersion: 0.0.1
+PackageVersion: 0.0.4
 PackageLocale: en-US
 Publisher: slyim
 PublisherUrl: https://github.com/slyim
@@ -26,8 +26,10 @@ Tags:
 - adblock
 - privacy
 ReleaseNotes: >-
-  First release of browse, a WinForms + WebView2 browser for Windows 10/11 x64.
-  Requires the .NET 10 Desktop Runtime (x64) and the Microsoft Edge WebView2 Runtime.
-ReleaseNotesUrl: https://github.com/slyim/browse/releases/tag/v0.0.1
+  Find bar, per-site zoom, print and save page, downloads flyout, crash recovery,
+  fullscreen/F11, EasyList/EasyPrivacy/uBlock/Peter Lowe ad and tracker blocking with
+  a per-site shield, Windows system icons, tab animations, collapsible tab rail,
+  focus mode, and settings as a browse://settings tab.
+ReleaseNotesUrl: https://github.com/slyim/browse/releases/tag/v0.0.4
 ManifestType: defaultLocale
 ManifestVersion: 1.28.0
