@@ -27,3 +27,11 @@ jobs:
 
       - name: Smoke test
         run: python test_smoke.py publish/browse.exe
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; if ($LASTEXITCODE) { throw 'Inno Setup install failed' } }
+          & $iscc /Q /DAppVersion=0.0.0 packaging\browse.iss
+          if ($LASTEXITCODE) { throw "ISCC failed ($LASTEXITCODE)" }

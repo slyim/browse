@@ -46,6 +46,16 @@ jobs:
       - name: Smoke test
         run: python test_smoke.py publish/browse.exe
 
+      - name: Build installer
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; if ($LASTEXITCODE) { throw 'Inno Setup install failed' } }
+          & $iscc /Q "/DAppVersion=$env:VERSION" packaging\browse.iss
+          if ($LASTEXITCODE) { throw "ISCC failed ($LASTEXITCODE)" }
+
       - name: Package and create GitHub Release
         shell: pwsh
         env:
@@ -53,19 +63,28 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
-          $zip = "browse-$($env:VERSION)-win-x64.zip"
+          # The in-app updater downloads this exact zip name; keep it.
+          $zip = "artifacts/browse-$($env:VERSION)-win-x64.zip"
+          $setup = "artifacts/browse-$($env:VERSION)-win-x64-setup.exe"
           $files = Get-ChildItem -LiteralPath publish -File | Where-Object { $_.Extension -notin '.pdb', '.xml' }
           if (-not ($files | Where-Object { $_.Name -eq 'browse.exe' })) {
             throw 'publish/browse.exe not found'
           }
+          if (-not (Test-Path -LiteralPath $setup)) { throw "$setup not found" }
           Compress-Archive -LiteralPath $files.FullName -DestinationPath $zip -Force
-          $sha256 = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $sums = foreach ($f in $setup, $zip) { "$((Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant())  $(Split-Path $f -Leaf)" }
+          $sums | Out-File -FilePath artifacts/SHA256SUMS.txt -Encoding ascii
           $notes = @(
             "Windows x64 build of browse $($env:VERSION)."
             ""
-            "Requires the .NET 10 Desktop Runtime (x64) and the Microsoft Edge WebView2 Runtime."
-            "Unzip anywhere and run browse.exe."
+            "- **Installer**: ``$(Split-Path $setup -Leaf)`` (per-user, no admin; Start menu shortcut, default-browser registration, uninstall from Settings > Apps)."
+            "- **Portable**: ``$(Split-Path $zip -Leaf)``: unzip anywhere and run ``browse.exe``."
             ""
-            "SHA256 ($zip): $sha256"
+            "Requires the .NET 10 Desktop Runtime (x64) and the Microsoft Edge WebView2 Runtime."
+            ""
+            "SHA256:"
+            '```'
+            $sums
+            '```'
           ) -join "`n"
-          gh release create $env:TAG_NAME $zip --title "browse $($env:VERSION)" --notes $notes
+          gh release create $env:TAG_NAME $setup $zip artifacts/SHA256SUMS.txt --title "browse $($env:VERSION)" --notes $notes

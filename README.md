@@ -6,7 +6,14 @@ Windows port of [Office Commun's Search](https://github.com/driceroland/Search),
 
 ## Download
 
-Get `browse.exe` from the [latest release](https://github.com/slyim/browse/releases/latest), unzip, and run it. Needs the .NET 10 Desktop Runtime (see below).
+Every [release](https://github.com/slyim/browse/releases/latest) has two builds. Both need the .NET 10 Desktop Runtime (see below). The installer checks for it and offers the download page if it's missing.
+
+- **Installer**: `browse-X.Y.Z-win-x64-setup.exe`. Installs for your user only, so no admin is needed, into `%LOCALAPPDATA%\Programs\browse`. It adds a Start menu shortcut and can make browse available as a default browser (you then pick it in **Settings > Apps > Default apps**). To upgrade, run a newer installer over the old one. To uninstall, use **Settings > Apps > Installed apps**. Uninstall removes the program, its shortcuts and its browser registration, then asks whether to delete your profile as well. It keeps the profile by default, and always keeps it when uninstalling silently.
+- **Portable**: `browse-X.Y.Z-win-x64.zip`. Unzip it anywhere and run `browse.exe`. It changes nothing in the registry unless you click **Make browse available as a default browser** in Settings. Delete the folder to remove it.
+
+Silent install: `browse-X.Y.Z-win-x64-setup.exe /VERYSILENT`. This registers browse as an available browser, because that option is checked by default. Add `/MERGETASKS="!defaultbrowser"` to skip the registration, or `/MERGETASKS="desktopicon"` to also get a desktop shortcut. Uninstall removes the registration only if it points at the installed copy, so a portable copy you registered yourself stays registered.
+
+Your tabs, settings and site data live in `%LOCALAPPDATA%\SearchWindows` (see [Data location](#data-location)), not in the program folder. Installer upgrades, in-app updates and switching between the installer and portable builds all keep them.
 
 Or with [Scoop](https://scoop.sh), which also installs the .NET runtime (that step needs an Administrator shell the first time):
 
@@ -94,7 +101,7 @@ All user data lives under `%LOCALAPPDATA%\SearchWindows\`:
 - `settings.json` — Preferences from **Settings** (`theme`, `verticalTabs`, `blockingEnabled`, `cleanLinksEnabled`, `sleepingTabsEnabled`, `autoUpdateCheck`, `shareEnabled`, `allowedExternalApps`).
 - `update-check.txt` — UTC timestamp of the last update check (omitted when `--no-update-check` is passed or automatic update checks are off).
 
-If you click **Make browse available as a default browser** in **Settings**, `browse` writes per-user browser registration keys under `HKCU\Software\Clients\StartMenuInternet\browse`, `HKCU\Software\RegisteredApplications`, and `HKCU\Software\Classes\browseHTML` (no admin required); clicking **Remove** deletes them.
+If you click **Make browse available as a default browser** in **Settings**, `browse` writes per-user browser registration keys under `HKCU\Software\Clients\StartMenuInternet\browse`, `HKCU\Software\RegisteredApplications`, and `HKCU\Software\Classes\browseHTML` (no admin required); clicking **Remove** deletes them. `browse.exe --register` and `browse.exe --unregister` do the same from the command line (the installer and uninstaller use them).
 
 Run `browse.exe --profile <folder>` to keep a separate profile (WebView data, `session.json`, and `settings.json`) in that folder instead, or `browse.exe [--profile <folder>] [--no-update-check] <url>` to open a URL directly.
 

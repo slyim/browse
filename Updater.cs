@@ -6,6 +6,7 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Win32;
 
 namespace SearchPort;
 
@@ -369,6 +370,29 @@ static class Updater
         }
     }
 
+    // Must match AppId in packaging/browse.iss (Inno appends "_is1").
+    internal const string InstallerUninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\{6F3C2A1E-8B4D-4E7A-9C51-2D0B7E9A4F13}_is1";
+
+    // Keeps Settings > Apps showing the right version after an in-app update of an installer copy.
+    // Only touches the entry when it belongs to this exe's folder; portable copies have no entry.
+    internal static bool RecordInstalledVersion(string exePath, string versionText, string keyPath = InstallerUninstallKey)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(keyPath, writable: true);
+            if (key?.GetValue("InstallLocation") is not string location) return false;
+            var installDir = Path.GetDirectoryName(Path.GetFullPath(exePath));
+            if (!string.Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath(location)), installDir, StringComparison.OrdinalIgnoreCase))
+                return false;
+            key.SetValue("DisplayVersion", versionText);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public static void SwapFiles(string exePath, string extractDir)
     {
         var installDir = Path.GetDirectoryName(exePath)
@@ -510,6 +534,26 @@ static class Updater
         Assert(DetectInstallKind(@"C:\Users\u\AppData\Local\Microsoft\WinGet\Packages\slyim.browse\browse.exe") == InstallKind.WinGet, "detect Microsoft WinGet");
         Assert(DetectInstallKind(@"C:\Program Files\WinGet\Packages\slyim.browse\browse.exe") == InstallKind.WinGet, "detect WinGet Packages");
         Assert(DetectInstallKind(@"C:\Tools\browse\browse.exe") == InstallKind.Direct, "detect direct install");
+
+        // Installer version write-back, under a throwaway HKCU key
+        var testKey = $@"Software\browse-selfcheck-{Environment.ProcessId}";
+        try
+        {
+            using (var k = Registry.CurrentUser.CreateSubKey(testKey))
+            {
+                k.SetValue("InstallLocation", @"C:\Inst\browse\");
+                k.SetValue("DisplayVersion", "0.0.1");
+            }
+            Assert(!RecordInstalledVersion(@"C:\Portable\browse.exe", "0.0.9", testKey), "skip other folder");
+            Assert(RecordInstalledVersion(@"C:\Inst\browse\browse.exe", "0.0.9", testKey), "record own folder");
+            using (var after = Registry.CurrentUser.OpenSubKey(testKey))
+                Assert((after?.GetValue("DisplayVersion") as string) == "0.0.9", "DisplayVersion written");
+            Assert(!RecordInstalledVersion(@"C:\Inst\browse\browse.exe", "0.0.9", testKey + @"\missing"), "no entry, no write");
+        }
+        finally
+        {
+            Registry.CurrentUser.DeleteSubKeyTree(testKey, throwOnMissingSubKey: false);
+        }
 
         return true;
     }
