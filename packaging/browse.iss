@@ -5,6 +5,10 @@
 #ifndef AppVersion
   #error Pass /DAppVersion=X.Y.Z
 #endif
+; Overridable only so the missing-runtime path can be tested.
+#ifndef RuntimeDir
+  #define RuntimeDir "{commonpf64}\dotnet\shared\Microsoft.WindowsDesktop.App"
+#endif
 
 [Setup]
 ; Never change AppId: upgrades and uninstall find the existing install by it.
@@ -59,6 +63,20 @@ Type: files; Name: "{app}\browse.exe.old"
 Type: dirifempty; Name: "{app}"
 
 [Code]
+// browse is framework-dependent. Without the runtime it would only fail at first launch, so say so up front.
+function InitializeSetup(): Boolean;
+var
+  FindRec: TFindRec;
+  ErrorCode: Integer;
+begin
+  Result := True;
+  if FindFirst(ExpandConstant('{#RuntimeDir}\10.*'), FindRec) then
+    FindClose(FindRec)
+  else if SuppressibleMsgBox('browse needs the .NET 10 Desktop Runtime (x64), which is not installed.' + #13#10#13#10 +
+      'Open the download page now? Setup continues either way.', mbConfirmation, MB_YESNO, IDNO) = IDYES then
+    ShellExec('open', 'https://dotnet.microsoft.com/download/dotnet/10.0', '', '', SW_SHOWNORMAL, ewNoWait, ErrorCode);
+end;
+
 // Browsing data lives in %LOCALAPPDATA%\SearchWindows, outside {app}, so upgrades never touch it.
 // Uninstall keeps it unless the user says otherwise; silent uninstalls always keep it.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

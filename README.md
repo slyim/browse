@@ -6,7 +6,7 @@ Windows port of [Office Commun's Search](https://github.com/driceroland/Search),
 
 ## Download
 
-Every [release](https://github.com/slyim/browse/releases/latest) has two builds. Both need the .NET 10 Desktop Runtime (see below).
+Every [release](https://github.com/slyim/browse/releases/latest) has two builds. Both need the .NET 10 Desktop Runtime (see below). The installer checks for it and offers the download page if it's missing.
 
 - **Installer**: `browse-X.Y.Z-win-x64-setup.exe`. Installs for your user only, so no admin is needed, into `%LOCALAPPDATA%\Programs\browse`. It adds a Start menu shortcut and can make browse available as a default browser (you then pick it in **Settings > Apps > Default apps**). To upgrade, run a newer installer over the old one. To uninstall, use **Settings > Apps > Installed apps**. Uninstall removes the program, its shortcuts and its browser registration, then asks whether to delete your profile as well. It keeps the profile by default, and always keeps it when uninstalling silently.
 - **Portable**: `browse-X.Y.Z-win-x64.zip`. Unzip it anywhere and run `browse.exe`. It changes nothing in the registry unless you click **Make browse available as a default browser** in Settings. Delete the folder to remove it.

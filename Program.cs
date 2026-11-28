@@ -5824,6 +5824,7 @@ sealed class BrowserWindow : Form
                 Updater.RestoreOldExe(exePath, exePath + ".old");
                 throw;
             }
+            Updater.RecordInstalledVersion(exePath, release.VersionText);
             ExitCode = 0;
             Close();
         }
