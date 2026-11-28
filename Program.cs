@@ -128,6 +128,17 @@ static class Program
     [STAThread]
     static int Main(string[] args)
     {
+        // Used by the installer and uninstaller, so the registry layout lives only in BrowserRegistration.
+        if (args is ["--register" or "--unregister"])
+        {
+            try
+            {
+                if (args[0] == "--register") BrowserRegistration.Register(Environment.ProcessPath!);
+                else BrowserRegistration.Unregister();
+                return 0;
+            }
+            catch { return 1; }
+        }
         var opts = ParseArgs(args);
         if (opts is null) return 2;
         string? smokeDir = null;

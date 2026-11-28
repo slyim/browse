@@ -24,5 +24,19 @@ Pushing a `v*.*.*` tag triggers `.github/workflows/release.yml` on `windows-late
 1. Verifies the tag matches `vX.Y.Z` and equals `<Version>` in `Search.Windows.csproj` (fails immediately on mismatch).
 2. Builds the release output with `dotnet publish Search.Windows.csproj -c Release -warnaserror -o publish`.
 3. Runs `python test_smoke.py publish/browse.exe`.
-4. Zips the published files (flat archive layout matching `v0.0.1`, excluding `.pdb` and `.xml`) into `browse-X.Y.Z-win-x64.zip` and computes its SHA256.
-5. Creates the GitHub Release `browse X.Y.Z` with `browse-X.Y.Z-win-x64.zip` attached and the SHA256 in the release notes. GitHub automatically computes the asset `digest` used by the app's auto-updater.
+4. Builds the installer `artifacts/browse-X.Y.Z-win-x64-setup.exe` from `packaging/browse.iss` with Inno Setup 6 (installed with Chocolatey if the runner lacks it).
+5. Zips the published files (flat archive layout matching `v0.0.1`, excluding `.pdb` and `.xml`) into the portable `browse-X.Y.Z-win-x64.zip`. Keep that name, because the in-app updater downloads exactly this asset.
+6. Writes `SHA256SUMS.txt` and creates the GitHub Release `browse X.Y.Z` with the installer, the zip and the sums attached. GitHub automatically computes the asset `digest` that the in-app updater verifies.
+
+CI (`ci.yml`) also compiles the installer on every push and PR, so a broken `browse.iss` shows up before a release.
+
+## Building the installer locally
+
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`), then from the repo root:
+
+```powershell
+dotnet publish Search.Windows.csproj -c Release -warnaserror -o publish
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=X.Y.Z packaging\browse.iss   # or "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+```
+
+The result is `artifacts\browse-X.Y.Z-win-x64-setup.exe`. Never change `AppId` in `browse.iss`: upgrades and uninstall find the existing install by it.
