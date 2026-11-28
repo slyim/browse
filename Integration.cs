@@ -302,6 +302,20 @@ static class BrowserRegistration
         }
     }
 
+    // True only when the registration's open command launches exactly this exe, so one copy never removes another's.
+    public static bool IsRegisteredTo(string exePath, RegistryKey? baseKey = null, string softwareRoot = DefaultSoftwareRoot)
+    {
+        try
+        {
+            using var cmdKey = (baseKey ?? Registry.CurrentUser).OpenSubKey($@"{NormalizeRoot(softwareRoot)}\Classes\{ProgId}\shell\open\command", writable: false);
+            return string.Equals(cmdKey?.GetValue("") as string, $"\"{NormalizeExePath(exePath)}\" \"%1\"", StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public static void OpenDefaultAppsSettings()
     {
         Process.Start(new ProcessStartInfo("ms-settings:defaultapps") { UseShellExecute = true });

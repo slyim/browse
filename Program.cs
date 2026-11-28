@@ -134,7 +134,7 @@ static class Program
             try
             {
                 if (args[0] == "--register") BrowserRegistration.Register(Environment.ProcessPath!);
-                else BrowserRegistration.Unregister();
+                else if (BrowserRegistration.IsRegisteredTo(Environment.ProcessPath!)) BrowserRegistration.Unregister();
                 return 0;
             }
             catch { return 1; }
@@ -7829,6 +7829,8 @@ sealed class BrowserWindow : Form
             using (var progCmd = Registry.CurrentUser.OpenSubKey($@"{testRegRoot}\Classes\browseHTML\shell\open\command"))
             {
                 regWrittenOk = BrowserRegistration.IsRegistered(Registry.CurrentUser, testRegRoot)
+                    && BrowserRegistration.IsRegisteredTo(fakeExe, Registry.CurrentUser, testRegRoot)
+                    && !BrowserRegistration.IsRegisteredTo(Path.Combine(Path.GetTempPath(), "other", "browse.exe"), Registry.CurrentUser, testRegRoot)
                     && (regApps?.GetValue("browse") as string) == expectedCapPath
                     && (cap?.GetValue("ApplicationName") as string) == "browse"
                     && (cap?.GetValue("ApplicationIcon") as string) == $"{fakeExe},0"
